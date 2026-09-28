@@ -173,7 +173,7 @@ def test_valid_moves(tmp_path: Path, source: str) -> None:
 def test_editor_knows_fmt(tmp_path: Path) -> None:
     source = 'let fmt = import("std:fmt")\nlet f = [fmt.format] () => null {\n    let t = fmt.format("%d", 1)\n}\n'
     document = Document.open(tmp_path / "x.bif", source)
-    assert [(h.position[0], h.label) for h in document.inlay_hints()] == [(2, ": mem.Unique[str]")]
+    assert [(h.position[0], h.label) for h in document.inlay_hints() if not h.parameter] == [(2, ": mem.Unique[str]")]
     assert "fmt.format = (pattern: str, ...) => mem.Unique[str]" in (document.hover((2, 17)) or "")
     typing = Document.open(tmp_path / "x.bif", source.replace('fmt.format("%d", 1)', "fmt."))
     assert [c.label for c in typing.completions((2, len("    let t = fmt.")))] == ["format"]

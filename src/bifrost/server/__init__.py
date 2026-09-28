@@ -183,7 +183,8 @@ def _inlay_hints(params: types.InlayHintParams) -> list[types.InlayHint]:
         types.InlayHint(
             position=types.Position(line=hint.position[0], character=hint.position[1]),
             label=hint.label,
-            kind=types.InlayHintKind.Type,
+            kind=types.InlayHintKind.Parameter if hint.parameter else types.InlayHintKind.Type,
+            padding_right=hint.parameter,  # `status: 200`, not `status:200`
         )
         for hint in _document(params.text_document.uri).inlay_hints()
     ]

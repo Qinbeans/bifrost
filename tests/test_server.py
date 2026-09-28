@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -201,7 +202,7 @@ def test_locals_show_their_inferred_types() -> None:
         '    io.printf("%d %d %f %s %d", a, m, c, s, t)\n'
         "}\n"
     )
-    hints = Document.open(EXAMPLES / "scratch.bif", source).inlay_hints()
+    hints = [h for h in Document.open(EXAMPLES / "scratch.bif", source).inlay_hints() if not h.parameter]
     assert [(row, label) for (row, _), label in ((h.position, h.label) for h in hints)] == [
         (2, ": i64"),
         (3, ": i32"),
@@ -209,3 +210,190 @@ def test_locals_show_their_inferred_types() -> None:
         (5, ": f64"),
         (6, ": str"),
     ]
+
+
+RECORDS = """\
+let io = import("std:stdio")
+let time = import("std:time")
+let tasks = import("std:tasks")
+
+let User = struct { let id: i64, let score: f64 }
+
+let fetch = [time.sleep] async (id: i64) => User {
+    await time.sleep(1)
+    return User(id: id, score: 1.5)
+}
+
+let show = [io.printf] (label: str) => null {
+    let point = #{x: 1, y: 2.5, tag: #{name: label, ok: true}}
+    io.printf("%lld %s", point.x, point.tag.name)
+}
+
+let main = [io.printf, tasks.gather, fetch] async () => null {
+    let found = await tasks.gather(user: fetch(1), other: fetch(2))
+    io.printf("%lld %f", found.user.id, found.other.score)
+}
+"""
+
+
+@pytest.fixture
+def records(tmp_path: Path) -> Document:
+    config = (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    (tmp_path / "config.yaml").write_text(config)  # `type: async`, so main may be async
+    return Document.open(tmp_path / "main.bif", RECORDS)
+
+
+@pytest.mark.parametrize(
+    ("needle", "occurrence", "expected"),
+    [
+        ("x: 1", 0, "x: i64\n// a field of #{x: i64, y: f64, tag: #{name: str, ok: bool}}"),
+        ("ok: true", 0, "ok: bool\n// a field of #{name: str, ok: bool}"),
+        ("name", 1, "name: str\n// a field of point.tag"),
+        ("user.id", 0, "user: User\n// a field of found"),
+        ("id, found", 0, "id: i64\n// a field of found.user"),
+        ("score)", 0, "score: f64\n// a field of found.other"),
+    ],
+)
+def test_hover_shows_record_fields(records: Document, needle: str, occurrence: int, expected: str) -> None:
+    assert records.hover(_position(RECORDS, needle, occurrence)) == f"```bifrost\n{expected}\n```"
+
+
+def test_records_show_their_types_in_async_main_too(records: Document) -> None:
+    assert [hint.label for hint in records.inlay_hints() if not hint.parameter] == [
+        ": #{x: i64, y: f64, tag: #{name: str, ok: bool}}",
+        ": i64",  # the fields of `point`
+        ": f64",
+        ": #{name: str, ok: bool}",
+        ": str",
+        ": bool",
+        ": #{user: User, other: User}",
+    ]
+
+
+def test_record_fields_show_their_types_after_their_names(tmp_path: Path) -> None:
+    source = (
+        'let io = import("std:stdio")\n'
+        'let json = import("std:json")\n'
+        "let show = [io.printf, json.encode] (a: i64, w: i32, r: f64) => null {\n"
+        "    let point = #{x: 1, y: 2.5}\n"
+        '    let text = json.encode(#{s: a + 1, c: a < 3, n: -r, px: point.x, half: w / 2, name: "x", k: 2})\n'
+        '    io.printf("%s", text)\n'
+        "}\n"
+    )
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    hints = [h for h in Document.open(tmp_path / "main.bif", source).inlay_hints() if not h.parameter]
+    line = source.splitlines()[4]
+    start = line.index("#{")
+    fields = [
+        (re.split(r"#\{|, ", line[: hint.position[1]])[-1], hint.label)  # the field's name, then its type
+        for hint in hints
+        if hint.position[0] == 4 and hint.position[1] > start  # not `let text`'s
+    ]
+    assert fields == [
+        ("s", ": i64"),
+        ("c", ": bool"),
+        ("n", ": f64"),
+        ("px", ": i64"),
+        ("half", ": i32"),
+        ("name", ": str"),
+        ("k", ": i64"),
+    ]
+
+
+def test_fields_read_through_a_guard_show_their_declared_types(tmp_path: Path) -> None:
+    # The compiler holds a guard as a pointer, so the field's type comes from the object's declaration.
+    source = (
+        'let mem = import("std:mem")\n'
+        'let json = import("std:json")\n'
+        "let State = struct { let hits: i64 }\n"
+        "let show = [json.encode] (app: mem.Shared[State]) => null {\n"
+        "    let s <- app\n"
+        "    let text = json.encode(#{hits: s.hits})\n"
+        "    s -> app\n"
+        "}\n"
+    )
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    document = Document.open(tmp_path / "main.bif", source)
+    assert [
+        (hint.position[0], hint.label)
+        for hint in document.inlay_hints()
+        if hint.position[0] == 5 and not hint.parameter
+    ][-1] == (
+        5,
+        ": i64",
+    )
+    assert document.hover(_position(source, "hits: s")) == "```bifrost\nhits: i64\n// a field of #{hits: i64}\n```"
+
+
+def test_arguments_show_the_parameters_they_fill(tmp_path: Path) -> None:
+    source = (
+        'let io = import("std:stdio")\n'
+        "let area = (width: i64, height: i64) => i64 width * height\n"
+        "let show = [io.printf, area] (height: i64) => null {\n"
+        "    let scale = (factor: i64) => i64 factor * 2\n"
+        '    io.printf("%lld %lld\\n", area(3, height), scale(4))\n'
+        "    let named = area(width: 2, height: 5)\n"
+        "}\n"
+    )
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    hints = [hint for hint in Document.open(tmp_path / "main.bif", source).inlay_hints() if hint.parameter]
+    line = source.splitlines()[4]
+    # `height` fills `height`, printf's values are variadic, and named arguments say their names already.
+    assert [(hint.position[0], line[hint.position[1] :][:3], hint.label) for hint in hints] == [
+        (4, '"%l', "format:"),
+        (4, "3, ", "width:"),
+        (4, "4))", "factor:"),
+    ]
+
+
+NAMED = """\
+let time = import("std:time")
+let tasks = import("std:tasks")
+let width = 3
+let Box = struct { let width: i64 }
+let area = (width: i64, height: i64) => i64 width * height
+let wait = [time.sleep] async (id: i64) => i64 {
+    await time.sleep(1)
+    return id
+}
+let main = [area, tasks.gather, wait] async () => null {
+    let box = Box(width: width)
+    let size = area(width: 2, height: 5)
+    let found = await tasks.gather(width: wait(1))
+}
+"""
+
+
+@pytest.fixture
+def named(tmp_path: Path) -> Document:
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    return Document.open(tmp_path / "main.bif", NAMED)
+
+
+@pytest.mark.parametrize(
+    ("needle", "expected"),
+    [
+        ("width: width", "let width: i64\n// a field of Box"),
+        ("width: 2", "width: i64\n// a parameter of area"),
+    ],
+)
+def test_a_named_argument_is_the_field_or_parameter_it_names(named: Document, needle: str, expected: str) -> None:
+    # Not the top-level `width` of the same name.
+    assert named.hover(_position(NAMED, needle)) == f"```bifrost\n{expected}\n```"
+    declared = "let width: i64 }" if "field" in expected else "width: i64, height"
+    location = named.definition(_position(NAMED, needle))
+    assert location is not None
+    assert location.range[0] == _position(NAMED, declared.removeprefix("let "))
+
+
+def test_a_named_argument_of_a_builtin_is_not_the_name_it_shadows(named: Document) -> None:
+    assert named.hover(_position(NAMED, "width: wait")) is None
+    assert named.definition(_position(NAMED, "width: wait")) is None

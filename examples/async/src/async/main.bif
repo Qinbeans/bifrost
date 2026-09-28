@@ -33,6 +33,7 @@ let main = [stdio.printf, time.now, async_.gather, task1, task2] async () => nul
     // Calls that pause are awaited: only an async function can, and main is async
     // because config.yaml says `type: async`
     let started = time.now()
-    let _task = await async_.gather(task1(), task2())
+    let task = await async_.gather(task1(), task2())
+    stdio.printf("Task status: %lld\n", task)
     stdio.printf("Slept for %lld ms\n", time.now() - started)
 }

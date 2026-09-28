@@ -170,7 +170,7 @@ def test_guard_types_are_hinted(tmp_path: Path) -> None:
     document = Document.open(tmp_path / "counter.bif", COUNTER)
     lines = COUNTER.splitlines()
     tick_lock, main_lock = lines.index("    let guard <- ctx"), lines.index("    let local <- ctx")
-    assert [(hint.position, hint.label) for hint in document.inlay_hints()] == [
+    assert [(hint.position, hint.label) for hint in document.inlay_hints() if not hint.parameter] == [
         ((tick_lock, len("    let guard")), ": mem.WeakGuard[Context]"),  # locks a `mem.Weak[Context]` parameter
         ((main_lock, len("    let local")), ": mem.UniqueGuard[Context]"),  # locks `let ctx: mem.Unique[Context] = ...`
     ]

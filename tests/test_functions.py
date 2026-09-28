@@ -134,7 +134,9 @@ def test_editor_shows_function_types() -> None:
     )
     document = Document.open(EXAMPLES / "scratch.bif", source)
     assert [d.message for d in document.diagnostics()] == []
-    hints = {row: label for (row, _), label in ((h.position, h.label) for h in document.inlay_hints())}
+    hints = {
+        row: label for (row, _), label in ((h.position, h.label) for h in document.inlay_hints() if not h.parameter)
+    }
     assert hints == {3: ": (x: i32) => i32", 4: ": (x: i32) => i32", 5: ": i32"}
     assert "x: i32" in (document.hover((5, 16)) or "")  # the lambda's own parameter
 
