@@ -1,6 +1,6 @@
 [project]
 name = "bifrost"
-version = "0.1.0"
+version = "0.1.1"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -9,7 +9,7 @@ dependencies = [
     "tree-sitter>=0.24.0",
     "typer>=0.15.1",
     "mlir-python>=0.2.4",
-    "tree-sitter-bifrost>=0.1.16",
+    "tree-sitter-bifrost>=0.1.17",
     "pyyaml>=6.0.3",
     "pygls>=2.0",
     "libclang>=18",

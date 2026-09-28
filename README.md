@@ -174,6 +174,20 @@ let main = [json.encode, stdio.puts] () => null {
 
 The compiler writes the conversion from the field names and types, so there is no reflection at run time: strings are escaped, numbers and bools written as they are, and nested records and objects become nested JSON objects. A C function can take JSON directly: a parameter declared `json` in `config.yaml` is given a record or object encoded at the call (and freed after it), or a `str` as JSON text already. That is how the HTTP example responds: `http.json(ctx, 200, #{sum: a + b})`.
 
+A record's type is written like a record, with types for values: `#{name: str, ms: i64}`. It can go wherever a type does: a parameter, a `let`, or a function's result. A function can also return `Record`, a record shaped like the ones it returns:
+
+```bifrost
+let timed = [time.now, time.sleep] async (name: str, ms: i64) => Record {
+    let started = time.now()
+    await time.sleep(ms)
+    return #{name: name, ms: time.now() - started}     // Record is #{name: str, ms: i64}
+}
+
+let point = [] (x: i64, y: i64) => #{x: i64, y: i64} #{x: x, y: y}
+```
+
+Every `return` of a `Record` function must give a record of the same shape; if two differ, the compiler asks to consolidate them into one (or to write the type). The order of fields does not matter: `#{y: 2, x: 1}` is a `#{x: i64, y: i64}`.
+
 ### Lists
 
 A list is written `#[4, 8, 15]` and typed `i64[]`. Index it with `xs[i]` (`xs[-1]` is the last item; an index out of range stops the program), take `len(xs)`, and loop over it with `forall`. `#[a...b]` is the range from `a` up to `b`, `b` excluded; `forall` counts through a range without making a list:

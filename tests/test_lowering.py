@@ -259,3 +259,36 @@ def test_empty_dependency_list_means_no_dependencies(tmp_path: Path) -> None:
     assert _function(project, "one")() == 1
     with pytest.raises(BifrostError, match="add it to the dependency list"):
         _lower(tmp_path, "let one = () => i32 1\nlet two = [] () => i32 one() + 1\n")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "return 1",
+        "if n > 0 { return 1 } else if n < 0 { return -1 } else { return 0 }",
+        "match n { 1: return 10, _: { return 0 } }",
+        "while true { return n }",
+        "let m = n + 1\n    return m",
+    ],
+)
+def test_bodies_that_return_on_every_path(tmp_path: Path, body: str) -> None:
+    project = _lower(tmp_path, f"let f = (n: i64) => i64 {{\n    {body}\n}}\n")
+    assert isinstance(_function(project, "f")(1), int)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "let m = n + 1",
+        "if n > 0 { return 1 }",
+        "if n > 0 { return 1 } else { let m = 2 }",
+        "match n { 1: return 10, 2: return 20 }",
+        "while n > 0 { return n }",
+        "forall i in #[0...3] { return i }",
+    ],
+)
+def test_a_body_that_can_end_without_a_return_is_an_error(tmp_path: Path, body: str) -> None:
+    with pytest.raises(BifrostError) as error:
+        _lower(tmp_path, f"let f = (n: i64) => i64 {{\n    {body}\n}}\n")
+    assert error.value.msg == "f must return i64, but its body can end without a `return`; return a i64 at the end"
+    assert error.value.lineno == 1  # at the result type

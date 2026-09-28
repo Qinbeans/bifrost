@@ -459,6 +459,14 @@ class _Formatter:
     def _tuple_type(self, node: Node, depth: int) -> str:
         return "<" + ", ".join(self.format(t, depth) for t in _named(node)) + ">"
 
+    def _record_type(self, node: Node, depth: int) -> str:
+        """``#{name: str, ms: i64}``, on one line like other types."""
+        return "#{" + ", ".join(self.format(field, depth) for field in _named(node)) + "}"
+
+    def _record_type_field(self, node: Node, depth: int) -> str:
+        name, kind = node.child_by_field_name("name"), node.child_by_field_name("type")
+        return f"{_text(name)}: {self.format(kind, depth)}"
+
     def _function_type(self, node: Node, depth: int) -> str:
         parameters = ", ".join(self.format(p, depth) for p in node.children_by_field_name("parameter"))
         return_type = self.format(node.child_by_field_name("return_type"), depth)

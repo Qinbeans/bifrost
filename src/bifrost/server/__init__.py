@@ -185,6 +185,7 @@ def _inlay_hints(params: types.InlayHintParams) -> list[types.InlayHint]:
             label=hint.label,
             kind=types.InlayHintKind.Parameter if hint.parameter else types.InlayHintKind.Type,
             padding_right=hint.parameter,  # `status: 200`, not `status:200`
+            tooltip=hint.tooltip or None,  # the whole type, where the label shortens it
         )
         for hint in _document(params.text_document.uri).inlay_hints()
     ]

@@ -133,6 +133,7 @@ def test_ignore_starts_a_call_without_waiting(tmp_path: Path) -> None:
         ('await tasks.gather(done: log("a"))', "log(...) returns nothing; pass it without a name"),
         ("let n = await tasks.gather(a: fetch_count(1), a: fetch_count(2))", "already has a result named 'a'"),
         ("await tasks.gather()", "tasks.gather takes the calls to run"),
+        ('let n = await tasks.gather(log("a"), log("b"))', "tasks.gather(...) gives nothing here"),
         ('let tasks = await tasks.gather(log("a"))', "'tasks' is a module of this file (an import)"),
         (
             "let u: mem.Unique[User] = User(id: 1, score: 0.0)\n    await tasks.gather(peek(u))",

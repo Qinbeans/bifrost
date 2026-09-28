@@ -259,8 +259,14 @@ def test_hover_shows_record_fields(records: Document, needle: str, occurrence: i
 
 
 def test_records_show_their_types_in_async_main_too(records: Document) -> None:
-    assert [hint.label for hint in records.inlay_hints() if not hint.parameter] == [
-        ": #{x: i64, y: f64, tag: #{name: str, ok: bool}}",
+    hints = [hint for hint in records.inlay_hints() if not hint.parameter]
+    # A long record is shortened, and shown whole in the hint's tooltip.
+    assert (hints[0].label, hints[0].tooltip) == (
+        ": #{x: i64, y: f64, ...}",
+        "#{x: i64, y: f64, tag: #{name: str, ok: bool}}",
+    )
+    assert [hint.label for hint in hints] == [
+        ": #{x: i64, y: f64, ...}",
         ": i64",  # the fields of `point`
         ": f64",
         ": #{name: str, ok: bool}",
@@ -397,3 +403,76 @@ def test_a_named_argument_is_the_field_or_parameter_it_names(named: Document, ne
 def test_a_named_argument_of_a_builtin_is_not_the_name_it_shadows(named: Document) -> None:
     assert named.hover(_position(NAMED, "width: wait")) is None
     assert named.definition(_position(NAMED, "width: wait")) is None
+
+
+@pytest.mark.parametrize("compiled_before", [False, True])
+def test_completes_the_fields_of_records(records: Document, compiled_before: bool) -> None:
+    from bifrost.server import analysis  # noqa: PLC0415 - to forget the types other tests compiled
+
+    analysis._LAST_TYPES.clear()
+    if compiled_before:
+        records.diagnostics()
+    # Half typed, the file does not compile: the fields come from before, or from the code as written.
+    typing = RECORDS.replace('io.printf("%lld %f", found.user.id, found.other.score)', "found.")
+    typed = RECORDS.replace('io.printf("%lld %s", point.x, point.tag.name)', "point.tag.")
+    for source, expected in [
+        (typing, [("user", "user: User"), ("other", "other: User")]),
+        (typed, [("name", "name: str"), ("ok", "ok: bool")]),
+    ]:
+        document = Document.open(records.path, source)
+        line = next(i for i, text in enumerate(source.splitlines()) if text.strip() in {"found.", "point.tag."})
+        position = (line, len(source.splitlines()[line]))
+        assert [(c.label, c.detail) for c in document.completions(position)] == expected
+
+
+RECORD_RESULTS = """\
+let stdio = import("std:stdio")
+
+let sign = [] (n: i64) => Record {
+    return #{value: n, negative: n < 0}
+}
+
+let main = [stdio.printf, sign] () => null {
+    let s = sign(-4)
+    stdio.printf("%lld", s.value)
+}
+"""
+
+
+def test_record_results_show_their_shape(tmp_path: Path) -> None:
+    from bifrost.server import analysis  # noqa: PLC0415 - to forget the types other tests compiled
+
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    document = Document.open(tmp_path / "main.bif", RECORD_RESULTS)
+    assert document.diagnostics() == []
+    shape = "#{value: i64, negative: bool}"
+    assert document.hover(_position(RECORD_RESULTS, "Record")) == (
+        f"```bifrost\nRecord = {shape}\n// the result: records of one shape, from every `return`\n```"
+    )
+    assert document.hover(_position(RECORD_RESULTS, "sign = ")) == (
+        f"```bifrost\nlet sign = (n: i64) => Record\n// Record is {shape}\n```"
+    )
+    assert f": {shape}" in [hint.label for hint in document.inlay_hints()]
+    # Half typed, nothing compiles: the fields come from what `sign` returns, as written.
+    analysis._LAST_TYPES.clear()
+    typing = RECORD_RESULTS.replace('stdio.printf("%lld", s.value)', "s.")
+    line = typing.splitlines().index("    s.")
+    completions = Document.open(tmp_path / "main.bif", typing).completions((line, 6))
+    assert [(c.label, c.detail) for c in completions] == [("value", "value: i64"), ("negative", "negative: bool")]
+
+
+@pytest.mark.parametrize(
+    ("whole", "short"),
+    [
+        ("#{task1: #{task1: str}, task2: str}", "#{task1: #{task1: str}, ...}"),
+        ("#{a: #{b: i64, c: i64}}", "#{a: #{b: i64, ...}}"),
+        ("#{value: i64, negative: bool}", "#{value: i64, negative: bool}"),  # short enough already
+        ("mem.Unique[str]", "mem.Unique[str]"),
+    ],
+)
+def test_long_records_are_shortened_in_hints(whole: str, short: str) -> None:
+    from bifrost.server.analysis import _short_type  # noqa: PLC0415
+
+    assert _short_type(whole, nested=False) == short

@@ -119,6 +119,8 @@ class Project:
         self.json_parameters: dict[str, set[int]] = {}
         # Compiled symbols of the Bifrost functions that pause (async functions).
         self.pausing: set[str] = set()
+        # Record fields ((name, type), ...) -> their record type, shared by every file.
+        self.records: dict[tuple[tuple[str, object], ...], type] = {}
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
         self._runtime_externs: dict[str, Function[..., Any]] = {}
         self._init_declarations()

@@ -22,7 +22,7 @@ from tree_sitter import Language, Node, Parser
 from bifrost import std
 from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.configs.schema import Declaration, _Extern
-from bifrost.lowering import BifrostError, display_types, lower_file
+from bifrost.lowering import RECORD, BifrostError, display_types, lower_file
 from bifrost.naming import extern_name, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
 from bifrost.project import Project
 from bifrost.std import fmt, json, mem, tasks
@@ -95,6 +95,7 @@ class InlayHint:
     position: Position
     label: str  # e.g. ": Guard[Context]", or "status:" before an argument
     parameter: bool = False  # names the parameter an argument fills, rather than a type
+    tooltip: str = ""  # the whole type, where the label shortens it
 
 
 @contextmanager
@@ -110,13 +111,31 @@ def _capturing_types(sink: dict[str, dict[str, Any]]) -> Iterator[None]:
 
     def compile_and_record(compiler: FunctionCompiler) -> None:
         original(compiler)
-        sink[compiler.function.name] = dict(compiler.variable_types)
+        found = dict(compiler.variable_types)
+        if len(compiler.signature.results) == 1:
+            found[_RESULT] = compiler.signature.results[0]  # what it returns: the shape of a `Record`
+        sink[compiler.function.name] = found
 
     FunctionCompiler.compile = compile_and_record  # type: ignore[method-assign]
     try:
         yield
     finally:
         FunctionCompiler.compile = original  # type: ignore[method-assign]
+
+
+# The key of a function's result among its compiled local types (no local is named `return`).
+_RESULT = "return"
+
+# Each file's local types from its last compile, by function symbol: while a line
+# is half typed (`results.`) nothing compiles, and completion still needs them.
+_LAST_TYPES: dict[Path, dict[str, dict[str, Any]]] = {}
+
+
+def _remember_types(path: Path, inferred: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return ``inferred`` over the functions' types from before, and keep that for next time."""
+    merged = {**_LAST_TYPES.get(path, {}), **inferred}
+    _LAST_TYPES[path] = merged
+    return merged
 
 
 def find_config(path: Path) -> Path | None:
@@ -237,10 +256,13 @@ class Document:
     config_path: Path | None = None
     config: Config | None = None
     _lines: list[bytes] = field(init=False, repr=False)
+    # The `=> Record` functions whose returns are being read (a record holding a call of itself stops there).
+    _resolving: set[int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Split the source into lines, for position conversions."""
         self._lines = self.source.split(b"\n")
+        self._resolving = set()
 
     @classmethod
     def open(cls, path: Path, text: str) -> "Document":
@@ -346,7 +368,7 @@ class Document:
         inferred: dict[str, dict[str, Any]] = {}
         syntax = self._syntax_errors()
         if syntax:
-            return syntax, inferred
+            return syntax, _remember_types(self.path, inferred)  # half typed: the types it last compiled with
         found = []
         if self.config_path is None:
             found.append(
@@ -369,7 +391,7 @@ class Document:
             found.append(self._error_diagnostic(error))
         except CompileError as error:
             found.append(Diagnostic(((0, 0), (0, 0)), error.msg))
-        return found, inferred
+        return found, _remember_types(self.path, inferred)
 
     def _syntax_errors(self) -> list[Diagnostic]:
         return [Diagnostic(self.range(p.node), p.message) for p in syntax_errors(self.root)]
@@ -500,7 +522,9 @@ class Document:
             declared = local.child_by_field_name("type")
             if declared is not None:
                 return " ".join(_text(declared).split())
-            return self._type_of_value(_unwrap(parts[-1]), local) or self._inferred_type(local)
+            value = _unwrap(parts[-1])
+            written = self._written_type(value, local) if value.type == "await_expression" else None
+            return self._type_of_value(value, local) or self._inferred_type(local) or written
         return None
 
     def _guard_type(self, locked: str) -> str:
@@ -621,7 +645,7 @@ class Document:
         if binding[1].type == "struct_assignment":
             return name
         if binding[1].type == "function_definition":
-            return self._signature(binding[1]).rpartition(" => ")[2] or None
+            return self._result_of(binding[1])
         return None
 
     def _type_of_static_call(self, struct: Node, name: str) -> str | None:
@@ -629,8 +653,32 @@ class Document:
         for member in struct.named_children:
             identifier = _name_of(member) if member.type == "struct_field" else None
             if identifier is not None and _text(identifier) == name:
-                return self._member_signature(member).rpartition(" => ")[2] or None
+                function = next((p for p in _named(member) if p.type == "local_function_definition"), None)
+                return self._result_of(function) if function is not None else None
         return None
+
+    def _result_of(self, function: Node) -> str | None:
+        """Return a function's result type as written, or, for ``Record``, the record it returns."""
+        written = self._signature(function).rpartition(" => ")[2] or None
+        if written != RECORD:
+            return written
+        shown = self._record_text(self._returned_entries(function))
+        return self._record_returned(function) or shown or written
+
+    def _record_text(self, entries: list[tuple[str, Node]] | None) -> str | None:
+        """Write a record's type from its fields as written: ``#{name: str, ms: i64}``.
+
+        Each value is typed where it is written (``n`` is the parameter of the function returning it).
+        """
+        if not entries:
+            return None
+        return "#{" + ", ".join(f"{name}: {self._written_type(v, v) or '?'}" for name, v in entries) + "}"
+
+    def _record_returned(self, function: Node) -> str | None:
+        """Return the record a function written ``=> Record`` returns, once it has compiled: ``#{ms: i64}``."""
+        symbol = self._symbol_of(function)
+        kind = self._compiled[1].get(symbol, {}).get(_RESULT) if symbol is not None else None
+        return _type_name(kind) if kind is not None else None
 
     def inlay_hints(self) -> list[InlayHint]:
         """Show the type of each guard and untyped ``let``: ``let guard: mem.WeakGuard[Context] <- ctx``.
@@ -654,7 +702,7 @@ class Document:
             kind = self._type_of_binding(node)
             if identifier is not None and kind is not None:
                 hints.append(InlayHint(self.position(identifier.end_point), f": {kind}"))
-        return sorted(hints, key=lambda hint: hint.position)
+        return sorted((_shortened(hint) for hint in hints), key=lambda hint: hint.position)
 
     def _argument_hints(self, call: Node) -> list[InlayHint]:
         """Name the parameter each positional argument fills, as clangd does: ``http.text(ctx, status: 200)``.
@@ -980,6 +1028,17 @@ class Document:
             return None
         return _text(path[0]), [_text(p) for p in path[1:]]
 
+    def _hover_record_result(self, node: Node) -> str | None:
+        """Describe ``Record`` where a function's result is written: the record it returns."""
+        written = node.parent if node.parent is not None and node.parent.type == "identifier" else node
+        result = written.parent
+        function = result.parent if result is not None and result.type == "type_or_object" else None
+        if function is None or function.type not in {"function_definition", "local_function_definition"}:
+            return ""
+        record = self._record_returned(function)
+        shape = record or "a record, shaped like what the function returns (once it compiles)"
+        return _code(f"{RECORD} = {shape}\n// the result: records of one shape, from every `return`")
+
     def _hover_access(self, node: Node) -> str | None:
         """Describe a name that is not a plain one: ``module.member``, ``value.field.field``, or a field in ``#{...}``.
 
@@ -989,6 +1048,8 @@ class Document:
         if self._is_argument_name(node):
             target = self._argument_target(node)
             return _code(target[0]) if target is not None else ""
+        if _text(node) == RECORD:
+            return self._hover_record_result(node)
         written = self._hover_record_literal(node)
         if written is not None:
             return written
@@ -1051,13 +1112,8 @@ class Document:
                 return {"string": "str", "boolean": "bool"}[value.type]
             case "number":
                 return "f64" if _named(value)[0].type == "float" else "i64"
-            case "record":
-                fields = [
-                    f"{_text(_named(field)[0])}: {self._written_type(_named(field)[-1], where) or '?'}"
-                    for field in _named(value)
-                    if field.type == "record_field"
-                ]
-                return "#{" + ", ".join(fields) + "}"
+            case "record" | "await_expression":
+                return self._record_text(self._entries(value, where))
             case "binary_expression" | "unary_expression":
                 return self._operation_type(value, where)
             case "child_annotation" if all(part.type == "simple_identifier" for part in _named(value)):
@@ -1138,8 +1194,10 @@ class Document:
             if owner in self.bindings():
                 return self._static_members(owner)
             where = self.root.named_descendant_for_point_range((row, character), (row, character))
-            found = self._struct_of(owner, where) if where is not None else None
-            return self._fields(found[1]) if found is not None else []
+            found = self._struct_of(owner, where) if where is not None and "." not in owner else None
+            if found is not None:
+                return self._fields(found[1])
+            return self._record_completions(owner, where) if where is not None and owner else []
         names = [
             Completion(name, self._describe(value)[0].value, self._describe(value)[1])
             for name, (_, value) in self.bindings().items()
@@ -1228,6 +1286,9 @@ class Document:
         name = _text(identifier) if identifier is not None else "?"
         if len(parts) > 1 and parts[-1].type == "function_definition":
             described = f"let {name} = {self._signature(parts[-1])}"
+            record = self._record_returned(parts[-1]) if described.endswith(f"=> {RECORD}") else None
+            if record is not None:
+                described += f"\n// {RECORD} is {record}"
             if name == "main" and parts[-1].child_by_field_name("async") is not None:
                 try:
                     kind = self.load_config().package.type
@@ -1308,6 +1369,80 @@ class Document:
             found.append(Completion(_text(identifier), "field", self._member_signature(member)))
         return found
 
+    def _record_completions(self, owner: str, where: Node) -> list[Completion]:
+        """Offer the fields of the record (or object) ``owner`` reaches, after ``results.`` or ``found.user.``."""
+        name, *fields = owner.split(".")
+        local = self._local(name, where)
+        if local is None:
+            return []
+        kind = _field_type(self._compiled_type(local), fields)
+        if kind is not None and kind.kind == "struct":
+            return [Completion(field, "field", f"{field}: {_type_name(held)}") for field, held in kind.fields]
+        written = self._path_type(name, fields, where) if fields else None
+        found = self._struct_named(written) if written is not None else None
+        return self._fields(found[1]) if found is not None else self._written_fields(local, fields)
+
+    def _written_fields(self, local: Node, path: list[str]) -> list[Completion]:
+        """Offer the fields of a record a ``let`` holds as written, for when the file does not compile.
+
+        ``let p = #{x: 1}`` gives ``x``; ``let found = await tasks.gather(user: f())``
+        gives ``user``; ``path`` leads into a record in it (``p.tag.``, ``found.user.``).
+        """
+        value = _named(local)[-1] if local.type == "local_assignment" else None
+        entries = self._entries(value, local) if value is not None else None
+        for wanted in path:
+            chosen = next((written for name, written in entries or [] if name == wanted), None)
+            if chosen is None:
+                return []
+            entries = self._entries(chosen, local)
+            if entries is None:  # not a record: an object, like `User`
+                kind = self._written_type(chosen, local)
+                found = self._struct_named(kind) if kind is not None else None
+                return self._fields(found[1]) if found is not None else []
+        return [
+            Completion(name, "field", f"{name}: {self._written_type(written, written) or '?'}")
+            for name, written in entries or []
+        ]
+
+    def _entries(self, value: Node, where: Node) -> list[tuple[str, Node]] | None:
+        """Return the fields of the record an expression gives, as written: each name and the value it holds.
+
+        A record literal, ``await tasks.gather(name: f())``, a local holding one,
+        or a call of a function written ``=> Record`` (from what it returns).
+        """
+        value = _unwrap(value)
+        if value.type == "await_expression":
+            awaited = value.child_by_field_name("value")
+            value = _unwrap(awaited) if awaited is not None else value
+        found = _written_entries(value)
+        if found is not None:
+            return found
+        if value.type == "identifier":
+            local = self._local(_text(value), where)
+            held = _named(local)[-1] if local is not None and local.type == "local_assignment" else None
+            return self._entries(held, local) if held is not None and held != value else None
+        if value.type == "function_call":
+            call = _named(value)[0]
+            function = call.child_by_field_name("function")
+            binding = self.bindings().get(_text(function)) if function is not None else None
+            if binding is not None and binding[1].type == "function_definition":
+                return self._returned_entries(binding[1])
+        return None
+
+    def _returned_entries(self, function: Node) -> list[tuple[str, Node]] | None:
+        """Return the fields of the record a ``=> Record`` function returns, from its first ``return`` of one."""
+        if self._signature(function).rpartition(" => ")[2] != RECORD or function.id in self._resolving:
+            return None
+        self._resolving.add(function.id)
+        try:
+            body = _named(function)[-1]
+            returned = [_named(r)[0] for r in _descendants(body, "return_statement", own=True) if _named(r)]
+            if body.type != "block_expression":
+                returned = [body]
+            return next((found for value in returned if (found := self._entries(value, value)) is not None), None)
+        finally:
+            self._resolving.discard(function.id)
+
     def _static_members(self, owner: str) -> list[Completion]:
         """Offer an object's static functions after ``Object.``."""
         binding = self.bindings().get(owner)
@@ -1381,6 +1516,56 @@ def _kind_of_binding(node: Node) -> str | None:
 _LOGICAL = {"<", "<=", ">", ">=", "==", "!=", "&&", "||", "!", "and", "or", "not"}
 
 
+# How long a record in an inlay hint may get before its other fields are left as `...`.
+_HINT_RECORD = 30
+
+
+def _shortened(hint: InlayHint) -> InlayHint:
+    """Shorten the records in a type hint, keeping the whole type for its tooltip."""
+    if hint.parameter or "#{" not in hint.label:
+        return hint
+    short = _short_type(hint.label.removeprefix(": "), nested=False)
+    if f": {short}" == hint.label:
+        return hint
+    return InlayHint(hint.position, f": {short}", tooltip=hint.label.removeprefix(": "))
+
+
+def _short_type(kind: str, *, nested: bool) -> str:
+    """``#{task1: #{task1: str, ok: bool}, task2: str}`` -> ``#{task1: #{task1: str, ...}, ...}``.
+
+    A record shows its fields while they fit (a nested one, only its first),
+    and ``...`` for the rest; other types are left as they are.
+    """
+    if not (kind.startswith("#{") and kind.endswith("}")):
+        return kind
+    fields = _top_level(kind[2:-1])
+    shown: list[str] = []
+    for index, written in enumerate(fields):
+        name, _, held = written.partition(": ")
+        entry = f"{name}: {_short_type(held, nested=True)}"
+        more = ", ..." if index < len(fields) - 1 else ""
+        if shown and (nested or len("#{" + ", ".join([*shown, entry]) + more + "}") > _HINT_RECORD):
+            break
+        shown.append(entry)
+    rest = ", ..." if len(shown) < len(fields) else ""
+    return "#{" + ", ".join(shown) + rest + "}"
+
+
+def _top_level(text: str) -> list[str]:
+    """Split ``a: i64, b: #{c: str, d: f64}`` at its top-level commas."""
+    parts, depth, start = [], 0, 0
+    for index, char in enumerate(text):
+        if char in "{[(":
+            depth += 1
+        elif char in "}])":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
 def _field_type(kind: Any, path: list[str]) -> Any:  # noqa: ANN401 - a compiler type
     """Follow ``path`` through the fields of a record or object type; ``None`` where one is missing."""
     for name in path:
@@ -1388,6 +1573,25 @@ def _field_type(kind: Any, path: list[str]) -> Any:  # noqa: ANN401 - a compiler
             return None
         kind = dict(kind.fields).get(name)
     return kind
+
+
+def _written_entries(value: Node) -> list[tuple[str, Node]] | None:
+    """Return the fields a record gets where it is written: ``#{x: 1}``, or ``tasks.gather(user: f())``'s names."""
+    if value.type == "literal":
+        value = _named(value)[0]
+    if value.type == "record":
+        fields = [field for field in _named(value) if field.type == "record_field" and len(_named(field)) > 1]
+        return [(_text(_named(field)[0]), _named(field)[-1]) for field in fields]
+    if value.type == "child_annotation" and _text(value).split("(")[0].endswith(".gather"):
+        call = _named(_named(value)[-1])[0]  # the user_function_call
+        arguments = [argument for argument in _named(call) if argument.type == "named_argument"]
+        return [
+            (_text(name), written)
+            for argument in arguments
+            if (name := argument.child_by_field_name("name")) is not None
+            and (written := argument.child_by_field_name("value")) is not None
+        ]
+    return None
 
 
 def _parameter_names(function: Node) -> list[str] | None:

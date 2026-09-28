@@ -231,6 +231,41 @@ def _type_label(kind: object) -> str:
     return getattr(kind, "__name__", None) or (found.name if found is not None else repr(kind))
 
 
+def _returns(node: Node) -> bool:
+    """Whether a statement (or block) returns on every path, so that nothing runs after it.
+
+    A ``return``; an ``if`` whose branches, ``else`` included, all return; a
+    ``match`` with a ``_`` arm whose arms all return; a block with such a
+    statement; or ``while true`` (only ``return`` leaves it).
+    """
+    node = _unwrap(node)
+    match node.type:
+        case "return_statement":
+            return True
+        case "block_expression":
+            return any(_returns(statement) for statement in _children(node))
+        case "if":
+            branches = _children(node)[1:]  # after the condition: `then`, and `else` if there is one
+            return len(branches) == 2 and all(_returns(branch) for branch in branches)  # noqa: PLR2004
+        case "match_expression":
+            arms = [arm for arm in _children(node) if arm.type == "match_arm"]
+            default = any(_text(_children(arm)[0]) == "_" for arm in arms)
+            return default and all(_returns(_children(arm)[-1]) for arm in arms)
+        case "while":
+            condition = _unwrap(_children(node)[0])
+            return _text(condition) == "true"
+    return False
+
+
+def _is_statement(node: Node) -> bool:
+    """Whether the expression ``node`` is in (``await f()``, ``(f())``) is a statement of its own, its value unused."""
+    around = {"function_call", "child_annotation", "await_expression", "expression", "parenthesized_expression"}
+    current = node.parent
+    while current is not None and current.type in around:
+        current = current.parent
+    return current is not None and current.type == "block_expression"
+
+
 def _is_async(function: Node) -> bool:
     """Whether a function definition is written ``async``."""
     return function.child_by_field_name("async") is not None
@@ -251,6 +286,18 @@ def _file_key(path: Path, root: Path) -> str:
     except ValueError:
         relative = Path(path.name)
     return "_".join(relative.with_suffix("").parts)
+
+
+# `=> Record`: the function returns a record, shaped like the records it returns.
+RECORD = "Record"
+_INFERRED = object()  # its result while it is being lowered
+
+
+def _shown(kind: ScalarType) -> str:
+    """Write a type as Bifrost does: ``#{ms: i64, name: str}`` for a record, ``str`` for a ``cstr``."""
+    if isinstance(kind, StructType) and kind.python.__name__ == "record":
+        return "#{" + ", ".join(f"{name}: {_shown(field)}" for name, field in kind.fields) + "}"
+    return "str" if kind == cstr else display_types(kind.name)
 
 
 class _FunctionScope:
@@ -284,6 +331,9 @@ class _FunctionScope:
         self.lend_call: Node | None = None  # the one call in this statement that may lend
         self.before: list[ast.stmt] = []
         self.after: list[ast.stmt] = []
+        self.result: object = None  # its result type, as written (`_INFERRED` for `Record`, until lowered)
+        # For a function written `=> Record`: each returned value, with its type.
+        self.results: list[tuple[Node, ScalarType | None]] | None = None
 
     def temporary(self) -> str:
         self.temporaries += 1
@@ -367,7 +417,11 @@ class SourceUnit:
             self._functions = {function.name for function in functions}
             self._pointer_params = {}
             self._function_nodes = {function.name: function.node for function in functions}
-            self._records: dict[tuple[tuple[str, object], ...], type] = {}
+            self._pending = {function.name: function for function in functions}
+            self._records = self.project.records  # records with the same fields have the same type, in every file
+            self._inferred: dict[str, type] = {}  # `=> Record` function -> the record it returns
+            self._inferring: set[str] = set()  # `=> Record` functions being lowered
+            self._lowered: dict[str, Callable[..., Any]] = {}  # functions lowered early, for their record
             self._owned_signatures: dict[str, tuple[bool, set[int]]] = {}
             self._cell_results: dict[str, tuple[mem.Container, object] | None] = {}
             for function in functions:
@@ -377,7 +431,9 @@ class SourceUnit:
             self._find_pausing(functions)
             for function in functions:
                 self._module = function.module
-                python = self._function(function.name, function.node, function.symbol)
+                python = self._lowered.pop(function.name, None) or self._function(
+                    function.name, function.node, function.symbol
+                )
                 self._register(function, python)
             self._module = None
         finally:
@@ -646,6 +702,11 @@ class SourceUnit:
                 return self._written_type(node)
             case "generic_type":
                 return self._generic_type(node)
+            case "record_type":
+                return self._record_shape(node)
+            case "identifier" if _text(node) == RECORD:
+                msg = f"{RECORD} is a function's result, the record it returns: `() => {RECORD} #{{x: 1}}`"
+                raise self.error(node, msg)
             case "identifier" | "child_annotation":
                 found = self._static(node)
                 if not (isinstance(found, type) and hasattr(found, "__lang_struct__")):
@@ -653,6 +714,21 @@ class SourceUnit:
                 return found
             case _:
                 raise self._unsupported(node)
+
+    def _record_shape(self, node: Node) -> type:
+        """``#{name: str, ms: i64}``: the type of records with these fields (in this order)."""
+        fields: list[tuple[str, object]] = []
+        for field in _children(node):
+            name_node = field.child_by_field_name("name")
+            name = self._identifier(name_node)
+            if any(name == other for other, _ in fields):
+                raise self.error(name_node, f"the record type already has a field '{name}'")
+            kind = self._type(field.child_by_field_name("type"))
+            if kind is type(None):
+                raise self.error(field, f"field '{name}' needs a type with values, not null")
+            held = scalar_type(kind)
+            fields.append((name, held.python if isinstance(held, StructType) else held))
+        return self._record_type(tuple(fields))
 
     def _written_type(self, node: Node) -> object:
         """Resolve a ``type`` node: a keyword (``i32``, ``str``, ``null``), a tuple, a function or a list type."""
@@ -842,7 +918,11 @@ class SourceUnit:
             parameter_name = self._identifier(identifier)
             annotations[parameter_name] = self._type(type_node)
             arguments.append(self._at(ast.arg(parameter_name), identifier))
-        annotations["return"] = self._type(return_node)
+        inferring = _text(return_node) == RECORD
+        annotations["return"] = _INFERRED if inferring else self._type(return_node)
+        self._check_returns(name, return_node, body, annotations["return"])
+        if inferring:
+            self._inferring.add(name)
         held = self._held(parameter_list, return_node, body)
         self._check_guards(body, held)
         owned_parameters = {
@@ -857,21 +937,17 @@ class SourceUnit:
         except ownership.OwnershipError as error:
             raise self.error(error.node, error.message) from None
 
-        self._scope = _FunctionScope(name, set(annotations) - {"return"}, symbol or name)
-        self._scope.is_async = is_async = name in self._pausing
+        self._scope = scope = _FunctionScope(name, set(annotations) - {"return"}, symbol or name)
+        scope.result = annotations["return"]
+        scope.results = [] if inferring else None
+        scope.is_async = is_async = name in self._pausing
         if is_async and name == "main" and self.is_root:
             self._check_async_main(node)
-            symbol = "bifrost_async_main"  # run by a plain `main` (see `_register`)
-            self._scope.symbol = symbol
-        self._scope.types = {
-            parameter: scalar_type(kind) for parameter, kind in annotations.items() if parameter != "return"
-        }
-        self._scope.held = held
-        self._scope.plan = plan
-        self._scope.pointers = {name for name, (container, _) in held.items() if container is mem.WEAK} | set(cells)
-        self._scope.cells = cells
-        self._scope.cell_parameters = cell_parameters
-        self._scope.shared_locals = {name for name, (container, _) in held.items() if container is mem.UNIQUE}
+            symbol = scope.symbol = "bifrost_async_main"  # run by a plain `main` (see `_register`)
+        scope.types = {parameter: scalar_type(kind) for parameter, kind in annotations.items() if parameter != "return"}
+        scope.held, scope.plan, scope.cells, scope.cell_parameters = held, plan, cells, cell_parameters
+        scope.pointers = {name for name, (container, _) in held.items() if container is mem.WEAK} | set(cells)
+        scope.shared_locals = {name for name, (container, _) in held.items() if container is mem.UNIQUE}
         if dependency_list is not None:
             self._dependencies(dependency_list)
         self._check_local_names(body)
@@ -880,16 +956,13 @@ class SourceUnit:
             | {self._identifier(lock.child_by_field_name("guard")) for lock in self._descendants(body, "lock")}
             | {self._identifier(_children(loop)[0]) for loop in self._descendants(body, "forall")}
         )
-        if body.type == "block_expression":
-            statements = self._block(body)
-        else:
-            value = self._expression(body)
-            returns = annotations["return"] is not type(None)
-            result = self._at(ast.Return(value) if returns else ast.Expr(value), body)
-            statements = [*self._scope.before, *self._retain_returned(body), result]
+        statements = self._body(body, returns=annotations["return"] is not type(None))
         for dependency, entry in self._scope.dependencies.items():
             if dependency not in self._scope.called:
                 raise self.error(entry, f"'{dependency}' is a dependency of {name} but never called")
+        if inferring:
+            annotations["return"] = self._inferred_record(name, self._scope.results or [])
+            self._inferring.discard(name)
         self._scope = None
 
         definition_type = ast.AsyncFunctionDef if is_async else ast.FunctionDef
@@ -1160,6 +1233,9 @@ class SourceUnit:
         if type_node is not None:
             found = self._container(type_node)
             known = scalar_type(self._type(found[1] if found is not None else type_node))
+            self._check_record(
+                value, known.python if isinstance(known, StructType) else None, f"{_text(identifier)} is"
+            )
         self._scope.types[_text(identifier)] = known
         if type_node is None or self._is(mem.UNIQUE, type_node):
             if type_node is not None:
@@ -1257,6 +1333,8 @@ class SourceUnit:
         """``return value``, freeing the owners still alive first (after computing the value)."""
         assert self._scope is not None
         values = _children(node)
+        if values:
+            self._returned(values[0])
         retains = self._retain_returned(values[0] if values else None)
         value = self._expression(values[0]) if values else None
         # What runs after the returned call (unlocking a cell lent to it), then the frees.
@@ -1625,8 +1703,9 @@ class SourceUnit:
             if isinstance(target, Function) and target.kind == "extern":
                 pointees = self._extern_pointees(target)
             pauses = pauses or self._pauses(target)
-        call = self._at(ast.Call(callee, *self._arguments(node, pointees)), node)
         dotted = ".".join([*(path or []), name])
+        self._check_record_arguments(node, target if owner is not None else callee_name, dotted)
+        call = self._at(ast.Call(callee, *self._arguments(node, pointees)), node)
         if not pauses and node.id in self._scope.awaited:
             raise self.error(node, f"{dotted}(...) does not pause, so there is nothing to await")
         return self._awaited(call, node, dotted) if pauses else call
@@ -1690,6 +1769,91 @@ class SourceUnit:
             raise self.error(node, f"`await` is only allowed in an async function; mark {where} `async`{hint}")
         self._scope.awaited.add(inner.id)
         return self._expression(value)
+
+    def _body(self, body: Node, *, returns: bool) -> list[ast.stmt]:
+        """Lower a function's body: a block, or one expression (its result, if it ``returns``)."""
+        assert self._scope is not None
+        if body.type == "block_expression":
+            return self._block(body)
+        if returns:
+            self._returned(body)
+        value = self._expression(body)
+        result = self._at(ast.Return(value) if returns else ast.Expr(value), body)
+        return [*self._scope.before, *self._retain_returned(body), result]
+
+    def _returned(self, value: Node) -> None:
+        """Note what a function returns: the shape of its ``Record``, or checked against its written record type."""
+        assert self._scope is not None
+        if self._scope.results is not None:
+            self._scope.results.append((value, self._static_type(value)))
+            return
+        self._check_record(value, self._scope.result, f"{self._scope.function} returns")
+
+    def _check_record(self, value: Node, expected: object, what: str) -> None:
+        """Where a record type is expected (``what`` it is for), reject a record with other fields, naming both."""
+        if not (isinstance(expected, type) and expected.__name__ == "record"):
+            return
+        kind = self._static_type(value)
+        if isinstance(kind, StructType) and kind.python.__name__ == "record" and kind.python is not expected:
+            wanted = _shown(scalar_type(expected))
+            raise self.error(value, f"{what} {wanted}, but this is {_shown(kind)}; give it the fields of {wanted}")
+
+    def _check_record_arguments(self, call: Node, callee: object, name: str) -> None:
+        """Check the records passed to a Bifrost function against its parameters' record types."""
+        if not (isinstance(callee, str) and callee in self._function_nodes) and not (
+            isinstance(callee, Function) and callee.kind != "extern"
+        ):
+            return
+        parameters = self._call_signature(callee)[1]
+        arguments = [argument for argument in _children(call) if argument.type == "expression"]
+        for argument, expected in zip(arguments, parameters, strict=False):
+            self._check_record(argument, expected, f"{name} takes")
+
+    def _inferred_record(self, name: str, results: list[tuple[Node, ScalarType | None]]) -> type:
+        """Return the record type a function written ``=> Record`` returns: one shape, from all its returns."""
+        first: tuple[Node, StructType] | None = None
+        for value, kind in results:
+            if kind is None:
+                msg = f"cannot tell the record {name} returns here; name its fields' values first: let x: i64 = ..."
+                raise self.error(value, msg)
+            if not (isinstance(kind, StructType) and kind.python.__name__ == "record"):
+                raise self.error(value, f"{name} returns a {RECORD}, but this returns {_shown(kind)}")
+            if first is None:
+                first = (value, kind)
+            elif kind.python is not first[1].python:
+                msg = (
+                    f"{name} returns records of different shapes: {_shown(first[1])} on line "
+                    f"{first[0].start_point[0] + 1}, and {_shown(kind)} here; consolidate them into one record "
+                    f"with the same fields (or write the result type: => #{{...}})"
+                )
+                raise self.error(value, msg)
+        assert first is not None  # `_check_returns`: it returns on every path
+        self._inferred[name] = first[1].python
+        return first[1].python
+
+    def _record_result(self, name: str, return_node: Node) -> type:
+        """Return the record the ``=> Record`` function ``name`` returns, lowering it first if need be."""
+        if name in self._inferred:
+            return self._inferred[name]
+        if name in self._inferring:
+            msg = f"the record {name} returns depends on a call of {name} itself; write its type: => #{{...}}"
+            raise self.error(return_node, msg)
+        pending = self._pending[name]
+        scope, module = self._scope, self._module
+        self._module = pending.module
+        try:
+            self._lowered[name] = self._function(pending.name, pending.node, pending.symbol)
+        finally:
+            self._scope, self._module = scope, module
+        return self._inferred[name]
+
+    def _check_returns(self, name: str, return_node: Node, body: Node, result: object) -> None:
+        """Require a function with a result to return it on every path, before anything else is checked in it."""
+        if result is type(None) or body.type != "block_expression" or _returns(body):
+            return
+        written = " ".join(_text(return_node).split())
+        msg = f"{name} must return {written}, but its body can end without a `return`; return a {written} at the end"
+        raise self.error(return_node, msg)
 
     def _check_async_main(self, node: Node) -> None:
         """Allow an async ``main`` only when config.yaml says so (``package.type: async``)."""
@@ -1880,7 +2044,13 @@ class SourceUnit:
             tokens.append(prefix)
         self._scope.before += [self._at(ast.Expr(self._at(ast.Await(name(token)), call)), call) for token in tokens]
         if not fields:
-            return self._at(ast.Constant(0), call)
+            if not _is_statement(call):
+                msg = (
+                    "tasks.gather(...) gives nothing here, since none of its calls returns a value; "
+                    "write `await tasks.gather(...)` on its own, or name the calls that return values"
+                )
+                raise self.error(call, msg)
+            return self._at(ast.Constant(0), call)  # a statement: its value is never read
         record = self._record_type(tuple(fields))
         return self._at(ast.Call(self._global(record, "record"), [], results), call)
 
@@ -2028,10 +2198,15 @@ class SourceUnit:
         return self._at(ast.Call(self._global(record, "record"), [], values), node)
 
     def _record_type(self, fields: tuple[tuple[str, object], ...]) -> type:
-        """Return the object type of records with these fields (one type per set of fields, so they mix)."""
-        if fields not in self._records:
-            self._records[fields] = struct(type("record", (), {"__annotations__": dict(fields)}))
-        return self._records[fields]
+        """Return the object type of records with these fields (one type per set of fields, so they mix).
+
+        The fields' order does not matter: ``#{y: 2, x: 1}`` is a ``#{x: i64, y: i64}``.
+        Its fields are laid out (and written as JSON) in the order first met.
+        """
+        key = tuple(sorted(fields, key=lambda field: field[0]))
+        if key not in self._records:
+            self._records[key] = struct(type("record", (), {"__annotations__": dict(fields)}))
+        return self._records[key]
 
     def _global(self, value: object, hint: str) -> ast.Name:
         """Return a name the generated code can use for ``value`` (a type, a runtime function)."""
@@ -2180,6 +2355,8 @@ class SourceUnit:
         node = self._function_nodes.get(qualified)
         if node is not None:
             parts = [part for part in _children(node) if part.type not in {"dependency_list", "local_dependency_list"}]
+            if _text(parts[1]) == RECORD:
+                return scalar_type(self._record_result(qualified, parts[1]))
             found = self._container(parts[1])
             return scalar_type(self._type(found[1] if found is not None else parts[1]))
         names = qualified.split(".")
