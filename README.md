@@ -312,7 +312,7 @@ Variables, functions, parameters and fields are `snake_case`; objects are `Pasca
 | `bifrost lsp` | Run the language server (diagnostics, formatting, outline, hover, go-to-definition, completion) |
 | `bifrost config traverse -c config.yaml -i path/to/include/` | Generate extern declarations in `config.yaml` from C/C++ headers |
 
-[vscode-bifrost](../vscode-bifrost) adds syntax highlighting and connects VS Code to the language server.
+[vscode-bifrost](./extras/vscode-bifrost) adds syntax highlighting and connects VS Code to the language server.
 
 ## Project configuration
 
