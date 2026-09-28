@@ -1,0 +1,80 @@
+{
+  "name": "vscode-bifrost",
+  "displayName": "vscode-bifrost",
+  "description": "Bifrost syntax highlighting and language server",
+  "version": "0.0.2",
+  "publisher": "qinbeans",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Qinbeans/vscode-mimi.git"
+  },
+  "engines": {
+    "vscode": "^1.97.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "bifrost",
+        "aliases": [
+          "Bifrost",
+          "bifrost"
+        ],
+        "extensions": [
+          ".bif"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icon.png",
+          "dark": "./icon.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "bifrost",
+        "scopeName": "source.bifrost",
+        "path": "./syntaxes/bifrost.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Bifrost",
+      "properties": {
+        "bifrost.server.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `bifrost` executable that runs the language server. Empty: use `.venv/bin/bifrost` in a workspace folder (or one of its subfolders), then `bifrost` on `PATH`."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "bifrost.restartServer",
+        "title": "Bifrost: Restart Language Server"
+      }
+    ],
+    "configurationDefaults": {
+      "[bifrost]": {
+        "editor.defaultFormatter": "qinbeans.vscode-bifrost"
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.js --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
+    "vscode:prepublish": "pnpm run build --minify",
+    "package": "vsce package --no-dependencies --skip-license"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2"
+  }
+}

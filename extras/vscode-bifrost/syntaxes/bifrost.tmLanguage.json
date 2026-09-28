@@ -1,0 +1,348 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "Bifrost",
+	"scopeName": "source.bifrost",
+	"patterns": [
+		{
+			"include": "#comments"
+		},
+		{
+			"include": "#strings"
+		},
+		{
+			"include": "#object-definition"
+		},
+		{
+			"include": "#function-definition"
+		},
+		{
+			"include": "#variable-declaration"
+		},
+		{
+			"include": "#keywords"
+		},
+		{
+			"include": "#types"
+		},
+		{
+			"include": "#builtins"
+		},
+		{
+			"include": "#constants"
+		},
+		{
+			"include": "#numbers"
+		},
+		{
+			"include": "#dependency-list"
+		},
+		{
+			"include": "#parameter"
+		},
+		{
+			"include": "#objects"
+		},
+		{
+			"include": "#function-call"
+		},
+		{
+			"include": "#property"
+		},
+		{
+			"include": "#variable"
+		},
+		{
+			"include": "#operators"
+		},
+		{
+			"include": "#punctuation"
+		}
+	],
+	"repository": {
+		"comments": {
+			"patterns": [
+				{
+					"name": "comment.line.double-slash.bifrost",
+					"match": "//.*$"
+				},
+				{
+					"name": "comment.block.bifrost",
+					"begin": "/\\*",
+					"end": "\\*/"
+				}
+			]
+		},
+		"strings": {
+			"name": "string.quoted.double.bifrost",
+			"begin": "\"",
+			"end": "\"",
+			"patterns": [
+				{
+					"comment": "printf-style placeholders, as fmt.format and stdio.printf read them: %s, %d, %.2f, %-5d, %lld, %%",
+					"name": "constant.other.placeholder.bifrost",
+					"match": "%(?:%|[-+ #0]*(?:\\d+|\\*)?(?:\\.(?:\\d+|\\*))?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfFgGaAcspn])"
+				},
+				{
+					"name": "constant.character.escape.bifrost",
+					"match": "\\\\(x[0-9a-fA-F]{2}|[ntr0\\\\'\"])"
+				},
+				{
+					"name": "invalid.illegal.escape.bifrost",
+					"match": "\\\\."
+				}
+			]
+		},
+		"function-definition": {
+			"comment": "let name = [dependencies] (...) => ... or let name = (...) => ...; `= [` is always a dependency list (list literals are #[)",
+			"match": "\\b(let)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(=)(?=\\s*\\[|\\s*async\\b|\\s*\\([^()]*\\)\\s*=>)",
+			"captures": {
+				"1": {
+					"name": "storage.type.bifrost"
+				},
+				"2": {
+					"name": "entity.name.function.bifrost"
+				},
+				"3": {
+					"name": "keyword.operator.assignment.bifrost"
+				}
+			}
+		},
+		"keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control.bifrost",
+					"match": "\\b(if|else|while|forall|in|match|return)\\b"
+				},
+				{
+					"name": "storage.type.bifrost",
+					"match": "\\b(let|fn|struct|module)\\b"
+				},
+				{
+					"name": "storage.modifier.async.bifrost",
+					"match": "\\b(async|await)\\b"
+				},
+				{
+					"name": "variable.language.bifrost",
+					"match": "\\b(this|super)\\b"
+				},
+				{
+					"name": "storage.type.bifrost",
+					"match": "\\bstatic\\b"
+				}
+			]
+		},
+		"types": {
+			"name": "storage.type.primitive.bifrost",
+			"match": "\\b(ptr|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|h8|h16|h32|h64|o8|o16|o32|o64|b8|b16|b32|b64|bool|str)\\b"
+		},
+		"builtins": {
+			"name": "support.function.builtin.bifrost",
+			"match": "\\b(hex|oct|bin|exit|panic|assert|len|export|import)(?=\\s*\\()"
+		},
+		"constants": {
+			"patterns": [
+				{
+					"name": "constant.language.boolean.bifrost",
+					"match": "\\b(true|false)\\b"
+				},
+				{
+					"name": "constant.language.null.bifrost",
+					"match": "\\bnull\\b"
+				},
+				{
+					"name": "variable.language.default.bifrost",
+					"match": "\\b_\\b"
+				}
+			]
+		},
+		"numbers": {
+			"patterns": [
+				{
+					"name": "constant.numeric.hex.bifrost",
+					"match": "\\b0x[0-9a-fA-F]+\\b"
+				},
+				{
+					"name": "constant.numeric.octal.bifrost",
+					"match": "\\b0o[0-7]+\\b"
+				},
+				{
+					"name": "constant.numeric.binary.bifrost",
+					"match": "\\b0b[01]+\\b"
+				},
+				{
+					"name": "constant.numeric.float.bifrost",
+					"match": "\\b[0-9]+\\.[0-9]+\\b"
+				},
+				{
+					"name": "constant.numeric.integer.bifrost",
+					"match": "\\b[0-9]+\\b"
+				}
+			]
+		},
+		"function-call": {
+			"match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+			"captures": {
+				"1": {
+					"name": "entity.name.function.call.bifrost"
+				}
+			}
+		},
+		"operators": {
+			"patterns": [
+				{
+					"name": "storage.type.function.arrow.bifrost",
+					"match": "=>"
+				},
+				{
+					"name": "keyword.operator.guard.bifrost",
+					"comment": "let guard <- ctx locks; guard -> ctx releases",
+					"match": "<-|->"
+				},
+				{
+					"name": "keyword.operator.spread.bifrost",
+					"match": "\\.\\.\\."
+				},
+				{
+					"name": "keyword.operator.logical.bifrost",
+					"match": "&&|\\|\\||!(?!=)"
+				},
+				{
+					"name": "keyword.operator.comparison.bifrost",
+					"match": "==|!=|<=|>=|<(?!<)|>(?!>)"
+				},
+				{
+					"name": "keyword.operator.bitwise.bifrost",
+					"match": "<<|>>|&|\\||\\^"
+				},
+				{
+					"name": "keyword.operator.arithmetic.bifrost",
+					"match": "\\*\\*|\\+|-|\\*|/|%"
+				},
+				{
+					"name": "keyword.operator.assignment.bifrost",
+					"match": "="
+				},
+				{
+					"name": "keyword.operator.optional.bifrost",
+					"match": "\\?"
+				}
+			]
+		},
+		"punctuation": {
+			"patterns": [
+				{
+					"name": "punctuation.definition.collection.begin.bifrost",
+					"match": "#\\[|#\\(|#\\{"
+				},
+				{
+					"name": "punctuation.accessor.bifrost",
+					"match": "\\."
+				},
+				{
+					"name": "punctuation.separator.comma.bifrost",
+					"match": ","
+				},
+				{
+					"name": "punctuation.separator.colon.bifrost",
+					"match": ":"
+				}
+			]
+		},
+		"object-definition": {
+			"comment": "let Name = struct { ... }: an object definition",
+			"match": "\\b(let)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(=)\\s*(struct)\\b",
+			"captures": {
+				"1": {
+					"name": "storage.type.bifrost"
+				},
+				"2": {
+					"name": "entity.name.type.struct.bifrost"
+				},
+				"3": {
+					"name": "keyword.operator.assignment.bifrost"
+				},
+				"4": {
+					"name": "storage.type.struct.bifrost"
+				}
+			}
+		},
+		"objects": {
+			"comment": "Objects are PascalCase (the language server flags any that are not), so PascalCase names are objects: Context, rl.Color",
+			"name": "entity.name.type.object.bifrost",
+			"match": "\\b[A-Z][a-zA-Z0-9]*\\b"
+		},
+		"variable-declaration": {
+			"comment": "let name = value: a variable (functions and objects are matched first)",
+			"match": "\\b(let)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\b",
+			"captures": {
+				"1": {
+					"name": "storage.type.bifrost"
+				},
+				"2": {
+					"name": "variable.other.readwrite.declaration.bifrost"
+				}
+			}
+		},
+		"dependency-list": {
+			"comment": "[a, rl.init_window, Context.new, this]: the functions a function may call",
+			"begin": "(?<==)\\s*(\\[)",
+			"beginCaptures": {
+				"1": {
+					"name": "punctuation.definition.dependencies.begin.bifrost"
+				}
+			},
+			"end": "\\]",
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.dependencies.end.bifrost"
+				}
+			},
+			"patterns": [
+				{
+					"include": "#comments"
+				},
+				{
+					"name": "variable.language.bifrost",
+					"match": "\\b(this|super)\\b"
+				},
+				{
+					"name": "entity.name.type.object.bifrost",
+					"match": "\\b[A-Z][a-zA-Z0-9]*\\b(?=\\s*\\.)"
+				},
+				{
+					"name": "variable.other.readwrite.bifrost",
+					"match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b(?=\\s*\\.)"
+				},
+				{
+					"name": "entity.name.function.bifrost",
+					"match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+				},
+				{
+					"include": "#punctuation"
+				}
+			]
+		},
+		"parameter": {
+			"comment": "name: in parameters (a: i32) and named arguments (width: 800)",
+			"match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=:(?!:))",
+			"captures": {
+				"1": {
+					"name": "variable.parameter.bifrost"
+				}
+			}
+		},
+		"property": {
+			"comment": "ctx.width: a field read through a value",
+			"match": "(?<=\\.)\\s*([a-zA-Z_][a-zA-Z0-9_]*)\\b(?!\\s*\\()",
+			"captures": {
+				"1": {
+					"name": "variable.other.property.bifrost"
+				}
+			}
+		},
+		"variable": {
+			"name": "variable.other.readwrite.bifrost",
+			"match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+		}
+	}
+}
