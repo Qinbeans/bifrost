@@ -316,6 +316,16 @@ let main = [greeting.greet] () => null greeting.greet("Bifrost")
 
 Variables, functions, parameters and fields are `snake_case`; objects are `PascalCase`. The language server flags names that break this.
 
+Documentation goes where a Python docstring would: a `/* ... */` comment first in a function's body, an object's braces, or a module's braces. The language server shows it when hovering the name and beside completions. `//` comments are only comments.
+
+```bifrost
+let draw = [rl.begin_drawing, rl.end_drawing] (ctx: mem.Weak[Context]) => null {
+    /* Draw the current frame using the given context */
+    rl.begin_drawing()
+    rl.end_drawing()
+}
+```
+
 ## Tooling
 
 | Command | What it does |

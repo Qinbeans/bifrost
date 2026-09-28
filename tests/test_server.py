@@ -259,7 +259,8 @@ def test_hover_shows_record_fields(records: Document, needle: str, occurrence: i
 
 
 def test_records_show_their_types_in_async_main_too(records: Document) -> None:
-    hints = [hint for hint in records.inlay_hints() if not hint.parameter]
+    show = RECORDS.splitlines().index("let show = [io.printf] (label: str) => null {")
+    hints = [hint for hint in records.inlay_hints() if not hint.parameter and hint.position[0] > show]
     # A long record is shortened, and shown whole in the hint's tooltip.
     assert (hints[0].label, hints[0].tooltip) == (
         ": #{x: i64, y: f64, ...}",
@@ -273,6 +274,8 @@ def test_records_show_their_types_in_async_main_too(records: Document) -> None:
         ": str",
         ": bool",
         ": #{user: User, other: User}",
+        ": User",  # the named arguments of `tasks.gather`, typed by their values
+        ": User",
     ]
 
 
@@ -476,3 +479,67 @@ def test_long_records_are_shortened_in_hints(whole: str, short: str) -> None:
     from bifrost.server.analysis import _short_type  # noqa: PLC0415
 
     assert _short_type(whole, nested=False) == short
+
+
+def test_named_arguments_show_the_type_they_fill(named: Document) -> None:
+    hints = {(hint.position, hint.label) for hint in named.inlay_hints() if not hint.parameter}
+    line = NAMED.splitlines().index("    let box = Box(width: width)")
+    assert ((line, len("    let box = Box(width")), ": i64") in hints  # a field of Box
+    line = NAMED.splitlines().index("    let size = area(width: 2, height: 5)")
+    assert ((line, len("    let size = area(width")), ": i64") in hints  # a parameter of area
+    assert ((line, len("    let size = area(width: 2, height")), ": i64") in hints
+    line = NAMED.splitlines().index("    let found = await tasks.gather(width: wait(1))")
+    assert ((line, len("    let found = await tasks.gather(width")), ": i64") in hints  # what wait returns
+
+
+DOCUMENTED = """\
+let Point = struct {
+    /* A point on the screen,
+     * in pixels */
+    let x: i32,
+    static let origin = [] () => Point {
+        /* The top left corner */
+        return Point(x: 0)
+    }
+}
+
+let shift = [] (p: Point, by: i32) => Point {
+    /* Move `p` right by `by` pixels */
+    return Point(x: p.x + by)
+}
+
+let plain = [] (n: i32) => i32 {
+    // only a comment
+    return n
+}
+
+let late = [] (n: i32) => i32 {
+    let m = n
+    /* not first, so not its documentation */
+    return m
+}
+"""
+
+
+@pytest.mark.parametrize(
+    ("needle", "occurrence", "doc"),
+    [
+        ("Point = struct", 0, "A point on the screen,\nin pixels"),
+        ("shift", 0, "Move `p` right by `by` pixels"),
+        ("origin", 0, "The top left corner"),
+        ("plain", 0, ""),
+        ("late", 0, ""),
+    ],
+)
+def test_a_leading_block_comment_documents_its_function_or_object(needle: str, occurrence: int, doc: str) -> None:
+    document = Document.open(EXAMPLES / "scratch.bif", DOCUMENTED)
+    hover = document.hover(_position(DOCUMENTED, needle, occurrence))
+    assert hover is not None
+    assert hover.partition("```\n")[2].strip() == doc
+
+
+def test_completions_carry_documentation() -> None:
+    document = Document.open(EXAMPLES / "scratch.bif", DOCUMENTED + "let use = [] () => null {\n    \n}\n")
+    line = len(DOCUMENTED.splitlines()) + 1
+    documented = {c.label: c.documentation for c in document.completions((line, 4)) if c.documentation}
+    assert documented == {"Point": "A point on the screen,\nin pixels", "shift": "Move `p` right by `by` pixels"}

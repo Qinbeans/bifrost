@@ -693,6 +693,9 @@ class Document:
             if node.type == "record_field":
                 hints.extend(self._record_field_hint(node))
                 continue
+            if node.type == "named_argument":
+                hints.extend(self._named_argument_hint(node))
+                continue
             if node.type == "user_function_call":
                 hints.extend(self._argument_hints(node))
                 continue
@@ -775,8 +778,8 @@ class Document:
             return [to_snake_case(parameter) for parameter in callee.parameters] if callee.type == "function" else None
         return _parameter_names(callee[1]) if callee is not None else None
 
-    def _argument_target(self, node: Node) -> "tuple[str, Location | None] | None":
-        """For the name of a named argument, describe what it names, and where that is declared.
+    def _argument_target(self, node: Node) -> "tuple[str, Location | None, str] | None":
+        """For the name of a named argument, describe what it names, where that is declared, and its type.
 
         ``hits`` in ``state.AppState(hits: 0)`` is a field of ``AppState``;
         ``width`` in ``area(width: 2)`` is a parameter of ``area``.
@@ -792,7 +795,8 @@ class Document:
         where = ".".join([*called[0], called[1]])
         if isinstance(callee, Declaration):
             kind = next((k for p, k in callee.parameters.items() if to_snake_case(p) == name), None)
-            return (f"{name}: {_bifrost_type(kind)}\n// a parameter of {where}", None) if kind else None
+            shown = _bifrost_type(kind) if kind else ""
+            return (f"{name}: {shown}\n// a parameter of {where}", None, shown) if kind else None
         if callee is None:
             return None
         document, value = callee
@@ -805,9 +809,24 @@ class Document:
             declared = found[0] if found else None
             described = f"{' '.join(_text(declared).split())}\n// a parameter of {where}" if declared else ""
         declared_name = _name_of(declared) if declared is not None else None
-        if declared_name is None:
+        if declared is None or declared_name is None:
             return None
-        return described, Location(document.path, document.range(declared_name))
+        written = next((part for part in _named(declared) if part.type == "type_or_object"), None)
+        shown = " ".join(_text(written).split()) if written is not None else ""
+        return described, Location(document.path, document.range(declared_name)), shown
+
+    def _named_argument_hint(self, argument: Node) -> list[InlayHint]:
+        """Hint a named argument's type after its name, as for a record field: ``Context(width: i32: 800)``.
+
+        The type of the field or parameter it fills; for a builtin's (``tasks.gather(user: f())``),
+        the type of its value.
+        """
+        name, value = argument.child_by_field_name("name"), argument.child_by_field_name("value")
+        if name is None or value is None:
+            return []
+        target = self._argument_target(name)
+        kind = target[2] if target is not None and target[2] else self._written_type(value, value)
+        return [InlayHint(self.position(name.end_point), f": {kind}")] if kind else []
 
     def _is_argument_name(self, node: Node) -> bool:
         """Whether ``node`` is the name in a named argument: ``hits`` in ``AppState(hits: 0)``."""
@@ -981,9 +1000,32 @@ class Document:
         if binding is None:
             return None
         assignment, value = binding
-        if value.type == "function_definition":
-            return _code(self._describe_binding(assignment))
-        return _code(_text(assignment))
+        if value.type in {"function_definition", "struct_assignment"}:
+            return _documented(self._describe_binding(assignment), _doc(value))
+        return _documented(_text(assignment), self._module_doc(value))
+
+    def _hover_member_declaration(self, node: Node) -> str | None:
+        """Describe an object's member where it is declared: ``static let origin = ...`` in ``struct { ... }``."""
+        identifier = node.parent if node.parent is not None and node.parent.type == "identifier" else node
+        member = identifier.parent
+        if member is None or member.type != "struct_field" or _name_of(member) != identifier:
+            return None
+        owner = member.parent.parent if member.parent is not None else None  # struct_assignment, then its `let`
+        owner_name = _name_of(owner) if owner is not None else None
+        where = f"\n// a member of {_text(owner_name)}" if owner_name is not None else ""
+        function = next((p for p in _named(member) if p.type == "local_function_definition"), None)
+        return _documented(f"{self._member_signature(member)}{where}", _doc(function))
+
+    def _module_doc(self, value: Node) -> str:
+        """Return the documentation of the module ``import("file:module")`` names, if it has one."""
+        module = self._module_of_value(value)
+        found = self._file_module(module) if module and _is_file_module(module) else None
+        return _doc(found[1]) if found is not None else ""
+
+    @staticmethod
+    def _module_of_value(value: Node) -> str | None:
+        text = _text(value)
+        return text.removeprefix("import(").rstrip(")").strip().strip('"') if text.startswith("import(") else None
 
     def _hover_member(self, node: Node) -> str | None:
         """Describe ``module.function`` (an extern) or ``Object.member``."""
@@ -993,7 +1035,8 @@ class Document:
             if found is None:
                 return None
             other, member = found
-            return _code(f"{other._describe_binding(member)}\n// {dotted[0]} ({other.path.name})")
+            described = f"{other._describe_binding(member)}\n// {dotted[0]} ({other.path.name})"
+            return _documented(described, _doc(_named(member)[-1]))
         if dotted is not None and dotted[0] in _BUILTIN_FUNCTIONS:
             builtin = _BUILTIN_FUNCTIONS[dotted[0]].get(dotted[1])
             return _code(f"{builtin!r} = {builtin.signature}\n// {builtin.summary}") if builtin else None
@@ -1012,7 +1055,8 @@ class Document:
             return self._hover_record_field(node)
         document, member, owner = found
         where = "" if document is self else f" ({document.path.name})"
-        return _code(f"{self._member_signature(member)}\n// a member of {owner}{where}")
+        function = next((p for p in _named(member) if p.type == "local_function_definition"), None)
+        return _documented(f"{self._member_signature(member)}\n// a member of {owner}{where}", _doc(function))
 
     def _field_path(self, node: Node) -> tuple[str, list[str]] | None:
         """For ``value.a.b`` with the cursor on ``b``, return ``value`` and the fields up to it: ``["a", "b"]``."""
@@ -1050,6 +1094,9 @@ class Document:
             return _code(target[0]) if target is not None else ""
         if _text(node) == RECORD:
             return self._hover_record_result(node)
+        declared = self._hover_member_declaration(node)
+        if declared is not None:
+            return declared
         written = self._hover_record_literal(node)
         if written is not None:
             return written
@@ -1199,7 +1246,12 @@ class Document:
                 return self._fields(found[1])
             return self._record_completions(owner, where) if where is not None and owner else []
         names = [
-            Completion(name, self._describe(value)[0].value, self._describe(value)[1])
+            Completion(
+                name,
+                self._describe(value)[0].value,
+                self._describe(value)[1],
+                documentation=_doc(value) or self._module_doc(value),
+            )
             for name, (_, value) in self.bindings().items()
         ]
         node = self.root.named_descendant_for_point_range((row, character), (row, character))
@@ -1298,7 +1350,8 @@ class Document:
                 described += f"\n// async main: {note} (package.type in config.yaml is {kind})"
             return described
         if len(parts) > 1 and parts[-1].type == "struct_assignment":
-            return f"let {name} = struct"
+            members = [self._member_signature(m) for m in _named(parts[-1]) if m.type == "struct_field"]
+            return f"let {name} = struct {{\n" + "".join(f"    {member}\n" for member in members) + "}"
         return " ".join(_text(assignment).split())
 
     def _file_modules(self) -> list[tuple[str, str]]:
@@ -1452,7 +1505,12 @@ class Document:
         for member in binding[1].named_children:
             identifier = _name_of(member) if member.type == "struct_field" else None
             if identifier is not None and member.child_by_field_name("modifier") is not None:
-                found.append(Completion(_text(identifier), "function", self._member_signature(member)))
+                function = next((p for p in _named(member) if p.type == "local_function_definition"), None)
+                found.append(
+                    Completion(
+                        _text(identifier), "function", self._member_signature(member), documentation=_doc(function)
+                    )
+                )
         return found
 
     def _members(self, module: str) -> list[Completion]:
@@ -1467,7 +1525,8 @@ class Document:
                 parts = _named(member)
                 if identifier is not None and len(parts) > 1:
                     kind = other._describe(parts[-1])[0].value
-                    completions.append(Completion(_text(identifier), kind, other._describe_binding(member)))
+                    described, doc = other._describe_binding(member), _doc(parts[-1])
+                    completions.append(Completion(_text(identifier), kind, described, documentation=doc))
             return completions
         if module in _BUILTIN_FUNCTIONS:
             return [Completion(f.name, "function", f"{f!r}{f.signature}") for f in _BUILTIN_FUNCTIONS[module].values()]
@@ -1616,6 +1675,43 @@ def _ancestor(node: Node, kind: str) -> Node | None:
     while current is not None and current.type not in {kind, "function_definition", "local_function_definition"}:
         current = current.parent
     return current if current is not None and current.type == kind else None
+
+
+def _doc(node: Node | None) -> str:
+    """Return the documentation of a function, object or module: a ``/* ... */`` first in its body.
+
+    As a Python docstring is: ``let draw = (...) => null { /* Draw the frame */ ... }``,
+    ``struct { /* ... */ let x: i32 }``, ``module helper = { /* ... */ ... }``.
+    ``//`` comments are only comments.
+    """
+    if node is None:
+        return ""
+    body = node
+    if node.type in {"function_definition", "local_function_definition"}:
+        body = _named(node)[-1] if _named(node) else node
+        if body.type != "block_expression":
+            return ""  # a one-expression body has nowhere for it
+    elif node.type not in {"struct_assignment", "module"}:
+        return ""
+    children = body.children
+    opening = next((index for index, child in enumerate(children) if child.type == "{"), None)
+    for child in children[opening + 1 :] if opening is not None else []:  # after `{`: a module's name comes before
+        if child.type == "comment":
+            return _doc_text(_text(child)) if _text(child).startswith("/*") else ""
+        if child.is_named:
+            return ""
+    return ""
+
+
+def _doc_text(comment: str) -> str:
+    """Strip a block comment to its text: ``/* Draw the frame`` / `` * using ctx */`` is two lines of text."""
+    lines = comment.removeprefix("/*").removesuffix("*/").splitlines()
+    return "\n".join(line.strip().removeprefix("*").strip() for line in lines).strip()
+
+
+def _documented(code: str, doc: str) -> str:
+    """Return a hover: the code, then its documentation (Markdown) under it."""
+    return _code(code) + (f"\n\n{doc}" if doc else "")
 
 
 def _code(text: str) -> str:

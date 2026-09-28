@@ -4,6 +4,7 @@ let mem = import("std:mem")
 module helper = {
     /* Description of the helper module */
     let greet = [fmt.format] (name: str) => mem.Unique[str] {
+        /* Format a greeting message for the given name */
         return fmt.format("Hello, %s!", name)
     }
 }

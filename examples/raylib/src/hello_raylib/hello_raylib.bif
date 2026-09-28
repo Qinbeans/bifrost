@@ -4,11 +4,13 @@ let mem = import("std:mem")
 let helper = import("hello_raylib.helper:helper")
 
 let Context = struct {
+    /* The context holds the state of the application */
     let window_width: i32,
     let window_height: i32,
     let window_title: str,
     let counter: i32,
     static let new = [] () => Context {
+        /* Initialize a new context with default values */
         return Context(
             window_width: 800,
             window_height: 600,
@@ -24,6 +26,7 @@ let draw = [
     rl.end_drawing,
     rl.draw_text
 ] (ctx: mem.Weak[Context]) => null {
+    /* Draw the current frame using the given context */
     rl.begin_drawing()
     rl.clear_background(rl.Color(0, 0, 0, 255))
     rl.draw_text("Hello, Raylib!", 10, 10, 20, rl.Color(255, 255, 255, 255))
@@ -31,6 +34,7 @@ let draw = [
 }
 
 let update = [stdio.printf] (ctx: mem.Weak[Context]) => null {
+    /* Update the application state using the given context */
     let guard <- ctx
     if guard.counter % 6000 == 0 {
         stdio.printf("Counter: %d\n", guard.counter)
