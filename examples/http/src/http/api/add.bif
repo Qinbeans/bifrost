@@ -1,0 +1,11 @@
+let http = import("http")
+
+module api = {
+    let add = [http.json, http.query_int] (ctx: http.Context) => null {
+        let a = http.query_int(ctx, "a", 0)
+        let b = http.query_int(ctx, "b", 0)
+        http.json(ctx, 200, #{sum: a + b})
+    }
+}
+
+export(api)

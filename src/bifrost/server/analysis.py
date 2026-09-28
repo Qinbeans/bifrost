@@ -1,0 +1,1144 @@
+"""What the language server knows about one Bifrost document.
+
+Everything here works on source text and returns plain data, so it is tested
+without a client. Positions are ``(line, character)`` in UTF-16 code units, as
+the Language Server Protocol counts them.
+"""
+
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
+from functools import cached_property
+from pathlib import Path
+from typing import Any
+
+import tree_sitter_bifrost
+from mlir_python.codegen import OptLevel
+from mlir_python.lang import CompileError
+from tree_sitter import Language, Node, Parser
+
+from bifrost import std
+from bifrost.configs import Config, ConfigBuilder, source_root
+from bifrost.configs.schema import Declaration, _Extern
+from bifrost.lowering import BifrostError, display_types, lower_file
+from bifrost.naming import extern_name, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
+from bifrost.project import Project
+from bifrost.std import fmt, json, mem, tasks
+from bifrost.syntax import syntax_errors
+
+_LANGUAGE = Language(tree_sitter_bifrost.language())
+_MODULE_MEMBER = 2  # parts in ``module.Member``
+
+KEYWORDS = ["let", "struct", "if", "else", "while", "forall", "in", "match", "return", "this", "true", "false", "null"]
+TYPES = [
+    *(f"{kind}{bits}" for kind in "iu" for bits in (8, 16, 32, 64)),
+    "f32",
+    "f64",
+    "bool",
+    "str",
+]
+
+type Position = tuple[int, int]
+type Range = tuple[Position, Position]
+
+
+class Severity(Enum):
+    ERROR = 1
+    WARNING = 2
+    INFORMATION = 3
+    HINT = 4
+
+
+class SymbolKind(Enum):
+    FUNCTION = "function"
+    STRUCT = "struct"
+    MODULE = "module"
+    CONSTANT = "constant"
+
+
+@dataclass(frozen=True)
+class Diagnostic:
+    range: Range
+    message: str
+    severity: Severity = Severity.ERROR
+    unnecessary: bool = False  # shown faded, e.g. an unused variable
+
+
+@dataclass(frozen=True)
+class Symbol:
+    name: str
+    kind: SymbolKind
+    detail: str
+    range: Range
+    selection: Range
+
+
+@dataclass(frozen=True)
+class Location:
+    path: Path
+    range: Range
+
+
+@dataclass(frozen=True)
+class Completion:
+    label: str
+    kind: str  # "function", "struct", "module", "constant", "variable", "keyword", "type"
+    detail: str = ""
+    replace: Range | None = None  # the text the completion replaces, when not just the word at the cursor
+    documentation: str = ""  # shown beside the list, e.g. an extern's doc
+
+
+@dataclass(frozen=True)
+class InlayHint:
+    position: Position
+    label: str  # e.g. ": Guard[Context]"
+
+
+@contextmanager
+def _capturing_types(sink: dict[str, dict[str, Any]]) -> Iterator[None]:
+    """Record each compiled function's inferred local types in ``sink``, keyed by symbol.
+
+    mlir_python keeps them only while a function compiles, so this wraps its
+    compiler to copy them out.
+    """
+    from mlir_python.lang._compiler import FunctionCompiler  # noqa: PLC0415 - no public hook yet
+
+    original = FunctionCompiler.compile
+
+    def compile_and_record(compiler: FunctionCompiler) -> None:
+        original(compiler)
+        sink[compiler.function.name] = dict(compiler.variable_types)
+
+    FunctionCompiler.compile = compile_and_record  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        FunctionCompiler.compile = original  # type: ignore[method-assign]
+
+
+def find_config(path: Path) -> Path | None:
+    """Return the nearest ``config.yaml`` in ``path``'s directory or above."""
+    for directory in [path.parent, *path.parent.parents]:
+        candidate = directory / "config.yaml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def default_config() -> Config:
+    """Return a configuration with no externs, for files outside a project."""
+    return Config(
+        package={"name": "untitled", "version": "0.0.0", "description": ""},
+        flags={"optimization": OptLevel.O0, "linker": "clang"},
+        libraries=[],
+        externs=[],
+    )
+
+
+def _text(node: Node) -> str:
+    return (node.text or b"").decode()
+
+
+def _named(node: Node) -> list[Node]:
+    """Named children, without comments or what error recovery made up.
+
+    The document is analysed while it is being typed, so the tree may hold
+    ``ERROR`` nodes and zero-width "missing" ones; nothing here assumes a shape.
+    """
+    return [c for c in node.named_children if c.type not in {"comment", "ERROR"} and not c.is_missing]
+
+
+def _unwrap(node: Node) -> Node:
+    while node.type in {"expression", "parenthesized_expression"} and _named(node):
+        node = _named(node)[0]
+    return node
+
+
+def _descendants(node: Node, *kinds: str, own: bool = False) -> list[Node]:
+    """``kinds`` nodes under ``node``; ``own``: only a function's own, not those of a lambda in it."""
+    found = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in kinds:
+            found.append(current)
+        if not (own and current is not node and current.type == "local_function_definition"):
+            stack.extend(reversed(current.named_children))
+    return found
+
+
+# Where a name is declared or only named, rather than read: `let x`, `x: i32`,
+# `let g <- ...`, `g -> x`, `f(width: ...)`. (Calling `f(...)` reads `f`: it
+# may be a function value.)
+_NOT_USES = {
+    "local_assignment": 0,
+    "parameter": 0,
+    "lock": "guard",
+    "release": "*",
+    "named_argument": "name",
+    "record_field": "name",
+}
+
+
+def _uses(function: Node) -> list[Node]:
+    """Return the names ``function``'s body reads: plain names and the roots of dotted names."""
+    found = []
+    for node in _descendants(function, "identifier", "child_annotation", own=True):
+        if node.type == "child_annotation":
+            root = _named(node)[0]
+            if root.type == "simple_identifier":
+                found.append(root)
+            continue
+        parent = node.parent
+        rule = _NOT_USES.get(parent.type) if parent is not None else None
+        if rule == "*":
+            continue
+        if isinstance(rule, int) and _named(parent)[rule] == node:
+            continue
+        if isinstance(rule, str) and parent.child_by_field_name(rule) == node:
+            continue
+        found.append(node)
+    return found
+
+
+_SKIPPED_FOLDERS = {"build", "node_modules", "__pycache__"}
+
+
+def _is_file_module(spec: str) -> bool:
+    """``utils.text:greeting`` names a module in a Bifrost file; ``std:stdio`` and ``raylib`` do not."""
+    return ":" in spec and not spec.startswith(std.PREFIX)
+
+
+def _module_description(module: Node) -> str | None:
+    """Return a module's description: the block comment at the top of its body."""
+    for child in module.children:
+        if child.type == "comment" and _text(child).startswith("/*"):
+            return " ".join(_text(child).removeprefix("/*").removesuffix("*/").strip(" *\n").split())
+        if child.type == "assignment":
+            return None
+    return None
+
+
+def _name_of(node: Node) -> Node | None:
+    """Return the identifier a ``let``, parameter or assignment binds, if it has one."""
+    parts = _named(node)
+    return parts[0] if parts and parts[0].type == "identifier" else None
+
+
+@dataclass
+class Document:
+    """One ``.bif`` file's text, parsed, with the project configuration it uses."""
+
+    path: Path
+    text: str
+    config_path: Path | None = None
+    config: Config | None = None
+    _lines: list[bytes] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Split the source into lines, for position conversions."""
+        self._lines = self.source.split(b"\n")
+
+    @classmethod
+    def open(cls, path: Path, text: str) -> "Document":
+        """Parse ``text`` as ``path``, loading the nearest ``config.yaml``."""
+        config_path = find_config(path)
+        return cls(path, text, config_path)
+
+    @cached_property
+    def source(self) -> bytes:
+        """The text as UTF-8, which tree-sitter positions count in."""
+        return self.text.encode()
+
+    @cached_property
+    def root(self) -> Node:
+        """The parsed syntax tree."""
+        return Parser(_LANGUAGE).parse(self.source).root_node
+
+    # -- positions ------------------------------------------------------------------
+
+    def position(self, point: tuple[int, int]) -> Position:
+        """Convert a tree-sitter ``(row, byte column)`` to an LSP position."""
+        row, column = point
+        line = self._lines[row] if row < len(self._lines) else b""
+        return row, len(line[:column].decode(errors="replace").encode("utf-16-le")) // 2
+
+    def point(self, position: Position) -> tuple[int, int]:
+        """Convert an LSP position to a tree-sitter ``(row, byte column)``."""
+        row, character = position
+        line = self._lines[row] if row < len(self._lines) else b""
+        text = line.decode(errors="replace").encode("utf-16-le")[: character * 2]
+        return row, len(text.decode("utf-16-le", errors="replace").encode())
+
+    def range(self, node: Node) -> Range:
+        """Return ``node``'s span as an LSP range."""
+        return self.position(node.start_point), self.position(node.end_point)
+
+    def node_at(self, position: Position) -> Node | None:
+        """Return the smallest named node at ``position``."""
+        point = self.point(position)
+        return self.root.named_descendant_for_point_range(point, point)
+
+    # -- configuration ----------------------------------------------------------------
+
+    def load_config(self) -> Config:
+        """Load (once) the project configuration, or a default one outside a project."""
+        if self.config is None:
+            self.config = ConfigBuilder(self.config_path).build() if self.config_path else default_config()
+        return self.config
+
+    # -- diagnostics ------------------------------------------------------------------
+
+    def diagnostics(self) -> list[Diagnostic]:
+        """Report syntax errors, or else lowering and type errors; and naming warnings."""
+        return [*self._program_errors(), *self.naming(), *self.unused()]
+
+    def naming(self) -> list[Diagnostic]:
+        """Warn about names that break the conventions: snake_case, and PascalCase objects."""
+        found = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            stack.extend(reversed(node.named_children))
+            if node.type not in {"assignment", "local_assignment", "lock", "parameter", "struct_field", "module"}:
+                continue
+            identifier = _name_of(node)
+            if identifier is None:
+                continue
+            name, what = _text(identifier), _kind_of_binding(node)
+            if what is None:
+                continue
+            if what == "object" and not is_pascal_case(name):
+                message = f"object '{name}' should be PascalCase: '{to_pascal_case(name)}'"
+            elif what != "object" and not is_snake_case(name):
+                message = f"{what} '{name}' should be snake_case: '{to_snake_case(name)}'"
+            else:
+                continue
+            found.append(Diagnostic(self.range(identifier), message, Severity.WARNING))
+        return found
+
+    def unused(self) -> list[Diagnostic]:
+        """Fade parameters, locals and guards that are never used (names starting with `_` are exempt)."""
+        found = []
+        for function in _descendants(self.root, "function_definition", "local_function_definition"):
+            declared = [
+                identifier
+                for binding in _descendants(function, "parameter", "local_assignment", "lock", own=True)
+                if (identifier := _name_of(binding)) is not None and not _text(identifier).startswith("_")
+            ]
+            used = {_text(name) for name in _uses(function)}
+            for identifier in declared:
+                name = _text(identifier)
+                if name not in used:
+                    message = f"{name} is never used; remove it, or name it _{name} to keep it"
+                    found.append(Diagnostic(self.range(identifier), message, Severity.HINT, unnecessary=True))
+        return found
+
+    def _program_errors(self) -> list[Diagnostic]:
+        return self._compiled[0]
+
+    @cached_property
+    def _compiled(self) -> tuple[list[Diagnostic], dict[str, dict[str, Any]]]:
+        """Compile the document once: its errors, and each function's inferred local types (by symbol)."""
+        inferred: dict[str, dict[str, Any]] = {}
+        syntax = self._syntax_errors()
+        if syntax:
+            return syntax, inferred
+        found = []
+        if self.config_path is None:
+            found.append(
+                Diagnostic(
+                    ((0, 0), (0, 0)),
+                    "no config.yaml in this directory or above it, so only standard modules (std:...) can be imported",
+                    Severity.INFORMATION,
+                )
+            )
+        try:
+            config = self.load_config()
+        except Exception as error:  # noqa: BLE001 - any invalid config is reported, not raised
+            return [*found, Diagnostic(((0, 0), (0, 0)), f"cannot load {self.config_path}: {error}")], inferred
+        try:
+            project = Project(config)
+            unit = lower_file(project, self.path, self.source, root=self.project_root)
+            with unit.errors(), _capturing_types(inferred):
+                _ = project.program.mlir  # type-check every function
+        except BifrostError as error:
+            found.append(self._error_diagnostic(error))
+        except CompileError as error:
+            found.append(Diagnostic(((0, 0), (0, 0)), error.msg))
+        return found, inferred
+
+    def _syntax_errors(self) -> list[Diagnostic]:
+        return [Diagnostic(self.range(p.node), p.message) for p in syntax_errors(self.root)]
+
+    def _error_diagnostic(self, error: BifrostError) -> Diagnostic:
+        """Span the token a ``BifrostError`` points at."""
+        start = ((error.lineno or 1) - 1, (error.offset or 1) - 1)
+        node = self.root.descendant_for_point_range(self._byte_point(start), self._byte_point(start))
+        end = node.end_point if node is not None and node.start_point == self._byte_point(start) else None
+        start_position = self.position(self._byte_point(start))
+        return Diagnostic((start_position, self.position(end) if end else start_position), error.msg)
+
+    def _byte_point(self, point: tuple[int, int]) -> tuple[int, int]:
+        """Convert a ``(row, character)`` point from a ``BifrostError`` to bytes."""
+        row, column = point
+        line = self._lines[row] if row < len(self._lines) else b""
+        return row, len(line.decode(errors="replace")[:column].encode())
+
+    # -- symbols ----------------------------------------------------------------------
+
+    def bindings(self) -> dict[str, tuple[Node, Node]]:
+        """Return each top-level ``let``'s name -> (assignment, value), and those of modules' members."""
+        found = {}
+        items = _named(self.root)
+        for module in (item for item in items if item.type == "module"):
+            items += module.children_by_field_name("member")
+        for assignment in items:
+            if assignment.type != "assignment":
+                continue
+            parts = _named(assignment)
+            identifier = _name_of(assignment)
+            if identifier is None or len(parts) < 2:  # noqa: PLR2004 - a name and a value
+                continue
+            found.setdefault(_text(identifier), (assignment, parts[-1]))
+        return found
+
+    def symbols(self) -> list[Symbol]:
+        """Outline the top-level bindings: functions, structs, modules, constants."""
+        symbols = []
+        for name, (assignment, value) in self.bindings().items():
+            kind, detail = self._describe(value)
+            identifier = _name_of(assignment)
+            if identifier is None:
+                continue
+            symbols.append(Symbol(name, kind, detail, self.range(assignment), self.range(identifier)))
+        for module in (item for item in _named(self.root) if item.type == "module"):
+            identifier = module.child_by_field_name("name")
+            if identifier is not None:
+                detail = _module_description(module) or "module"
+                symbols.append(
+                    Symbol(_text(identifier), SymbolKind.MODULE, detail, self.range(module), self.range(identifier))
+                )
+        return symbols
+
+    def _describe(self, value: Node) -> tuple[SymbolKind, str]:
+        if value.type == "function_definition":
+            return SymbolKind.FUNCTION, self._signature(value)
+        if value.type == "struct_assignment":
+            return SymbolKind.STRUCT, "struct"
+        if _text(value).startswith("import("):
+            return SymbolKind.MODULE, _text(value)
+        return SymbolKind.CONSTANT, _text(value)
+
+    @staticmethod
+    def _signature(function: Node) -> str:
+        """Return ``(a: i32) => i32``, or ``async (a: i32) => i32``: a function's parameters and result."""
+        parts = [p for p in _named(function) if p.type not in {"dependency_list", "local_dependency_list"}]
+        if len(parts) < 2 or parts[0].type != "parameter_list":  # noqa: PLR2004 - parameters and result
+            return "(...)"
+        parameters, result = parts[0], parts[1]
+        is_async = "async " if function.child_by_field_name("async") is not None else ""
+        return f"{is_async}{' '.join(_text(parameters).split())} => {_text(result)}"
+
+    # -- definitions and hover ----------------------------------------------------------
+
+    def _enclosing_function(self, node: Node) -> Node | None:
+        while node is not None and node.type not in {"function_definition", "local_function_definition"}:
+            node = node.parent
+        return node
+
+    def _local(self, name: str, node: Node) -> Node | None:
+        """Return the parameter or ``let`` that binds ``name`` where ``node`` is."""
+        function = self._enclosing_function(node)
+        if function is None:
+            return None
+        for parameter in function.named_children:
+            if parameter.type == "parameter_list":
+                for candidate in _named(parameter):
+                    identifier = _name_of(candidate)
+                    if identifier is not None and _text(identifier) == name:
+                        return candidate
+        for current in _descendants(function, "local_assignment", "lock", own=True):
+            identifier = _name_of(current)
+            if identifier is not None and _text(identifier) == name:
+                return current
+        return None
+
+    def _describe_local(self, local: Node) -> str:
+        """``let guard: Guard[Context] <- ctx``: a local's binding, with its type when it is known."""
+        if local.type == "parameter":
+            return " ".join(_text(local).split())
+        identifier = _name_of(local)
+        first_line = _text(local).split("\n")[0]
+        kind = self._type_of_binding(local)
+        if identifier is None or kind is None or local.child_by_field_name("type") is not None:
+            return first_line  # unknown, or already written: `let ctx: mem.Shared[Context] = ...`
+        name = _text(identifier)
+        rest = first_line[first_line.index(name) + len(name) :]  # ` <- ctx`, ` = Context.new()`
+        return f"let {name}: {kind}{rest}"
+
+    def type_of(self, name: str, node: Node) -> str | None:
+        """Return the type of local ``name`` where ``node`` is, when known: ``Context``, ``Guard[Context]``."""
+        local = self._local(name, node)
+        return self._type_of_binding(local) if local is not None else None
+
+    def _type_of_binding(self, local: Node) -> str | None:
+        parts = _named(local)
+        if local.type == "parameter" and len(parts) > 1:
+            return " ".join(_text(parts[1]).split())
+        if local.type == "lock":
+            source = local.child_by_field_name("source")
+            locked = self.type_of(_text(_unwrap(source)), local) if source is not None else None
+            declared = local.child_by_field_name("type")
+            if declared is not None:
+                return " ".join(_text(declared).split())
+            return self._guard_type(locked) if locked else None
+        if local.type == "local_assignment" and len(parts) > 1:
+            declared = local.child_by_field_name("type")
+            if declared is not None:
+                return " ".join(_text(declared).split())
+            return self._type_of_value(_unwrap(parts[-1]), local) or self._inferred_type(local)
+        return None
+
+    def _guard_type(self, locked: str) -> str:
+        """Name the guard a lock gives: ``mem.Weak[Context]`` -> ``mem.WeakGuard[Context]``.
+
+        A plain local is owned by its function alone, so its guard is a ``UniqueGuard``.
+        """
+        held = re.fullmatch(r"(\w+)\.(Unique|Weak|Shared|Atomic)\[(.*)\]", locked)
+        if held is not None and self._module_of(held.group(1)) == f"{std.PREFIX}mem":
+            return f"{held.group(1)}.{held.group(2)}Guard[{held.group(3).strip()}]"
+        alias = next((name for name in self.bindings() if self._module_of(name) == f"{std.PREFIX}mem"), None)
+        return f"{alias}.UniqueGuard[{locked}]" if alias else f"UniqueGuard[{locked}]"
+
+    def _shared_inner(self, type_text: str) -> str:
+        """``mem.Weak[Context]``, ``mem.WeakGuard[Context]`` -> ``Context``; other types are unchanged."""
+        shared = re.fullmatch(r"(\w+)\.(?:Unique|Weak|Shared|Atomic)(?:Guard)?\[(.*)\]", type_text)
+        if shared is not None and self._module_of(shared.group(1)) == f"{std.PREFIX}mem":
+            return shared.group(2).strip()
+        return type_text
+
+    def _inferred_type(self, local: Node) -> str | None:
+        """Return the type the compiler inferred for a ``let``.
+
+        A literal takes its type from how it is used: ``let i = 0`` is an ``i64``,
+        or an ``i32`` if it is added to one.
+        """
+        identifier = _name_of(local)
+        symbol = self._symbol_of(local)
+        if identifier is None or symbol is None:
+            return None
+        kind = self._compiled[1].get(symbol, {}).get(_text(identifier))
+        if kind is None or kind.kind == "ptr":
+            return None
+        return _type_name(kind)
+
+    def _symbol_of(self, node: Node) -> str | None:
+        """Return the compiled symbol of the function ``node`` is in: ``draw``, or ``Context_new``."""
+        current: Node | None = node
+        while current is not None and current.type not in {"function_definition", "local_function_definition"}:
+            current = current.parent
+        if current is not None and current.parent is not None and current.parent.type == "expression":
+            # A lambda: named after the function around it and where it starts.
+            outer = self._symbol_of(current.parent)
+            row, column = current.start_point
+            return f"{outer}_lambda_{row + 1}_{column}" if outer is not None else None
+        binding = current.parent if current is not None else None
+        name = _name_of(binding) if binding is not None else None
+        if binding is None or name is None:
+            return None
+        if binding.type == "assignment" and binding.parent is not None and binding.parent.type == "module":
+            module = binding.parent.child_by_field_name("name")
+            return f"{_text(module)}_{_text(name)}" if module is not None else None
+        if binding.type == "assignment":
+            return _text(name)
+        owner = binding.parent.parent if binding.parent is not None else None  # struct_assignment -> assignment
+        owner_name = _name_of(owner) if owner is not None and owner.type == "assignment" else None
+        return f"{_text(owner_name)}_{_text(name)}" if owner_name is not None else None
+
+    def _type_of_value(self, value: Node, where: Node) -> str | None:
+        """Return the type of an expression, for the simple cases: calls, construction, names."""
+        if value.type == "local_function_definition":
+            return self._signature(value)  # a lambda
+        if value.type == "identifier":
+            return self._type_of_name(_text(value), where)
+        if value.type == "function_call":
+            call = _named(value)[0]
+            function = call.child_by_field_name("function")
+            return self._type_of_call([], _text(function)) if function is not None else None
+        if value.type == "child_annotation":
+            parts = _named(value)
+            last = parts[-1]
+            if last.type != "function_call" or not all(p.type == "simple_identifier" for p in parts[:-1]):
+                return None
+            function = _named(last)[0].child_by_field_name("function")
+            return self._type_of_call([_text(p) for p in parts[:-1]], _text(function)) if function else None
+        return None
+
+    def _type_of_name(self, name: str, where: Node) -> str | None:
+        """Return the type of a local, or of a function named as a value: ``(x: i32) => i32``."""
+        binding = self.bindings().get(name)
+        if self._local(name, where) is None and binding is not None and binding[1].type == "function_definition":
+            return self._signature(binding[1])
+        return self.type_of(name, where)
+
+    def _type_of_call(self, owner: list[str], name: str) -> str | None:
+        """Return the result type of calling ``owner.name(...)`` (``owner`` empty for ``name(...)``)."""
+        if not owner:
+            return self._type_of_top_call(name)
+        if len(owner) != 1:
+            return None
+        binding = self.bindings().get(owner[0])
+        if binding is not None and binding[1].type == "struct_assignment":
+            return self._type_of_static_call(binding[1], name)
+        module = self._module_of(owner[0])
+        builtins = _BUILTIN_FUNCTIONS.get(module or "", {})
+        if name in builtins:
+            return builtins[name].signature.rpartition(" => ")[2]
+        declaration = self._declaration(module, name) if module else None
+        if declaration is None:
+            return None
+        return f"{owner[0]}.{name}" if declaration.type == "struct" else _bifrost_type(declaration.return_type)
+
+    def _type_of_top_call(self, name: str) -> str | None:
+        """Return the result type of ``Name(...)`` (a constructor) or ``function(...)``."""
+        binding = self.bindings().get(name)
+        if binding is None:
+            return None
+        if binding[1].type == "struct_assignment":
+            return name
+        if binding[1].type == "function_definition":
+            return self._signature(binding[1]).rpartition(" => ")[2] or None
+        return None
+
+    def _type_of_static_call(self, struct: Node, name: str) -> str | None:
+        """Return the result type of ``Object.name(...)``."""
+        for member in struct.named_children:
+            identifier = _name_of(member) if member.type == "struct_field" else None
+            if identifier is not None and _text(identifier) == name:
+                return self._member_signature(member).rpartition(" => ")[2] or None
+        return None
+
+    def inlay_hints(self) -> list[InlayHint]:
+        """Show the type of each guard and untyped ``let``: ``let guard: mem.WeakGuard[Context] <- ctx``."""
+        hints = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.named_children)
+            if node.type not in {"lock", "local_assignment"} or node.child_by_field_name("type") is not None:
+                continue
+            identifier = _name_of(node)
+            kind = self._type_of_binding(node)
+            if identifier is not None and kind is not None:
+                hints.append(InlayHint(self.position(identifier.end_point), f": {kind}"))
+        return sorted(hints, key=lambda hint: hint.position)
+
+    def _dotted(self, node: Node) -> tuple[str, str] | None:
+        """For ``module.member`` with the cursor on ``member``, return the module and member."""
+        access = self._member_access(node)
+        module = self._module_of(access[0]) if access else None
+        return (module, access[1]) if module and access else None
+
+    def _object_member(self, node: Node) -> "tuple[Document, Node, str] | None":
+        """For ``Object.member`` or ``value.field`` with the cursor on the member, return its ``struct_field``.
+
+        Also the document declaring it (another file's, for ``state.AppState``) and the object's name.
+        """
+        access = self._member_access(node)
+        if access is None:
+            return None
+        binding = self.bindings().get(access[0])
+        found: tuple[Document, Node, str] | None = None
+        if binding is not None and binding[1].type == "struct_assignment":
+            found = (self, binding[1], access[0])
+        if found is None:
+            found = self._struct_of(access[0], node)  # `guard.counter`: the struct `guard` reaches
+        if found is None:
+            return None
+        document, struct, owner = found
+        for member in struct.named_children:
+            identifier = _name_of(member) if member.type == "struct_field" else None
+            if identifier is not None and _text(identifier) == access[1]:
+                return document, member, owner
+        return None
+
+    def _struct_of(self, name: str, node: Node) -> "tuple[Document, Node, str] | None":
+        """Return the ``struct`` a local reaches (``Context``, ``mem.Weak[Context]``, a guard of one).
+
+        With the document declaring it, which is another file's for ``state.AppState``, and its type's name.
+        """
+        kind = self.type_of(name, node)
+        return self._struct_named(self._shared_inner(kind)) if kind is not None else None
+
+    def _struct_named(self, kind: str) -> "tuple[Document, Node, str] | None":
+        """Find the object type ``Context``, or ``state.AppState`` in the module a file imports as ``state``."""
+        binding = self.bindings().get(kind)
+        if binding is not None and binding[1].type == "struct_assignment":
+            return self, binding[1], kind
+        alias, _, member = kind.partition(".")
+        spec = self._module_of(alias) if member and "." not in member else None
+        found = self._file_member(spec, member) if spec and _is_file_module(spec) else None
+        if found is None:
+            return None
+        value = _named(found[1])[-1]
+        return (found[0], value, kind) if value.type == "struct_assignment" else None
+
+    def _member_access(self, node: Node) -> tuple[str, str] | None:
+        """For ``owner.member`` with the cursor on ``member``, return both names."""
+        part = node
+        if part.parent is not None and part.parent.type == "identifier":
+            part = part.parent
+        if part.parent is not None and part.parent.type == "user_function_call":
+            part = part.parent.parent  # the function_call segment
+        owner = part.parent if part is not None else None
+        if owner is None or owner.type != "child_annotation":
+            return None
+        parts = _named(owner)
+        if len(parts) < _MODULE_MEMBER or parts[1] != part or parts[0].type != "simple_identifier":
+            return None
+        return _text(parts[0]), _text(node)
+
+    def _module_of(self, binding: str) -> str | None:
+        """Return the configured module a top-level ``let x = import(...)`` names."""
+        found = self.bindings().get(binding)
+        if found is None:
+            return None
+        text = _text(found[1])
+        if not text.startswith("import("):
+            return None
+        return text.removeprefix("import(").rstrip(")").strip().strip('"')
+
+    def _extern(self, module: str) -> tuple[_Extern, Path | None] | None:
+        """Find ``module`` and the file declaring it: a standard module, or one in ``config.yaml``."""
+        if module.startswith(std.PREFIX):
+            name = module.removeprefix(std.PREFIX)
+            if name in std.BUILTIN or name not in std.available():
+                return None  # `std:mem` is built into the compiler, not declared in YAML
+            return std.load(name), std.path(name)
+        try:
+            config = self.load_config()
+        except Exception:  # noqa: BLE001 - reported by diagnostics
+            return None
+        extern = next((e for e in config.externs if e.module == module), None)
+        return (extern, self.config_path) if extern is not None else None
+
+    def _declaration(self, module: str, member: str) -> Declaration | None:
+        found = self._extern(module)
+        if found is None:
+            return None
+        return next((d for d in found[0].declarations if extern_name(d) == member), None)
+
+    def definition(self, position: Position) -> Location | None:
+        """Return where the name at ``position`` is defined."""
+        node = self.node_at(position)
+        if node is None or node.type not in {"simple_identifier", "identifier"}:
+            return None
+        dotted = self._dotted(node)
+        if dotted is not None:
+            return self._member_location(*dotted)
+        found = self._object_member(node)
+        if found is not None:
+            document, member, _ = found
+            identifier = _name_of(member)
+            return Location(document.path, document.range(identifier if identifier is not None else member))
+        name = _text(node)
+        local = self._local(name, node)
+        if local is not None:
+            identifier = _name_of(local)
+            return Location(self.path, self.range(identifier if identifier is not None else local))
+        binding = self.bindings().get(name)
+        if binding is not None:
+            identifier = _name_of(binding[0])
+            return Location(self.path, self.range(identifier if identifier is not None else binding[0]))
+        return None
+
+    def _config_location(self, module: str, member: str) -> Location | None:
+        """Find ``member``'s declaration (``init_window`` is ``InitWindow``) in the file declaring ``module``."""
+        declaration = self._declaration(module, member)
+        found = self._extern(module)
+        if found is None or found[1] is None or declaration is None:
+            return None
+        path = found[1]
+        member = declaration.name
+        in_module = False
+        for row, line in enumerate(path.read_text().splitlines()):
+            stripped = line.strip().removeprefix("- ")
+            if stripped.startswith("module:"):
+                in_module = stripped.removeprefix("module:").strip().strip('"') == module
+            elif in_module and stripped in {f"name: {member}", f'name: "{member}"'}:
+                column = line.index("name:") + len("name: ")
+                return Location(path, ((row, column), (row, column + len(member))))
+        return None
+
+    def hover(self, position: Position) -> str | None:
+        """Return Markdown describing the name at ``position``."""
+        node = self.node_at(position)
+        if node is None or node.type not in {"simple_identifier", "identifier"}:
+            return None
+        if self._member_access(node) is not None:
+            return self._hover_member(node)
+        name = _text(node)
+        local = self._local(name, node)
+        if local is not None:
+            return _code(self._describe_local(local))
+        binding = self.bindings().get(name)
+        if binding is None:
+            return None
+        assignment, value = binding
+        if value.type == "function_definition":
+            return _code(self._describe_binding(assignment))
+        return _code(_text(assignment))
+
+    def _hover_member(self, node: Node) -> str | None:
+        """Describe ``module.function`` (an extern) or ``Object.member``."""
+        dotted = self._dotted(node)
+        if dotted is not None and _is_file_module(dotted[0]):
+            found = self._file_member(*dotted)
+            if found is None:
+                return None
+            other, member = found
+            return _code(f"{other._describe_binding(member)}\n// {dotted[0]} ({other.path.name})")
+        if dotted is not None and dotted[0] in _BUILTIN_FUNCTIONS:
+            builtin = _BUILTIN_FUNCTIONS[dotted[0]].get(dotted[1])
+            return _code(f"{builtin!r} = {builtin.signature}\n// {builtin.summary}") if builtin else None
+        if dotted is not None and dotted[0] == f"{std.PREFIX}mem":
+            container = mem.CONTAINERS.get(dotted[1])
+            return _code(f"{container!r}[T]\n// {container.summary}") if container else None
+        if dotted is not None:
+            declaration = self._declaration(*dotted)
+            return _code(_extern_signature(dotted[0], declaration)) if declaration else None
+        return self._hover_field(node)
+
+    def _hover_field(self, node: Node) -> str | None:
+        """Describe ``value.field`` or ``Object.member``, with the object it belongs to."""
+        found = self._object_member(node)
+        if found is None:
+            return None
+        document, member, owner = found
+        where = "" if document is self else f" ({document.path.name})"
+        return _code(f"{self._member_signature(member)}\n// a member of {owner}{where}")
+
+    def _member_signature(self, member: Node) -> str:
+        """Return ``static let new = () => Context``, or ``let width: i32`` for a field."""
+        function = next((p for p in _named(member) if p.type == "local_function_definition"), None)
+        if function is None:
+            return " ".join(_text(member).split())
+        modifier = "static " if member.child_by_field_name("modifier") is not None else ""
+        identifier = _name_of(member)
+        name = _text(identifier) if identifier is not None else "?"
+        return f"{modifier}let {name} = {self._signature(function)}"
+
+    # -- completion -----------------------------------------------------------------------
+
+    def completions(self, position: Position) -> list[Completion]:
+        """Offer modules in ``import("...")``, members after ``name.``, and names in scope otherwise."""
+        modules = self._import_completions(position)
+        if modules is not None:
+            return modules
+        row, character = self.point(position)
+        line = self._lines[row][:character].decode(errors="replace") if row < len(self._lines) else ""
+        before = line.rstrip()
+        stem = before[len(before.rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")) :]
+        prefix = before[: len(before) - len(stem)]
+        if prefix.endswith("."):
+            owner = prefix[:-1].split()[-1].split("[")[-1].split("(")[-1] if prefix[:-1].strip() else ""
+            module = self._module_of(owner)
+            if module:
+                return self._members(module)
+            if owner in self.bindings():
+                return self._static_members(owner)
+            where = self.root.named_descendant_for_point_range((row, character), (row, character))
+            found = self._struct_of(owner, where) if where is not None else None
+            return self._fields(found[1]) if found is not None else []
+        names = [
+            Completion(name, self._describe(value)[0].value, self._describe(value)[1])
+            for name, (_, value) in self.bindings().items()
+        ]
+        node = self.root.named_descendant_for_point_range((row, character), (row, character))
+        function = self._enclosing_function(node) if node is not None else None
+        if function is not None:
+            for candidate in self._locals(function):
+                names.append(Completion(candidate, "variable"))
+        return (
+            names
+            + [Completion(keyword, "keyword") for keyword in KEYWORDS]
+            + [Completion(kind, "type") for kind in TYPES]
+        )
+
+    def _locals(self, function: Node) -> list[str]:
+        found: list[str] = []
+        stack = [function]
+        while stack:
+            current = stack.pop()
+            if current.type in {"parameter", "local_assignment", "lock"}:
+                identifier = _name_of(current)
+                if identifier is not None:
+                    found.append(_text(identifier))
+            stack.extend(current.named_children)
+        return sorted(set(found))
+
+    @property
+    def project_root(self) -> Path:
+        """Where ``import("a.b:module")`` finds ``a/b.bif``: the project's ``src/``, or its folder."""
+        return source_root(self.config_path.parent) if self.config_path else self.path.parent
+
+    def _open(self, path: Path) -> "Document | None":
+        try:
+            text = path.read_text()
+        except OSError:
+            return None
+        return Document(path, text, self.config_path, self.config)
+
+    def _file_module(self, spec: str) -> "tuple[Document, Node] | None":
+        """Find ``file:module``'s ``module`` node, and the document it is in."""
+        file_part, _, name = spec.partition(":")
+        dots = len(file_part) - len(file_part.lstrip("."))
+        base = self.project_root if dots == 0 else self.path.parent
+        for _ in range(max(dots - 1, 0)):
+            base = base.parent
+        names = file_part[dots:].split(".")
+        if not all(names):
+            return None
+        other = self._open(base.joinpath(*names[:-1], names[-1] + ".bif"))
+        if other is None:
+            return None
+        module = next(
+            (
+                item
+                for item in _named(other.root)
+                if item.type == "module" and _text(item.child_by_field_name("name")) == name
+            ),
+            None,
+        )
+        return (other, module) if module is not None else None
+
+    def _member_location(self, module: str, member: str) -> Location | None:
+        """Find ``module.member``: in another Bifrost file, or in the config.yaml or YAML that declares it."""
+        if not _is_file_module(module):
+            return self._config_location(module, member)
+        found = self._file_member(module, member)
+        identifier = _name_of(found[1]) if found is not None else None
+        return Location(found[0].path, found[0].range(identifier)) if found and identifier else None
+
+    def _file_member(self, spec: str, member: str) -> "tuple[Document, Node] | None":
+        found = self._file_module(spec)
+        if found is None:
+            return None
+        other, module = found
+        for assignment in module.children_by_field_name("member"):
+            identifier = _name_of(assignment)
+            if identifier is not None and _text(identifier) == member:
+                return other, assignment
+        return None
+
+    def _describe_binding(self, assignment: Node) -> str:
+        """``let greet = (name: str) => null``: a ``let``, with a function shown by its signature."""
+        identifier = _name_of(assignment)
+        parts = _named(assignment)
+        name = _text(identifier) if identifier is not None else "?"
+        if len(parts) > 1 and parts[-1].type == "function_definition":
+            described = f"let {name} = {self._signature(parts[-1])}"
+            if name == "main" and parts[-1].child_by_field_name("async") is not None:
+                try:
+                    kind = self.load_config().package.type
+                except (OSError, ValueError):
+                    kind = "sync"
+                note = "runs on the event loop" if kind == "async" else "needs `type: async`"
+                described += f"\n// async main: {note} (package.type in config.yaml is {kind})"
+            return described
+        if len(parts) > 1 and parts[-1].type == "struct_assignment":
+            return f"let {name} = struct"
+        return " ".join(_text(assignment).split())
+
+    def _file_modules(self) -> list[tuple[str, str]]:
+        """Return every exported module under the project root, as (``utils.text:greeting``, description)."""
+        found = []
+        root = self.project_root
+        for path in sorted(root.rglob("*.bif")):
+            relative = path.relative_to(root)
+            if any(part.startswith(".") or part in _SKIPPED_FOLDERS for part in relative.parts[:-1]):
+                continue
+            if path.resolve() == self.path.resolve():
+                continue
+            other = self._open(path)
+            if other is None:
+                continue
+            exported = {
+                _text(name)
+                for item in _named(other.root)
+                if item.type == "export_statement"
+                for name in item.children_by_field_name("module")
+            }
+            dotted = ".".join(relative.with_suffix("").parts)
+            for item in _named(other.root):
+                name = item.child_by_field_name("name") if item.type == "module" else None
+                if name is not None and _text(name) in exported:
+                    found.append((f"{dotted}:{_text(name)}", _module_description(item) or f"module in {relative}"))
+        return found
+
+    def _import_completions(self, position: Position) -> list[Completion] | None:
+        """Offer every module ``import("...")`` can name, when the cursor is in its string."""
+        row, column = self.point(position)
+        line = self._lines[row][:column].decode(errors="replace") if row < len(self._lines) else ""
+        opened = re.search(r'\bimport\(\s*"([^"]*)$', line)
+        if opened is None:
+            return None
+        typed = len(opened.group(1).encode("utf-16-le")) // 2
+        replace = ((position[0], position[1] - typed), position)
+        found = [
+            Completion(f"{std.PREFIX}{name}", "module", self._standard_summary(name), replace)
+            for name in std.available()
+        ]
+        try:
+            config = self.load_config()
+        except Exception:  # noqa: BLE001 - reported by diagnostics
+            return found
+        files = [Completion(spec, "module", description, replace) for spec, description in self._file_modules()]
+        return found + files + [Completion(e.module, "module", e.description, replace) for e in config.externs]
+
+    @staticmethod
+    def _standard_summary(name: str) -> str:
+        if name == "mem":
+            return "memory containers: " + ", ".join(mem.CONTAINERS)
+        if name == "fmt":
+            return "formatting into owned strings: " + ", ".join(fmt.FUNCTIONS)
+        if name == "json":
+            return "values as JSON text: " + ", ".join(json.FUNCTIONS)
+        if name == "tasks":
+            return "running async functions at the same time: " + ", ".join(tasks.FUNCTIONS)
+        return std.load(name).description
+
+    def _fields(self, struct: Node) -> list[Completion]:
+        """Offer an object's stored fields after ``value.``."""
+        found = []
+        for member in struct.named_children:
+            identifier = _name_of(member) if member.type == "struct_field" else None
+            if identifier is None or any(part.type == "local_function_definition" for part in _named(member)):
+                continue
+            found.append(Completion(_text(identifier), "field", self._member_signature(member)))
+        return found
+
+    def _static_members(self, owner: str) -> list[Completion]:
+        """Offer an object's static functions after ``Object.``."""
+        binding = self.bindings().get(owner)
+        if binding is None or binding[1].type != "struct_assignment":
+            return []
+        found = []
+        for member in binding[1].named_children:
+            identifier = _name_of(member) if member.type == "struct_field" else None
+            if identifier is not None and member.child_by_field_name("modifier") is not None:
+                found.append(Completion(_text(identifier), "function", self._member_signature(member)))
+        return found
+
+    def _members(self, module: str) -> list[Completion]:
+        if _is_file_module(module):
+            found = self._file_module(module)
+            if found is None:
+                return []
+            other, node = found
+            completions = []
+            for member in node.children_by_field_name("member"):
+                identifier = _name_of(member)
+                parts = _named(member)
+                if identifier is not None and len(parts) > 1:
+                    kind = other._describe(parts[-1])[0].value
+                    completions.append(Completion(_text(identifier), kind, other._describe_binding(member)))
+            return completions
+        if module in _BUILTIN_FUNCTIONS:
+            return [Completion(f.name, "function", f"{f!r}{f.signature}") for f in _BUILTIN_FUNCTIONS[module].values()]
+        if module == f"{std.PREFIX}mem":
+            return [
+                Completion(container.name, "struct", f"{container!r}[T]: {container.summary}")
+                for container in mem.CONTAINERS.values()
+            ]
+        found = self._extern(module)
+        if found is None:
+            return []
+        return [
+            Completion(extern_name(d), d.type, _extern_signature(module, d).split("\n")[0], documentation=d.doc)
+            for d in found[0].declarations
+        ]
+
+
+_BINDING_KINDS = {"parameter": "parameter", "struct_field": "field", "lock": "guard", "module": "module"}
+_VALUE_KINDS = {
+    "struct_assignment": "object",
+    "function_definition": "function",
+    "local_function_definition": "function",
+}
+
+
+def _kind_of_binding(node: Node) -> str | None:
+    """Say what a ``let``, parameter or field binds, for naming messages (``None``: can't tell)."""
+    if node.type == "struct_field" and any(p.type == "local_function_definition" for p in _named(node)):
+        return "static function" if node.child_by_field_name("modifier") is not None else "method"
+    if node.type in _BINDING_KINDS:
+        return _BINDING_KINDS[node.type]
+    if any(child.is_error for child in node.children):
+        # Half-typed: judge by what follows `=` (`struct {` is an object), else not at all.
+        value_text = _text(node).partition("=")[2].lstrip()
+        return "object" if re.match(r"struct\b", value_text) else None
+    parts = _named(node)
+    value = parts[-1] if len(parts) > 1 else None
+    if value is None:
+        return "variable"
+    if value.type in _VALUE_KINDS:
+        return _VALUE_KINDS[value.type]
+    return "module" if _text(value).startswith("import(") else "variable"
+
+
+def _code(text: str) -> str:
+    return f"```bifrost\n{text}\n```"
+
+
+def _type_name(kind: Any) -> str:  # noqa: ANN401 - a compiler type
+    """Write a compiler type as Bifrost does: ``#{sum: i64}`` for a record, ``(i32) => null`` for a function."""
+    if kind.kind == "fn":
+        return display_types(kind.name)
+    if kind.kind == "struct" and kind.name == "record":
+        return "#{" + ", ".join(f"{name}: {_type_name(field)}" for name, field in kind.fields) + "}"
+    return {"cstr": "str"}.get(kind.name, kind.name)
+
+
+# Standard modules whose functions the compiler expands itself.
+_BUILTIN_FUNCTIONS = {
+    f"{std.PREFIX}fmt": fmt.FUNCTIONS,
+    f"{std.PREFIX}json": json.FUNCTIONS,
+    f"{std.PREFIX}tasks": tasks.FUNCTIONS,
+}
+
+
+def _bifrost_type(kind: str) -> str:
+    """Show a config type as Bifrost writes it: ``raylib_Color`` is ``raylib.Color``, ``None`` is ``null``."""
+    function = re.fullmatch(r"\(([^()]*)\)\s*=>\s*([^()]+)", kind.strip())
+    if function is not None:
+        parameters = ", ".join(_bifrost_type(part.strip()) for part in function.group(1).split(",") if part.strip())
+        return f"({parameters}) => {_bifrost_type(function.group(2).strip())}"
+    if kind == "None":
+        return "null"
+    if kind == "cstr":
+        return "str"
+    module, _, name = kind.partition("_")
+    module = module.removeprefix(std.PREFIX)  # std:stdio_File would be stdio.File
+    return f"{module}.{to_pascal_case(name)}" if name and name[0].isupper() else kind
+
+
+def _extern_signature(module: str, declaration: Declaration) -> str:
+    """Show an extern as Bifrost sees it, with the C symbol it binds."""
+    name = f"{module.removeprefix(std.PREFIX)}.{extern_name(declaration)}"
+    doc = f"\n// {declaration.doc}" if declaration.doc else ""
+    if declaration.type == "struct":
+        fields = ", ".join(
+            f"let {to_snake_case(field)}: {_bifrost_type(kind)}" for field, kind in declaration.fields.items()
+        )
+        return f"{name} = struct {{ {fields} }}{doc}\n// C: struct {declaration.name}"
+    parameters = [
+        f"{to_snake_case(parameter)}: {_bifrost_type(kind)}" for parameter, kind in declaration.parameters.items()
+    ]
+    if declaration.variadic:
+        parameters.append("...")
+    result = _bifrost_type(declaration.return_type)
+    return f"{name} = ({', '.join(parameters)}) => {result}{doc}\n// C: {declaration.name}"

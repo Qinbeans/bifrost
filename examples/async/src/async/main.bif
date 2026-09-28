@@ -1,0 +1,38 @@
+let stdio = import("std:stdio")
+let mem = import("std:mem")
+let time = import("std:time")
+let async_ = import("std:tasks")
+
+let task1 = [stdio.printf, time.now, time.sleep] async () => null {
+    let started = time.now()
+    forall i in #[0...10] {
+        stdio.printf("Task1 iteration %lld\n", i)
+        await time.sleep(150)
+    }
+    stdio.printf("Task1 slept for %lld ms\n", time.now() - started)
+}
+
+let task2 = [stdio.printf, time.now, time.sleep] async () => null {
+    let started = time.now()
+    forall i in #[0...10] {
+        stdio.printf("Task2 iteration %lld\n", i)
+        await time.sleep(100)
+    }
+    stdio.printf("Task2 slept for %lld ms\n", time.now() - started)
+}
+
+let main = [stdio.printf, time.now, async_.gather, task1, task2] async () => null {
+    let counter: mem.Atomic[i64] = 0
+    // A guard on a whole value reads it as `guard`, and writes it with `guard = ...`
+    let guard <- counter
+    stdio.printf("Counter: %lld\n", guard)
+    guard = guard + 1
+    stdio.printf("Counter after increment: %lld\n", guard)
+    guard -> counter
+
+    // Calls that pause are awaited: only an async function can, and main is async
+    // because config.yaml says `type: async`
+    let started = time.now()
+    let _task = await async_.gather(task1(), task2())
+    stdio.printf("Slept for %lld ms\n", time.now() - started)
+}

@@ -1,0 +1,13 @@
+let http = import("http")
+
+module api = {
+    let hello = [http.json, http.param, http.protocol] (ctx: http.Context) => null {
+        http.json(ctx, 200, #{
+            message: "hello",
+            name: http.param(ctx, "name"),
+            protocol: http.protocol(ctx)
+        })
+    }
+}
+
+export(api)

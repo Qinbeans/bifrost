@@ -1,0 +1,10 @@
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+
+module helper = {
+    /* Description of the helper module */
+    let greet = [fmt.format] (name: str) => mem.Unique[str] {
+        return fmt.format("Hello, %s!", name)
+    }
+}
+export(helper)

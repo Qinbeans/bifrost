@@ -1,0 +1,7 @@
+module state = {
+    /* What the handlers share: a mem.Shared owned by main, which the server passes to them */
+
+    let AppState = struct { let hits: i64 }
+}
+
+export(state)

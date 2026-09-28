@@ -1,0 +1,18 @@
+# Time, kept by Bifrost's async runtime (std/async_runtime.c), which programs using it link.
+# `sleep` pauses: await it in an async function. Other work runs meanwhile.
+module: std:time
+description: Sleeping without blocking, and measuring time
+declarations:
+  - name: bifrost_time_sleep
+    as: sleep
+    type: function
+    parameters:
+      milliseconds: i64
+    return: token
+    doc: "Pause for milliseconds; other work runs meanwhile. Await it in an async function."
+  - name: bifrost_time_now
+    as: now
+    type: function
+    parameters: {}
+    return: i64
+    doc: "Milliseconds since a fixed point (not the date): subtract two to measure time."

@@ -1,0 +1,67 @@
+let rl = import("raylib")
+let stdio = import("std:stdio")
+let mem = import("std:mem")
+let helper = import("hello_raylib.helper:helper")
+
+let Context = struct {
+    let window_width: i32,
+    let window_height: i32,
+    let window_title: str,
+    let counter: i32,
+    static let new = [] () => Context {
+        return Context(
+            window_width: 800,
+            window_height: 600,
+            window_title: "Hello Raylib",
+            counter: 0
+        )
+    }
+}
+
+let draw = [
+    rl.begin_drawing,
+    rl.clear_background,
+    rl.end_drawing,
+    rl.draw_text
+] (ctx: mem.Weak[Context]) => null {
+    rl.begin_drawing()
+    rl.clear_background(rl.Color(0, 0, 0, 255))
+    rl.draw_text("Hello, Raylib!", 10, 10, 20, rl.Color(255, 255, 255, 255))
+    rl.end_drawing()
+}
+
+let update = [stdio.printf] (ctx: mem.Weak[Context]) => null {
+    let guard <- ctx
+    if guard.counter % 6000 == 0 {
+        stdio.printf("Counter: %d\n", guard.counter)
+    }
+    guard.counter = guard.counter + 1
+    guard -> ctx
+}
+
+let main = [
+    rl.init_window,
+    rl.close_window,
+    rl.window_should_close,
+    draw,
+    update,
+    Context.new,
+    stdio.printf,
+    helper.greet
+] () => null {
+    rl.init_window(800, 600, "Hello Raylib")
+    stdio.printf("Initializing context\n")
+    let i: f32 = 0
+    let ctx: mem.Unique[Context] = Context.new()
+    while !rl.window_should_close() {
+        draw(ctx)
+        update(ctx)
+        let i = i + 0.01
+    }
+    rl.close_window()
+    let guard <- ctx
+    let greeting = helper.greet("World")
+    stdio.printf("Drew %d frames\n", guard.counter)
+    stdio.printf("%s, %.2f\n", greeting, i * 51)
+    guard -> ctx
+}

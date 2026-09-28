@@ -1,0 +1,16 @@
+let http = import("http")
+
+module api = {
+    /* Pauses for ?ms= milliseconds (100 by default); other requests are served meanwhile */
+    let slow = [
+        http.query_int,
+        http.sleep,
+        http.json
+    ] async (ctx: http.Context) => null {
+        let ms = http.query_int(ctx, "ms", 100)
+        await http.sleep(ms)
+        http.json(ctx, 200, #{slept: ms})
+    }
+}
+
+export(api)

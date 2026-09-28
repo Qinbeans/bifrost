@@ -1,0 +1,12 @@
+let http = import("http")
+
+module api = {
+    let echo = [http.json, http.body, http.header] (ctx: http.Context) => null {
+        http.json(ctx, 201, #{
+            received: http.body(ctx),
+            content_type: http.header(ctx, "Content-Type")
+        })
+    }
+}
+
+export(api)

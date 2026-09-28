@@ -1,0 +1,75 @@
+# C standard input and output (<stdio.h>), from libc, which every program links.
+# `FILE *` streams are `ptr`. The `stdout`/`stderr` globals are variables, not
+# functions, so they cannot be declared here; use `puts`/`printf` for stdout.
+module: std:stdio
+description: C standard input and output (libc <stdio.h>)
+declarations:
+  - name: printf
+    type: function
+    parameters:
+      format: cstr
+    variadic: true
+    return: i32
+  - name: puts
+    type: function
+    parameters:
+      text: cstr
+    return: i32
+  - name: putchar
+    type: function
+    parameters:
+      character: i32
+    return: i32
+  - name: getchar
+    type: function
+    parameters: {}
+    return: i32
+  - name: snprintf
+    type: function
+    parameters:
+      buffer: cstr
+      size: u64
+      format: cstr
+    variadic: true
+    return: i32
+  - name: fopen
+    type: function
+    parameters:
+      path: cstr
+      mode: cstr
+    return: ptr
+  - name: fclose
+    type: function
+    parameters:
+      stream: ptr
+    return: i32
+  - name: fprintf
+    type: function
+    parameters:
+      stream: ptr
+      format: cstr
+    variadic: true
+    return: i32
+  - name: fputs
+    type: function
+    parameters:
+      text: cstr
+      stream: ptr
+    return: i32
+  - name: fgets
+    type: function
+    parameters:
+      buffer: ptr
+      size: i32
+      stream: ptr
+    return: ptr
+  - name: fflush
+    type: function
+    parameters:
+      stream: ptr
+    return: i32
+  - name: perror
+    type: function
+    parameters:
+      message: cstr
+    return: None

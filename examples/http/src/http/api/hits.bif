@@ -1,0 +1,16 @@
+let http = import("http")
+let mem = import("std:mem")
+let state = import("http.state:state")
+
+module api = {
+    let hits = [
+        http.json
+    ] (ctx: http.Context, app: mem.Shared[state.AppState]) => null {
+        let s <- app
+        s.hits = s.hits + 1
+        http.json(ctx, 200, #{hits: s.hits})
+        s -> app
+    }
+}
+
+export(api)

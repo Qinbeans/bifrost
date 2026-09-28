@@ -1,0 +1,34 @@
+let http = import("http")
+let mem = import("std:mem")
+let state = import("http.state:state")
+let add = import("http.api.add:api")
+let health = import("http.api.health:api")
+let hello = import("http.api.hello:api")
+let echo = import("http.api.echo:api")
+let hits = import("http.api.hits:api")
+let slow = import("http.api.slow:api")
+
+let main = [
+    http.app,
+    http.get,
+    http.post,
+    http.get_with,
+    http.run_with,
+    health.health,
+    hello.hello,
+    add.add,
+    echo.echo,
+    hits.hits,
+    slow.slow
+] () => i32 {
+    let app = http.app()
+    http.get(app, "/health", health.health)
+    http.get(app, "/hello/:name", hello.hello)
+    http.get(app, "/add", add.add)
+    http.post(app, "/echo", echo.echo)
+    http.get_with(app, "/hits", hits.hits)
+    http.get(app, "/slow", slow.slow)
+
+    let shared: mem.Shared[state.AppState] = state.AppState(hits: 0)
+    return http.run_with(app, 8080, shared)
+}
