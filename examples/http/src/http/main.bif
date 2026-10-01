@@ -7,6 +7,8 @@ let hello = import("http.api.hello:api")
 let echo = import("http.api.echo:api")
 let hits = import("http.api.hits:api")
 let slow = import("http.api.slow:api")
+let users = import("http.api.users:api")
+let notes = import("http.api.notes:api")
 
 let main = [
     http.app,
@@ -19,7 +21,11 @@ let main = [
     add.add,
     echo.echo,
     hits.hits,
-    slow.slow
+    slow.slow,
+    users.users,
+    notes.add,
+    notes.list,
+    http.post_with
 ] () => i32 {
     let app = http.app()
     http.get(app, "/health", health.health)
@@ -28,7 +34,10 @@ let main = [
     http.post(app, "/echo", echo.echo)
     http.get_with(app, "/hits", hits.hits)
     http.get(app, "/slow", slow.slow)
+    http.get(app, "/users", users.users)
+    http.post_with(app, "/notes", notes.add)
+    http.get_with(app, "/notes", notes.list)
 
-    let shared: mem.Shared[state.AppState] = state.AppState(hits: 0)
+    let shared: mem.Shared[state.AppState] = state.AppState(hits: 0, notes: #[])
     return http.run_with(app, 8080, shared)
 }

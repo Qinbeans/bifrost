@@ -92,6 +92,20 @@ def bifrost_shared_release(value: ptr) -> None:
 
 
 @runtime.function
+def bifrost_shared_unref(value: ptr) -> i64:
+    """Drop one owner, and return how many are left, without freeing: at 0, what the value holds is freed first."""
+    header = Ptr[i64](value) - 2
+    count = header[0] - 1
+    header[0] = count
+    return count
+
+
+@runtime.function
+def bifrost_shared_destroy(value: ptr) -> None:
+    c_free(Ptr[i64](value) - 2)
+
+
+@runtime.function
 def bifrost_shared_lock(value: ptr, message: cstr) -> None:
     """Take the guard; a second one while it is held stops the program with ``message``."""
     header = Ptr[i64](value) - 2
@@ -132,6 +146,19 @@ def bifrost_atomic_release(value: ptr) -> None:
         cell = Ptr[u8](value) - ATOMIC_HEADER
         c_mutex_destroy(cell)
         c_free(cell)
+
+
+@runtime.function
+def bifrost_atomic_unref(value: ptr) -> i64:
+    """Drop one owner, from any thread, and return how many are left, without freeing (see bifrost_shared_unref)."""
+    return atomic_add(Ptr[i64](value) - 2, -1) - 1
+
+
+@runtime.function
+def bifrost_atomic_destroy(value: ptr) -> None:
+    cell = Ptr[u8](value) - ATOMIC_HEADER
+    c_mutex_destroy(cell)
+    c_free(cell)
 
 
 @runtime.function

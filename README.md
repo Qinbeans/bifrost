@@ -69,6 +69,23 @@ Naming a function without calling it counts as depending on it, so `main` lists 
 
 `struct` defines an object. `let name: Type` members are stored fields, laid out as a C struct, so objects pass to and from C unchanged. `static let` members are functions called on the type (`Context.new()`) and take no space in the object. Objects are built with named arguments: `Context(window_width: 800, ...)`.
 
+A member function without `static` is a method: it is called on an object (`team.size()`), which it reads as `super`, listed in its dependencies like anything else it uses. A method named `to_string` is how `%v` prints the object:
+
+```bifrost
+let Team = struct {
+    let name: str,
+    let members: str[],
+    let size = [super] () => i64 len(super.members),
+    let to_string = [super, fmt.format] () => mem.Unique[str] {
+        return fmt.format("%s (%d members)", super.name, super.size())
+    }
+}
+
+stdio.printf("%v\n", team)    // core (2 members)
+```
+
+A method reads its object; it does not change it (fields change through a guard, where the object is held).
+
 ### Owners, guards and shared values
 
 `std:mem` holds the containers that say how a value is held. A `mem.Unique[T]` local is the one owner of its value; a `mem.Weak[T]` parameter is that value lent to a call. Either is reached only through a guard, a lock that exists only at compile time.
@@ -153,7 +170,15 @@ let main = [greet, stdio.puts] () => null {
 }                                   // freed here
 ```
 
-An owned string (`mem.Unique[str]`) is freed where its owner's scope ends, on every path, unless ownership moves first: `return message`, `let other = message`, or passing it to a `mem.Unique[str]` parameter. The compiler checks that a moved string is not used again, that it moves on every path through a branch or on none (never inside a loop), and that every owned result gets an owner, so nothing leaks and nothing is freed twice. There is no `malloc` or `free` to call yourself.
+An owned string (`mem.Unique[str]`) is freed where its owner's scope ends, on every path, unless ownership moves first: `return message`, `let other = message`, or passing it to a `mem.Unique[str]` parameter. The compiler checks that a moved string is not used again, and that it moves on every path through a branch or on none (never inside a loop), so nothing leaks and nothing is freed twice. An owned string only lent (`stdio.puts(fmt.format("%d items", n))`) is freed after the statement. There is no `malloc` or `free` to call yourself.
+
+Patterns are checked at compile time, for `fmt.format` and C's `printf` family: one value per conversion, each of a type it prints (`%d` integers, `%f` numbers, `%s` strings, `%p` addresses). `%d` prints any integer, whatever its size: Bifrost passes integers as 64 bits and makes the pattern say so (`%lld`). `%v` prints any value as its type calls for: numbers as numbers, `true`/`false`, strings as they are, lists and records as their JSON text, and objects as their `to_string` method gives them (an object without one is an error):
+
+```bifrost
+stdio.printf("%d of %d: %v\n", done, len(xs), xs)    // 2 of 3: [4, 8, 15]
+stdio.printf("%v\n", team)                          // core (2 members), from Team's to_string
+stdio.printf("%s\n", xs)                            // error: xs is a list, which %s cannot print; print it with %v
+```
 
 ### Records and JSON
 
@@ -210,7 +235,44 @@ let main = [total, io.printf] () => null {
 }
 ```
 
-Lists hold integers, floats or bools, for now. A list is freed once nothing uses it, in async functions too; functions borrow the lists passed to them and give the lists they return to their caller.
+A list holds values of any one type: numbers, strings, records, objects, or other lists (`#{name: str, ids: i64[]}[]`, `i64[][]`). Records and objects can hold lists, and `json.encode` writes lists as JSON arrays. An empty list needs its type written: `let xs: i64[] = #[]`.
+
+`xs[a...b]` is a new list of the items from `a` up to `b` (`xs[1...]`, `xs[...-1]`: either left out is the end), with Python's rules: negative counts from the end, and bounds past either end stop there. `users[0].name` reads on from an item.
+
+A list or record can own the strings it holds: its type says `mem.Unique[str]` (`mem.Unique[str][]`, `#{name: mem.Unique[str]}`, or an object's field), and it frees them with itself. A string from `fmt.format` moves in; a literal cannot (it is not the list's to free), so the compiler asks for an owned copy, `fmt.format("%s", "text")`. A value holding lists can also live in a `mem.Shared` or `mem.Atomic`, whose last owner frees it; a guard on one can grow its lists in place, which is how the HTTP example keeps notes across requests:
+
+```bifrost
+let AppState = struct { let hits: i64, let notes: mem.Unique[str][] }
+
+let add = [http.json, http.body, fmt.format] (ctx: http.Context, app: mem.Shared[AppState]) => null {
+    let s <- app
+    s.notes = #[...s.notes, fmt.format("%s", http.body(ctx))]    // a copy: the request's text is gone after it
+    http.json(ctx, 201, #{count: len(s.notes)})
+    s -> app
+}
+```
+
+`...xs` spreads a list into a new one: `#[0, ...xs, ...ys, 99]` copies their items, and `#[...xs]` is a copy of `xs`. Written as `let xs = #[...xs, x]`, it appends: the old `xs` is not used again, so the list grows in place (doubling its capacity when full, so appending costs O(1) on average), including a field changed through a guard (`guard.members = #[...guard.members, name]`):
+
+```bifrost
+let squares = [] (n: i64) => i64[] {
+    let xs: i64[] = #[]
+    forall i in #[0...n] {
+        let xs = #[...xs, i * i]     // grows xs in place
+    }
+    return xs
+}
+
+let users = [http.json] (ctx: http.Context) => null {
+    let found: #{id: i64, name: str}[] = #[]
+    forall id in #[1...4] {
+        let found = #[...found, #{id: id, name: "user"}]
+    }
+    http.json(ctx, 200, #{users: found})    // {"users": [{"id": 1, "name": "user"}, ...]}
+}
+```
+
+A list has one owner, like an owned string: the `let` holding it, freed at the end of its block, or its caller, once returned. Putting it in a record, object or another list that is kept moves it in (`let team = Team(members: xs)`); passing it to a function lends it. Reading a list out of another value (`team.members`, `rows[0]`, the `row` of `forall row in rows`) gives a view: it can be used, but not kept, so returning or storing it asks for a copy (`#[...team.members]`), and what it reads from is not replaced while the view is in use. A list made only to be lent (`total(#[1, 2, 3])`, `http.json(ctx, 200, #{users: found})`) is freed after the statement. At run time, a list is a pointer to its first item, after its length and capacity, so indexing is as fast as a C array.
 
 ### HTTP servers
 
@@ -475,12 +537,12 @@ uv run ruff format     # format
 ## Roadmap
 
 - **Closures**: lambdas that capture the locals around them
-- **Methods**: struct functions without `static`, reading the instance through `[super]`
+- **Methods that change their object**: a method taking `super` as a guard, so it can write its fields
 - **More of `std:mem`**: owned values other than strings (lists, buffers), and objects that hold a `mem.Shared` or `mem.Atomic`
 - **String interpolation**: `"Hello, {name}!"`, compiled to a checked `fmt.format`
 - **Opaque C types** in extern declarations, such as `FILE`
 - **Trailing commas**
-- **More of lists**: strings and objects in lists, lists in records (and so in JSON), and spreading (`#[...xs, 4]`)
+- **More of lists**: changing an item in place (`xs[i] = x`, `rows[i].name = ...`), and a list's own functions (sorting, searching)
 - **Quick fixes** in the language server, such as adding a missing dependency
 
 ## Project Goals

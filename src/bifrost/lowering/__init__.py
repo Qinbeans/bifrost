@@ -29,6 +29,7 @@ the ``.bif`` file, and so do compile errors in the generated functions.
 """
 
 import ast
+import copy
 import keyword
 import linecache
 import re
@@ -41,7 +42,6 @@ from typing import Any
 
 import tree_sitter_bifrost
 from mlir_python.lang import (
-    Array,
     CompileError,
     Fn,
     Function,
@@ -64,14 +64,14 @@ from mlir_python.lang import (
 )
 from mlir_python.lang._types import scalar_type
 from mlir_python.lang.types import FnType, ScalarType, StructType
-from mlir_python.lang.types import array as mlir_array
 from tree_sitter import Language, Node, Parser
 
-from bifrost import guards, ownership, std
+from bifrost import formats, guards, ownership, std
 from bifrost.configs.schema import _Extern
 from bifrost.naming import extern_name
+from bifrost.owned import OWNED_STRING, is_list, list_of, owns
 from bifrost.project import Project
-from bifrost.std import fmt, json, json_runtime, mem, mem_runtime, tasks
+from bifrost.std import fmt, json, json_runtime, list_runtime, mem, mem_runtime, tasks
 from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
@@ -155,6 +155,8 @@ def display_types(text: str) -> str:
         previous = text
         text = _FN_TYPE.sub(lambda m: f"({m.group(1)}) => {'null' if m.group(2) == 'None' else m.group(2)}", text)
     text = re.sub(r"\bArray\[(\w+)\]", r"\1[]", text)
+    while "List[" in text:  # a list: `List[List[i64]]` is `i64[][]`
+        text = re.sub(r"\bList\[([^\[\]]*)\]", r"\1[]", text)
     return re.sub(r"\bcstr\b", "str", text) if "=>" in text else text
 
 
@@ -208,6 +210,7 @@ class _PendingFunction:
     node: Node
     owner: object = None  # the object (or module) a static function or member belongs to
     module: str | None = None  # the module the function is a member of, if any
+    method: bool = False  # a function of an object without `static`: called on one, which it reads as `super`
 
 
 def _statement_call(item: Node) -> Node | None:
@@ -255,6 +258,33 @@ def _returns(node: Node) -> bool:
             condition = _unwrap(_children(node)[0])
             return _text(condition) == "true"
     return False
+
+
+def _unprintable(entries: list[tuple[str, ScalarType | None, bool]]) -> None:
+    """Reject lists and records given to a pattern that is not a literal (so has no %v to print them with)."""
+    for position, (text, kind, _) in enumerate(entries):
+        if kind is not None and (is_list(kind) or isinstance(kind, StructType)):
+            what = "a list" if is_list(kind) else "a record or object"
+            msg = f"{text} is {what}, which printf cannot print here; write the pattern where it is, with %v for it"
+            raise formats.FormatError(msg, position)
+
+
+def _read_as(read: formats.Read) -> ScalarType | None:
+    """Return the type a value is passed as, for the conversion reading it (``None``: as it is)."""
+    if read.what == "int":
+        return (u64 if read.unsigned else i64) if read.wide else i32  # `%c`, `%hd`, a `*` width: C's int
+    return f64 if read.what == "float" else None
+
+
+def _identifiers(node: Node) -> Iterator[Node]:
+    """Yield the ``identifier`` nodes in an expression, and the names starting a dotted path (``xs`` in ``xs.a``)."""
+    if node.type == "identifier":
+        yield node
+        return
+    if node.type == "child_annotation":
+        yield _children(node)[0]
+    for child in _children(node):
+        yield from _identifiers(child)
 
 
 def _is_statement(node: Node) -> bool:
@@ -314,6 +344,7 @@ class _FunctionScope:
         self.awaited: set[int] = set()  # ids of the call nodes written `await f(x)`
         self.names = set(parameters)
         self.temporaries = 0
+        self.receiver: type | None = None  # a method's object type: it reads the object it is called on as `super`
         # Dependency ("raylib.InitWindow", or the function's own name for
         # `this`) -> its entry in the list.
         self.dependencies: dict[str, Node] = {}
@@ -368,6 +399,8 @@ class SourceUnit:
         self._positions: dict[str, dict[tuple[int, int], tuple[int, int]]] = {}
         self._scope: _FunctionScope | None = None
         self._outer: list[_FunctionScope] = []  # the functions around the lambda being lowered
+        self._owning: set[int] = set()  # ids of the expressions that are kept: what they hold moves in
+        self._expected: dict[int, ScalarType] = {}  # list literals (by id) whose type is written where they go
         self._functions: set[str] = set()  # top-level functions, bound after lowering
 
     # -- errors -----------------------------------------------------------------
@@ -432,7 +465,7 @@ class SourceUnit:
             for function in functions:
                 self._module = function.module
                 python = self._lowered.pop(function.name, None) or self._function(
-                    function.name, function.node, function.symbol
+                    function.name, function.node, function.symbol, function.owner if function.method else None
                 )
                 self._register(function, python)
             self._module = None
@@ -491,10 +524,16 @@ class SourceUnit:
             case "function_definition":
                 return [_PendingFunction(qualified, symbol, value, owner, module)]
             case "struct_assignment":
-                scope[name], statics = self._struct(name, value)
+                scope[name], members = self._struct(name, value)
+                methods = self.project.methods.setdefault(scope[name], {})
+                for member, _, method in members:
+                    if method:
+                        methods[member] = (f"{qualified}.{member}", f"{symbol}_{member}")
                 return [
-                    _PendingFunction(f"{qualified}.{member}", f"{symbol}_{member}", definition, scope[name], module)
-                    for member, definition in statics
+                    _PendingFunction(
+                        f"{qualified}.{member}", f"{symbol}_{member}", definition, scope[name], module, method
+                    )
+                    for member, definition, method in members
                 ]
             case "expression":
                 scope[name] = self._constant(_unwrap(value))
@@ -648,7 +687,7 @@ class SourceUnit:
             raise self.error(node, f"unknown module {module!r} (configured: {known}; standard: std:...)")
         return extern
 
-    def _struct(self, name: str, node: Node) -> tuple[type, list[tuple[str, Node]]]:
+    def _struct(self, name: str, node: Node) -> tuple[type, list[tuple[str, Node, bool]]]:
         """Build an object's data type, and collect its ``static`` functions.
 
         ``let x: T`` members are stored fields, laid out as a C struct.
@@ -656,18 +695,16 @@ class SourceUnit:
         (``Context.new()``); they take no space in the object.
         """
         annotations: dict[str, object] = {}
-        statics: list[tuple[str, Node]] = []
+        statics: list[tuple[str, Node, bool]] = []  # functions, and whether each is a method
         for member in _children(node):
             parts = _children(member)
             member_name = self._identifier(parts[0])
             is_static = member.child_by_field_name("modifier") is not None
-            if member_name in annotations or any(member_name == other for other, _ in statics):
+            if member_name in annotations or any(member_name == other for other, _, _ in statics):
                 raise self.error(parts[0], f"{name} already has a member named '{member_name}'")
             function = next((part for part in parts if part.type == "local_function_definition"), None)
-            if function is not None and is_static:
-                statics.append((member_name, function))
-            elif function is not None:
-                raise self._unsupported(member, "a method (a function without `static`)")
+            if function is not None:
+                statics.append((member_name, function, not is_static))  # without `static`: a method
             elif is_static:
                 raise self.error(member, f"static data is not supported; '{member_name}' must be a field or a function")
             else:
@@ -679,14 +716,23 @@ class SourceUnit:
         except TypeError as error:
             raise self.error(node, str(error)) from error
 
+    def _stored_type(self, type_node: Node) -> object:
+        """Return the type of a value a list, record or object holds: ``mem.Unique[str]`` is a string it owns."""
+        found = self._container(type_node)
+        if found is not None and found[0] is mem.UNIQUE and self._type(found[1]) == cstr:
+            return OWNED_STRING
+        return self._type(type_node)
+
     def _field_type(self, type_node: Node) -> object:
-        """Return the type of an object's field; a field cannot hold a ``mem`` container (yet)."""
+        """Return the type of an object's field; a field cannot hold a ``mem`` container (yet), but an owned string."""
         found = self._container(type_node)
         if found is None:
             return self._type(type_node)
         container = found[0]
         if container is mem.WEAK:
             raise self.error(type_node, "an object cannot store a mem.Weak: it would outlive the call that lends it")
+        if container is mem.UNIQUE and self._type(found[1]) == cstr:
+            return OWNED_STRING
         if container is mem.UNIQUE:
             raise self._unsupported(type_node, "an object owning another (a mem.Unique field)")
         if container in mem.CELLS:
@@ -723,7 +769,7 @@ class SourceUnit:
             name = self._identifier(name_node)
             if any(name == other for other, _ in fields):
                 raise self.error(name_node, f"the record type already has a field '{name}'")
-            kind = self._type(field.child_by_field_name("type"))
+            kind = self._stored_type(field.child_by_field_name("type"))
             if kind is type(None):
                 raise self.error(field, f"field '{name}' needs a type with values, not null")
             held = scalar_type(kind)
@@ -747,12 +793,13 @@ class SourceUnit:
             case "function_type":
                 return self._function_type(inner[0])
             case "list_type":
-                element = self._type(_children(inner[0])[0])
-                try:
-                    return Array[element]
-                except TypeError:
-                    name = getattr(element, "__name__", _text(_children(inner[0])[0]))
-                    raise self.error(inner[0], f"a list holds integers, floats or bools, not {name} (yet)") from None
+                written = _children(inner[0])[0]
+                element = self._stored_type(written)
+                if self._container(written) is not None and element != OWNED_STRING:
+                    raise self._unsupported(written, "a list of mem containers")
+                if element is type(None):
+                    raise self.error(written, "a list holds values; null is not one")
+                return list_of(element)
         raise self._unsupported(inner[0])
 
     def _function_type(self, node: Node) -> object:
@@ -788,6 +835,7 @@ class SourceUnit:
             raise self.error(node, f"{base!r} takes one type: {base!r}[Context]")
         if base is mem.UNIQUE:
             return self._type(arguments[0])  # the owner holds the value itself (a str: its pointer)
+        # pyrefly: ignore [invalid-annotation]
         return Ptr[self._type(arguments[0])]
 
     def _container(self, type_node: Node | None) -> tuple[mem.Container, Node] | None:
@@ -906,13 +954,18 @@ class SourceUnit:
 
     # -- functions ----------------------------------------------------------------
 
-    def _function(self, name: str, node: Node, symbol: str | None = None) -> Callable[..., Any]:
-        """Lower a function; ``name`` is how Bifrost calls it, ``symbol`` its compiled name."""
+    def _function(
+        self, name: str, node: Node, symbol: str | None = None, receiver: type | None = None
+    ) -> Callable[..., Any]:
+        """Lower a function; ``name`` is how Bifrost calls it, ``symbol`` its compiled name.
+
+        ``receiver``: for a method, its object's type; the object it is called on is its first parameter, ``super``.
+        """
         parts = _children(node)
         dependency_list = parts[0] if parts[0].type in {"dependency_list", "local_dependency_list"} else None
         parameter_list, return_node, body = parts[1:] if dependency_list else parts
-        annotations: dict[str, object] = {}
-        arguments = []
+        annotations: dict[str, object] = {"super": receiver} if receiver is not None else {}
+        arguments = [self._at(ast.arg("super"), node)] if receiver is not None else []
         for parameter in _children(parameter_list):
             identifier, type_node = _children(parameter)
             parameter_name = self._identifier(identifier)
@@ -932,20 +985,17 @@ class SourceUnit:
         }
         cells = {name: container for name, (container, _) in held.items() if container in mem.CELLS}
         cell_parameters = set(cells) & set(annotations)
-        try:
-            plan = ownership.check(body, owned_parameters, self._ownership_oracle(), cell_parameters)
-        except ownership.OwnershipError as error:
-            raise self.error(error.node, error.message) from None
 
         self._scope = scope = _FunctionScope(name, set(annotations) - {"return"}, symbol or name)
         scope.result = annotations["return"]
+        scope.receiver = receiver
         scope.results = [] if inferring else None
         scope.is_async = is_async = name in self._pausing
         if is_async and name == "main" and self.is_root:
             self._check_async_main(node)
             symbol = scope.symbol = "bifrost_async_main"  # run by a plain `main` (see `_register`)
         scope.types = {parameter: scalar_type(kind) for parameter, kind in annotations.items() if parameter != "return"}
-        scope.held, scope.plan, scope.cells, scope.cell_parameters = held, plan, cells, cell_parameters
+        scope.held, scope.cells, scope.cell_parameters = held, cells, cell_parameters
         scope.pointers = {name for name, (container, _) in held.items() if container is mem.WEAK} | set(cells)
         scope.shared_locals = {name for name, (container, _) in held.items() if container is mem.UNIQUE}
         if dependency_list is not None:
@@ -956,10 +1006,16 @@ class SourceUnit:
             | {self._identifier(lock.child_by_field_name("guard")) for lock in self._descendants(body, "lock")}
             | {self._identifier(_children(loop)[0]) for loop in self._descendants(body, "forall")}
         )
+        for parameter in owned_parameters:  # a mem.Unique[str] parameter: a string it owns
+            scope.types[parameter] = OWNED_STRING
+        # Checked once the parameters' and names' types are known, which the check asks about.
+        scope.plan = self._check_ownership(body, owned_parameters, set(annotations) - {"return"})
+        self._scope = scope  # checking may lower a function early (for its `Record`), which restores this
         statements = self._body(body, returns=annotations["return"] is not type(None))
         for dependency, entry in self._scope.dependencies.items():
             if dependency not in self._scope.called:
-                raise self.error(entry, f"'{dependency}' is a dependency of {name} but never called")
+                verb = "used" if dependency == "super" else "called"
+                raise self.error(entry, f"'{dependency}' is a dependency of {name} but never {verb}")
         if inferring:
             annotations["return"] = self._inferred_record(name, self._scope.results or [])
             self._inferring.discard(name)
@@ -1083,13 +1139,82 @@ class SourceUnit:
                 return self.project.owned_signatures.get(callee.name, (False, set()))
             return False, set()
 
+        def kind(node: Node) -> ScalarType | None:
+            try:
+                return self._static_type(node)
+            except BifrostError:
+                return None  # reported where it is lowered
+
         return ownership.Oracle(
             owned_call=lambda node: signature(node)[0],
             moved_arguments=lambda node: signature(node)[1],
             owned_type=self._owned_type,
             cell_call=lambda node: self._cell_result(node) is not None,
             cell_type=lambda node: self._cell(node) is not None,
+            owned_value=lambda node: owns(kind(node)),
+            copy=lambda node: self._copy_hint(node, kind(node)),
+            constructs=self._constructs,
+            bind=self._bind_local,
         )
+
+    @staticmethod
+    def _copy_hint(node: Node, kind: ScalarType | None) -> str:
+        """Write how to copy ``node`` of type ``kind``: ``#[...xs]``, ``fmt.format("%s", s)``, or ``""``."""
+        text = " ".join(_text(node).split())
+        if is_list(kind):
+            return f"#[...{text}]"
+        return f'fmt.format("%s", {text})' if kind == OWNED_STRING else ""
+
+    def _check_ownership(self, body: Node, owned: set[str], parameters: set[str]) -> ownership.Plan:
+        """Check the owned values of the function being lowered (see ``ownership``); return where to free them."""
+        assert self._scope is not None
+        weak = {name for name, (container, _) in self._scope.held.items() if container is mem.WEAK}
+        try:
+            return ownership.check(
+                body,
+                owned,
+                self._ownership_oracle(),
+                self._scope.cell_parameters,
+                {name: name in weak for name in parameters},
+            )
+        except ownership.OwnershipError as error:
+            raise self.error(error.node, error.message) from None
+
+    def _constructs(self, node: Node) -> bool:
+        """Whether a call expression constructs an object: ``Team(members: xs)``, ``state.Team(...)``."""
+        parts = _children(node) if node.type == "child_annotation" else [node]
+        if node.type == "child_annotation" and any(part.type != "simple_identifier" for part in parts[:-1]):
+            return False
+        call = _children(parts[-1])[0]
+        function = call.child_by_field_name("function") if call.type == "user_function_call" else None
+        if function is None:
+            return False
+        return self._builds(".".join([*(_text(part) for part in parts[:-1]), _text(function)]))
+
+    def _bind_local(self, name: str, node: Node) -> None:
+        """Record a local's type as the ownership check reaches its ``let`` (or ``forall``)."""
+        assert self._scope is not None
+        try:
+            if node.type == "forall":
+                iterated = _children(node)[1]
+                literal = _unwrap(iterated)
+                inner = _children(literal)[0] if literal.type == "literal" else literal
+                span = self._span(inner) if inner.type == "list" else None
+                kind = (self._static_type(span[0]) or i64) if span is not None else self._static_type(iterated)
+                kind = kind if span is not None else (kind.element if kind is not None and is_list(kind) else None)
+            else:
+                declared = node.child_by_field_name("type")
+                found = self._container(declared) if declared is not None else None
+                if found is not None and found[0] is mem.UNIQUE:
+                    kind = scalar_type(self._stored_type(declared))
+                elif declared is not None:
+                    kind = scalar_type(self._type(found[1] if found is not None else declared))
+                else:
+                    kind = self._static_type(_children(node)[-1])
+        except BifrostError:
+            return  # reported where it is lowered
+        if kind is not None or name not in self._scope.types:
+            self._scope.types[name] = kind
 
     def _dependencies(self, node: Node) -> None:
         """Record the functions a dependency list lets the current function call.
@@ -1101,19 +1226,30 @@ class SourceUnit:
         for entry in node.children:
             if (not entry.is_named and entry.type not in {"this", "super"}) or entry.type == "comment":
                 continue
-            if entry.type == "super":
+            if entry.type == "super" and self._scope.receiver is None:
                 function = self._scope.function
-                raise self.error(entry, f"static function {function} has no instance, so it cannot depend on super")
+                raise self.error(entry, f"{function} is not called on an object, so it has no super to depend on")
+            if entry.type == "super":
+                self._scope.dependencies["super"] = entry
+                continue
             if entry.type == "this":
                 dependency = self._scope.function
             else:
                 parts = _text(entry).split(".")
                 dependency = ".".join([self._qualify(parts[0]), *parts[1:]])
+                self._not_a_method(entry, dependency, "it needs no entry in a dependency list")
                 if not self._is_function(entry):
                     raise self.error(entry, f"'{dependency}' is not a function; list only functions")
             if dependency in self._scope.dependencies:
                 raise self.error(entry, f"'{dependency}' is already a dependency")
             self._scope.dependencies[dependency] = entry
+
+    def _not_a_method(self, node: Node, dotted: str, instead: str) -> None:
+        """Reject naming a method as an object's function (``Point.norm``): it is called on a value."""
+        owner, _, name = dotted.rpartition(".")
+        cls = self.globals.get(owner) if owner and "." not in owner else None
+        if isinstance(cls, type) and name in self.project.methods.get(cls, {}):
+            raise self.error(node, f"{dotted} is a method, called on a {owner} (value.{name}(...)); {instead}")
 
     def _is_function(self, node: Node) -> bool:
         """Whether a (dotted) name is a top-level function, an object's static function, or an extern."""
@@ -1163,9 +1299,12 @@ class SourceUnit:
     # -- statements ---------------------------------------------------------------
 
     def _block(self, node: Node) -> list[ast.stmt]:
+        assert self._scope is not None
+        # What the statement around this block (an `if`, a loop) runs before and after it is its own.
+        outer = self._scope.before, self._scope.after, self._scope.lend_call
+        self._scope.before, self._scope.after = [], []
         statements: list[ast.stmt] = []
         for item in _children(node):
-            assert self._scope is not None
             self._scope.lend_call = _statement_call(item)
             lowered = self._block_item(item)
             statements.extend([*self._scope.before, *lowered])
@@ -1173,13 +1312,28 @@ class SourceUnit:
                 statements.extend(self._scope.after)
             self._scope.before, self._scope.after, self._scope.lend_call = [], [], None
         statements += [self._free(name, node) for name in self._scope.plan.at_end.get(node.id, [])]
+        self._scope.before, self._scope.after, self._scope.lend_call = outer
         return statements or [self._at(ast.Pass(), node)]
 
     def _free(self, name: str, node: Node) -> ast.stmt:
         """``free(name)``: the end of an owned string's life (for a cell, the end of one owner's)."""
         assert self._scope is not None
         if name in self._scope.cells:
-            return self._cell_statement("release", name, node)
+            held = scalar_type(self._scope.held[name][1])
+            if not owns(held):
+                return self._cell_statement("release", name, node)
+            # The last owner frees what the value holds, then the cell.
+            assert held is not None
+            pointer = self._at(ast.Name(name, ast.Load()), node)
+            left = self._cell_call("unref", self._scope.cells[name], [pointer], node)
+            value = self._at(ast.Subscript(copy.copy(pointer), ast.Constant(0), ast.Load()), node)
+            last = self._at(ast.Compare(left, [ast.Eq()], [ast.Constant(0)]), node)
+            destroy = self._cell_call("destroy", self._scope.cells[name], [copy.copy(pointer)], node)
+            return self._at(ast.If(last, [self._drop(value, held, node), self._at(ast.Expr(destroy), node)], []), node)
+        kind = self._scope.types.get(name)
+        if owns(kind):
+            assert kind is not None
+            return self._drop(self._at(ast.Name(name, ast.Load()), node), kind, node)
         self.globals["__bifrost_free"] = self.project.runtime("free")
         call = ast.Call(self._at(ast.Name("__bifrost_free", ast.Load()), node), [ast.Name(name, ast.Load())], [])
         return self._at(ast.Expr(self._at(call, node)), node)
@@ -1201,51 +1355,129 @@ class SourceUnit:
                 if source in self._scope.cells:  # other guards are checked by `guards`; nothing runs
                     statements.append(self._cell_statement("unlock", source, item))
             case "field_assignment":
-                target = self._field_target(item.child_by_field_name("target"))
-                value = self._expression(item.child_by_field_name("value"))
-                statements.append(self._at(ast.Assign([target], value), item))
+                statements.extend(self._field_assignment(item))
             case "guard_assignment":  # `guard = v`: write the value it holds (checked by `guards`)
                 guarded = self._guarded(item.child_by_field_name("guard"), ast.Store())
                 assert guarded is not None
                 value = self._expression(item.child_by_field_name("value"))
                 statements.append(self._at(ast.Assign([guarded], value), item))
             case "local_assignment":
-                statements.append(self._local_assignment(item))
+                statements.extend(self._local_assignment(item))
             case "return_statement":
                 statements.extend(self._return_statement(item))
             case _:
                 statements.extend(self._statement(item))
         return statements
 
-    def _local_assignment(self, item: Node) -> ast.stmt:
-        """``let x = v``, or ``let x: T = v`` (a ``mem.Unique`` local is a plain value, lent to calls)."""
+    def _local_assignment(self, item: Node) -> list[ast.stmt]:
+        """``let x = v``, or ``let x: T = v`` (a ``mem.Unique`` local is a plain value, lent to calls).
+
+        When ``x`` owns a value already, the new one replaces it: the old is
+        freed after the new is made, or, for ``let xs = #[...xs, x]``, grown in place.
+        """
         assert self._scope is not None
         parts = _children(item)
         identifier, value = parts[0], parts[-1]
         if value.type != "expression":
             raise self._unsupported(value, "a nested function or block value")
-        target = self._at(ast.Name(self._identifier(identifier), ast.Store()), identifier)
+        name = self._identifier(identifier)
+        target = self._at(ast.Name(name, ast.Store()), identifier)
         type_node = item.child_by_field_name("type")
-        if _text(identifier) in self._scope.cells:
-            return self._cell_assignment(item, target, value)
-        known = self._static_type(value)
-        lowered = self._expression(value)
+        if name in self._scope.cells:
+            return [self._cell_assignment(item, target, value)]
         if type_node is not None:
+            found = self._container(type_node)
+            self._expect(value, scalar_type(self._type(found[1] if found is not None else type_node)))
+        known = self._static_type(value)
+        if type_node is not None and self._is(mem.UNIQUE, type_node):
+            known = scalar_type(self._stored_type(type_node))
+        replacing = self._scope.plan.replaced.get(item.id) == name
+        if replacing and owns(known) and self._grows(name, value):
+            assert known is not None
+            self._scope.types[name] = known
+            literal = _children(_unwrap(value))[0]
+            parts = [self._list_part(part, known.element, owning=True) for part in _children(literal)[1:]]
+            _ListWriter(self, literal, known).grow(name, parts)
+            return []
+        lowered = self._owned_expression(value) if owns(known) and self._fresh(value) else self._expression(value)
+        if replacing:
+            lowered = self._replace(name, lowered, item)
+        if type_node is not None and not self._is(mem.UNIQUE, type_node):
             found = self._container(type_node)
             known = scalar_type(self._type(found[1] if found is not None else type_node))
             self._check_record(
                 value, known.python if isinstance(known, StructType) else None, f"{_text(identifier)} is"
             )
-        self._scope.types[_text(identifier)] = known
+        self._scope.types[name] = known
         if type_node is None or self._is(mem.UNIQUE, type_node):
             if type_node is not None:
                 self._type(type_node)  # resolve it, to report unknown types here
-            return self._at(ast.Assign([target], lowered), item)
+            return [self._at(ast.Assign([target], lowered), item)]
+        annotation_name = self._at(self._global(self._type(type_node), "type"), type_node)
+        return [self._at(ast.AnnAssign(target, annotation_name, lowered, simple=1), item)]
+
+    def _replace(self, name: str, new: ast.expr, item: Node) -> ast.expr:
+        """Make the new value of the owner ``name``, then free its old one (which making the new one may read)."""
+        assert self._scope is not None
+        old = self._scope.types.get(name)
         self._scope.temporaries += 1
-        annotation = f"__bifrost_type_{self._scope.temporaries}"
-        self.globals[annotation] = self._type(type_node)
-        annotation_name = self._at(ast.Name(annotation, ast.Load()), type_node)
-        return self._at(ast.AnnAssign(target, annotation_name, lowered, simple=1), item)
+        held = self._at(ast.Name(f"__bifrost_new_{self._scope.temporaries}", ast.Store()), item)
+        self._scope.before.append(self._at(ast.Assign([held], new), item))
+        if old is not None and (owns(old) or old == cstr):
+            self._scope.before.append(self._free(name, item))
+        return self._at(ast.Name(held.id, ast.Load()), item)
+
+    def _expect(self, value: Node, kind: object) -> None:
+        """Note the type written where a list literal goes (``let xs: f64[] = #[1, 2]``), which it takes."""
+        literal = _unwrap(value)
+        if literal.type == "literal" and _children(literal)[0].type == "list" and is_list(kind):
+            assert isinstance(kind, ScalarType)
+            self._expected[_children(literal)[0].id] = kind
+
+    @staticmethod
+    def _grows(name: str, value: Node) -> bool:
+        """Whether ``name = value`` appends to ``name`` in place: ``#[...name, x]``, with ``name`` read nowhere else.
+
+        ``name`` is a local (``xs``) or a field (``guard.members``); nothing else in the list may read its root.
+        """
+        literal = _unwrap(value)
+        if literal.type != "literal" or _children(literal)[0].type != "list":
+            return False
+        items = _children(_children(literal)[0])
+        first = items[0] if items else None
+        written = " ".join(_text(_unwrap(_children(first)[-1])).split()) if first is not None else ""
+        if first is None or first.type != "spread_action" or written != name:
+            return False
+        root = name.split(".", maxsplit=1)[0]
+        return not any(_text(found) == root for item in items[1:] for found in _identifiers(item))
+
+    def _field_assignment(self, item: Node) -> list[ast.stmt]:
+        """``x.f = v``; a list (or a value holding one) it replaces is freed after the new one is made."""
+        assert self._scope is not None
+        target_node, value_node = item.child_by_field_name("target"), item.child_by_field_name("value")
+        target = self._field_target(target_node)
+        kind = self._static_type(value_node)
+        if not owns(kind):
+            return [self._at(ast.Assign([target], self._expression(value_node)), item)]
+        assert kind is not None
+        self._expect(value_node, kind)
+        old = self._field_target(target_node)
+        old.ctx = ast.Load()
+        self._scope.temporaries += 1
+        new = f"__bifrost_new_{self._scope.temporaries}"
+        if is_list(kind) and self._grows(" ".join(_text(target_node).split()), value_node):
+            # Grown in place (it may move), then stored back.
+            self._scope.before.append(self._at(ast.Assign([self._at(ast.Name(new, ast.Store()), item)], old), item))
+            literal = _children(_unwrap(value_node))[0]
+            parts = [self._list_part(part, kind.element, owning=True) for part in _children(literal)[1:]]
+            _ListWriter(self, literal, kind).grow(new, parts)
+            return [self._at(ast.Assign([target], self._at(ast.Name(new, ast.Load()), item)), item)]
+        lowered = self._owned_expression(value_node)
+        return [
+            self._at(ast.Assign([self._at(ast.Name(new, ast.Store()), item)], lowered), item),
+            self._drop(old, kind, item),
+            self._at(ast.Assign([target], self._at(ast.Name(new, ast.Load()), item)), item),
+        ]
 
     def _cell_assignment(self, item: Node, target: ast.Name, value: Node) -> ast.stmt:
         """``let c: mem.Shared[T] = v`` puts ``v`` in a new cell; ``let other = c`` is another owner of ``c``'s."""
@@ -1273,7 +1505,10 @@ class SourceUnit:
         allocate = self._at(ast.Call(self._at(pointer, item), [raw], []), item)
         owner = self._at(ast.Name(name, ast.Load()), item)
         element = self._at(ast.Subscript(owner, ast.Constant(0), ast.Store()), item)
-        self._scope.after.append(self._at(ast.Assign([element], self._expression(value)), item))
+        moved = (
+            self._owned_expression(value) if owns(scalar_type(held)) and self._fresh(value) else self._expression(value)
+        )
+        self._scope.after.append(self._at(ast.Assign([element], moved), item))
         annotation = self._at(self._global(Ptr[held], "type"), item)
         return self._at(ast.AnnAssign(target, annotation, allocate, simple=1), item)
 
@@ -1335,8 +1570,9 @@ class SourceUnit:
         values = _children(node)
         if values:
             self._returned(values[0])
+            self._expect(values[0], self._scope.result)
         retains = self._retain_returned(values[0] if values else None)
-        value = self._expression(values[0]) if values else None
+        value = self._kept(values[0]) if values else None
         # What runs after the returned call (unlocking a cell lent to it), then the frees.
         after, self._scope.after = self._scope.after, []
         frees = after + [self._free(name, node) for name in self._scope.plan.before_return.get(node.id, [])]
@@ -1369,12 +1605,15 @@ class SourceUnit:
                 return [self._if_statement(inner)]
             case "while":
                 condition, body = _children(inner)
-                return [
-                    self._at(
-                        ast.While(self._expression(condition), self._block(body), []),
-                        inner,
+                assert self._scope is not None
+                waiting = len(self._scope.before)
+                test = self._expression(condition)
+                if len(self._scope.before) != waiting:
+                    msg = (
+                        "this condition makes a value the loop would compute only once; name it with a let in the loop"
                     )
-                ]
+                    raise self.error(condition, msg)
+                return [self._at(ast.While(test, self._block(body), []), inner)]
             case "match_expression":
                 return self._match_statement(inner)
             case "forall":
@@ -1395,9 +1634,30 @@ class SourceUnit:
             iterable: ast.expr = self._at(ast.Call(self._at(ast.Name("range", ast.Load()), node), bounds, []), node)
             self._scope.types[name] = self._static_type(span[0]) or i64
         else:
-            iterable = self._expression(iterated)
             kind = self._static_type(iterated)
-            self._scope.types[name] = kind.element if kind is not None else None
+            if kind is None or not is_list(kind):
+                shown = display_types(kind.name) if kind is not None else "a value of unknown type"
+                raise self.error(iterated, f"forall goes through a list, not {shown}")
+            self._scope.types[name] = kind.element
+            items = self._expression(iterated)
+            self._scope.temporaries += 1
+            prefix = f"__bifrost_forall_{self._scope.temporaries}"
+
+            def local(identifier: str, context: ast.expr_context | None = None) -> ast.Name:
+                return self._at(ast.Name(identifier, context or ast.Load()), node)
+
+            length = self._at(self._global(list_runtime.bifrost_list_length, "list"), node)
+            self._scope.before += [
+                self._at(ast.Assign([local(prefix, ast.Store())], items), node),
+                self._at(
+                    ast.Assign([local(f"{prefix}_count", ast.Store())], ast.Call(length, [local(prefix)], [])), node
+                ),
+            ]
+            iterable = self._at(ast.Call(local("range"), [local(f"{prefix}_count")], []), node)
+            item = ast.Subscript(local(prefix), local(f"{prefix}_index"), ast.Load())
+            read = self._at(ast.Assign([self._at(ast.Name(name, ast.Store()), identifier)], self._at(item, node)), node)
+            index = local(f"{prefix}_index", ast.Store())
+            return self._at(ast.For(index, iterable, [read, *self._block(body)], []), node)
         target = self._at(ast.Name(name, ast.Store()), identifier)
         return self._at(ast.For(target, iterable, self._block(body), []), node)
 
@@ -1463,11 +1723,54 @@ class SourceUnit:
         return self._call(_children(node)[0], None)
 
     def _get_expression(self, node: Node) -> ast.expr:
+        """``xs[i]``: from the start, or from the end when negative; out of range stops the program."""
         owner, index = _children(node)
-        if index.type == "rest_of":
-            raise self._unsupported(index, "slicing")
-        value = ast.Subscript(self._expression(owner), self._expression(index), ast.Load())
-        return self._at(value, node)
+        if index.type in _SLICES:
+            return self._slice(node, owner, index)
+        kind = self._static_type(owner)
+        items = self._expression(owner)
+        if kind is None or not is_list(kind):
+            return self._at(ast.Subscript(items, self._expression(index), ast.Load()), node)
+        if not isinstance(items, (ast.Name, ast.Attribute)):  # computed: read it once
+            assert self._scope is not None
+            self._scope.temporaries += 1
+            holder = f"__bifrost_items_{self._scope.temporaries}"
+            self._scope.before.append(
+                self._at(ast.Assign([self._at(ast.Name(holder, ast.Store()), node)], items), node)
+            )
+            items = self._at(ast.Name(holder, ast.Load()), node)
+        where = f"{_display(self.path, self.root)}:{node.start_point[0] + 1}"
+        check = self._at(self._global(list_runtime.bifrost_list_index, "list"), node)
+        message = ast.Constant(f"{where}: index out of range\n")
+        position = self._at(ast.Call(check, [items, self._expression(index), message], []), node)
+        return self._at(ast.Subscript(copy.copy(items), position, ast.Load()), node)
+
+    def _slice(self, node: Node, owner: Node, index: Node) -> ast.expr:
+        """``xs[a...b]``: a new list of the items from ``a`` up to ``b`` (either left out: the end), as in Python.
+
+        The items are copied (deep copies of those holding lists): the new list is its own.
+        """
+        assert self._scope is not None
+        kind = self._static_type(owner)
+        if kind is None or not is_list(kind):
+            shown = display_types(kind.name) if kind is not None else _text(owner)
+            raise self.error(owner, f"only a list can be sliced, not {shown}")
+        bounds = [child for child in _children(index) if child.type != "ellipsis"]
+        start = bounds[0] if index.type in {"spread_between", "rest_of"} else None
+        end = bounds[-1] if index.type in {"spread_between", "spread_action"} else None
+        writer = _ListWriter(self, node, kind)
+        items = self._expression(owner)
+        writer.assign(f"{writer.prefix}_from", items)
+        source = writer.name(f"{writer.prefix}_from")
+        length = writer.runtime("length", source)
+        for name, bound, fallback in (("start", start, ast.Constant(0)), ("end", end, length)):
+            given = ast.Constant(0 if bound is None else 1)
+            value = ast.Constant(0) if bound is None else self._expression(bound)
+            writer.assign(f"{writer.prefix}_{name}", writer.runtime("bound", copy.copy(source), value, given, fallback))
+        writer.slice(source)
+        if node.id not in self._owning:  # only lent: freed after the statement
+            self._scope.after.append(self._drop(writer.result, kind, node))
+        return writer.result
 
     def _default_var(self, node: Node) -> ast.expr:
         raise self.error(node, "'_' is only a match arm's default")
@@ -1504,50 +1807,85 @@ class SourceUnit:
                     node,
                 )
             case "record":
-                return self._record(inner)
+                return self._record(inner, owning=node.id in self._owning)
             case "list":
-                return self._list(inner)
+                return self._list(inner, owning=node.id in self._owning)
             case _:
                 raise self._unsupported(inner, f"a {inner.type} value")
         return self._at(ast.Constant(value), node)
 
-    def _list(self, node: Node) -> ast.expr:
-        """``#[1, 2, 3]``, or ``#[0...10]`` (0 to 9): a list, freed when nothing uses it any more."""
-        items = _children(node)
-        span = self._span(node)
-        if span is None:
-            if any(item.type != "expression" for item in items):
-                raise self._unsupported(next(i for i in items if i.type != "expression"), "spreading into a list")
-            return self._at(ast.List([self._expression(item) for item in items], ast.Load()), node)
-        # A range as a list: fill a new one with start, start + 1, ... (end - 1).
+    def _list(self, node: Node, *, owning: bool) -> ast.expr:
+        """``#[1, 2, 3]``, ``#[...xs, 4]``, or ``#[0...10]`` (0 to 9): a new list.
+
+        ``owning``: it is kept (bound, returned, or put in another value), so
+        what it holds moves in; otherwise it lends what it holds and is freed
+        after the statement.
+        """
         assert self._scope is not None
-        start, end = span
-        self._scope.temporaries += 1
-        prefix = f"__bifrost_range_{self._scope.temporaries}"
-        kind = self._static_type(start) or i64
+        for item in _children(node):
+            spread = _children(item)[-1] if item.type == "spread_action" else None
+            if spread is not None and not is_list(self._static_type(spread)):
+                raise self.error(spread, f"only a list can be spread into a list, not {_text(spread)}")
+        kind = self._list_type(node)
+        if kind is None:
+            raise self.error(node, "give an empty list its type: let xs: i64[] = #[]")
+        element = kind.element
+        assert element is not None
+        items = _children(node)
+        for item in items:
+            if item.type not in {"expression", "spread_action"} and self._span(node) is None:
+                raise self._unsupported(item, "a range among other items (spread it: #[...#[0...n], x])")
+        writer = _ListWriter(self, node, kind)
+        span = self._span(node)
+        if span is not None:
+            writer.range(*span)
+        else:
+            parts = [self._list_part(item, element, owning=owning) for item in items]
+            writer.fill(parts)
+        if not owning:
+            # Only lent: freed after the statement. What it holds is lent to it, or freed on its own.
+            self._scope.after.append(self._list_free(writer.result, node))
+        return writer.result
 
-        def name(identifier: str, context: ast.expr_context | None = None) -> ast.Name:
-            return self._at(ast.Name(identifier, context or ast.Load()), node)
+    def _check_string(self, value: Node, expected: object, where: str) -> None:
+        """Check a string going where a list, record or object holds it: owned there only if it is owned."""
+        if scalar_type(expected) not in (cstr, OWNED_STRING):
+            return
+        kind = self._static_type(value)
+        text = " ".join(_text(value).split())
+        if expected == OWNED_STRING and kind == cstr:
+            msg = f'{where} owned (mem.Unique[str]), but {text} is not; keep an owned copy: fmt.format("%s", {text})'
+            raise self.error(value, msg)
+        if expected == cstr and kind == OWNED_STRING:
+            msg = f"{where} not owned (str), but {text} is; write the type as mem.Unique[str]"
+            raise self.error(value, msg)
 
-        count = self._at(ast.BinOp(name(f"{prefix}_end"), ast.Sub(), name(f"{prefix}_start")), node)
-        allocate = ast.Call(name("__bifrost_array"), [self._global(kind, "type"), name(f"{prefix}_count")], [])
-        self.globals["__bifrost_array"] = mlir_array
-        element = ast.Subscript(name(prefix), name(f"{prefix}_index"), ast.Store())
-        value = ast.BinOp(name(f"{prefix}_start"), ast.Add(), name(f"{prefix}_index"))
-        fill = ast.For(
-            name(f"{prefix}_index", ast.Store()),
-            ast.Call(name("range"), [name(f"{prefix}_count")], []),
-            [self._at(ast.Assign([self._at(element, node)], self._at(value, node)), node)],
-            [],
-        )
-        self._scope.before += [
-            self._at(ast.Assign([name(f"{prefix}_start", ast.Store())], self._expression(start)), node),
-            self._at(ast.Assign([name(f"{prefix}_end", ast.Store())], self._expression(end)), node),
-            self._at(ast.Assign([name(f"{prefix}_count", ast.Store())], count), node),
-            self._at(ast.Assign([name(prefix, ast.Store())], self._at(allocate, node)), node),
-            self._at(fill, node),
-        ]
-        return name(prefix)
+    def _list_part(self, item: Node, element: ScalarType, *, owning: bool) -> "tuple[str, ast.expr]":
+        """Lower one item of a list literal: ``("item", value)``, or ``("spread", list)`` for ``...xs``."""
+        if item.type == "spread_action":
+            spread = _children(item)[-1]
+            kind = self._static_type(spread)
+            if kind is None or not is_list(kind):
+                raise self.error(spread, f"only a list can be spread into a list, not {_text(spread)}")
+            if kind.element != element:
+                shown = display_types(kind.name)
+                raise self.error(
+                    spread, f"{_text(spread)} is a {shown}, but this list holds {display_types(element.name)}"
+                )
+            return "spread", self._expression(spread)
+        self._check_string(item, element, "this list's strings are")
+        value = self._owned_expression(item) if owning and owns(element) else self._expression(item)
+        return "item", value
+
+    def _list_free(self, items: ast.expr, node: Node) -> ast.stmt:
+        """Free a list itself, not what it holds (a list that only lent its items)."""
+        free = self._at(self._global(list_runtime.bifrost_list_free, "list"), node)
+        return self._at(ast.Expr(self._at(ast.Call(free, [items], []), node)), node)
+
+    def _drop(self, value: ast.expr, kind: ScalarType, node: Node) -> ast.stmt:
+        """Free an owned value and what it owns: a list (and its items' lists), a record or object holding one."""
+        function = self._at(self._global(self.project.drops.drop(kind), "drop"), node)
+        return self._at(ast.Expr(self._at(ast.Call(function, [value], []), node)), node)
 
     @staticmethod
     def _span(list_node: Node) -> tuple[Node, Node] | None:
@@ -1578,6 +1916,8 @@ class SourceUnit:
     def _load(self, node: Node) -> ast.expr:
         name = self._identifier(node)
         assert self._scope is not None
+        if name == "super":
+            return self._super(node)
         qualified = self._qualify(name)
         if qualified != name and name not in self._scope.names:
             module = self._at(ast.Name(self._module, ast.Load()), node)
@@ -1588,6 +1928,17 @@ class SourceUnit:
                 raise self.error(node, msg)
             raise self.error(node, f"'{name}' is not defined")
         return self._at(ast.Name(name, ast.Load()), node)
+
+    def _super(self, node: Node) -> ast.expr:
+        """``super``: the object a method is called on, which it depends on (``[super]``)."""
+        assert self._scope is not None
+        if self._scope.receiver is None:
+            msg = "super is the object a method is called on; only a function in an object, without static, has one"
+            raise self.error(node, msg)
+        if "super" not in self._scope.dependencies:
+            raise self.error(node, f"{self._scope.function} reads super without depending on it; add it: [super]")
+        self._scope.called.add("super")
+        return self._at(ast.Name("super", ast.Load()), node)
 
     def _value(self, node: Node) -> ast.expr:
         """Lower a name used as a value; a function's name is the function itself, a dependency."""
@@ -1623,8 +1974,26 @@ class SourceUnit:
         """``a.b.f(x).c``: attribute access and calls, left to right."""
         value: ast.expr | None = None
         path: list[str] = []  # the dotted name so far, e.g. ["raylib"]
-        for part in _children(node):
-            if part.type == "simple_identifier":
+        assert self._scope is not None
+        parts = _children(node)
+        for index, part in enumerate(parts):
+            local = not path or path[0] in self._scope.names or path[0] in self._scope.guards or path[0] == "super"
+            kind = (
+                self._parts_type(parts[:index])
+                if part.type == "function_call" and value is not None and local
+                else None
+            )
+            called = _children(part)[0].child_by_field_name("function") if part.type == "function_call" else None
+            missing = isinstance(kind, StructType) and called is not None and kind.field(_text(called)) is None
+            if missing and self._method(kind, _text(called)) is None:  # neither a method nor a function field
+                raise self.error(called, f"{display_types(kind.name)} has no method {_text(called)}")
+            if kind is not None and called is not None and self._method(kind, _text(called)) is not None:
+                # A method, called on the value so far: `team.to_string()`, `users[0].label()`.
+                value = self._method_call(_children(part)[0], value, kind)
+                path = []
+            elif part.type == "get_expression":  # `users[0].name`: reading on from an item
+                value = self._expression(part)
+            elif part.type == "simple_identifier":
                 if value is None:
                     value = self._guarded(part) or self._load(part)
                 else:
@@ -1705,10 +2074,166 @@ class SourceUnit:
             pauses = pauses or self._pauses(target)
         dotted = ".".join([*(path or []), name])
         self._check_record_arguments(node, target if owner is not None else callee_name, dotted)
-        call = self._at(ast.Call(callee, *self._arguments(node, pointees)), node)
+        owning = self._call_expression(node).id in self._owning
+        result = self._call_result(dotted, name)
+        self._expect_arguments(
+            node, result if self._builds(dotted) else None, target if owner is not None else callee_name
+        )
+        keeping = owning and isinstance(result, StructType) and self._builds(dotted)
+        self._give_away(node, target if owner is not None else callee_name)
+        positional, named = self._arguments(node, pointees, keeping=keeping)
+        if isinstance(target, Function) and target.kind == "extern" and target.name in formats.PATTERNS:
+            positional = self._checked_format(node, formats.PATTERNS[target.name], positional)
+        call = self._at(ast.Call(callee, positional, named), node)
         if not pauses and node.id in self._scope.awaited:
             raise self.error(node, f"{dotted}(...) does not pause, so there is nothing to await")
-        return self._awaited(call, node, dotted) if pauses else call
+        value = self._awaited(call, node, dotted) if pauses else call
+        return value if owning or not owns(result) else self._temporary(value, result, node)
+
+    def _give_away(self, call: Node, callee: object) -> None:
+        """Mark the arguments a call takes ownership of (``mem.Unique[str]`` parameters): kept, not freed after."""
+        if isinstance(callee, str):
+            moved = self._owned_signatures.get(callee, (False, set()))[1]
+        elif isinstance(callee, Function):
+            moved = self.project.owned_signatures.get(callee.name, (False, set()))[1]
+        else:
+            return
+        arguments = [argument for argument in _children(call) if argument.type == "expression"]
+        for index in moved:
+            if index < len(arguments):
+                core = _unwrap(arguments[index])
+                self._owning.add(core.id)
+                if core.type == "await_expression" and core.child_by_field_name("value") is not None:
+                    self._owning.add(_unwrap(core.child_by_field_name("value")).id)
+
+    def _expect_arguments(self, call: Node, built: ScalarType | None, callee: object) -> None:
+        """Give the lists written as arguments (``Board(scores: #[])``) the types of what they fill."""
+        arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
+        if isinstance(built, StructType):
+            fields = dict(built.fields)
+            for index, argument in enumerate(arguments):
+                if argument.type == "named_argument":
+                    name = _text(argument.child_by_field_name("name"))
+                    value, kind = argument.child_by_field_name("value"), fields.get(name)
+                elif index < len(built.fields):
+                    name, (value, kind) = built.fields[index][0], (argument, built.fields[index][1])
+                else:
+                    continue
+                self._expect(value, kind)
+                shown = "a record's" if built.name == "record" else f"{built.name}'s"
+                self._check_string(value, kind, f"{shown} {name} is")
+            return
+        known = (isinstance(callee, str) and callee in self._function_nodes) or (
+            isinstance(callee, Function) and callee.kind != "extern"
+        )
+        if not known:
+            return
+        parameters = self._call_signature(callee)[1]
+        for argument, kind in zip(arguments, parameters, strict=False):
+            if argument.type == "expression":
+                self._expect(argument, scalar_type(kind))
+
+    def _method(self, kind: ScalarType | None, name: str) -> tuple[str, str] | None:
+        """Return the method ``name`` of an object of type ``kind`` (its Bifrost name and symbol), if it has one."""
+        cls = kind.python if isinstance(kind, StructType) else None
+        return self.project.methods.get(cls, {}).get(name) if cls is not None else None
+
+    def _method_result(self, kind: ScalarType, name: str) -> ScalarType | None:
+        """Return what calling the method ``name`` on a ``kind`` gives."""
+        found = self._method(kind, name)
+        if found is None:
+            return None
+        if found[0] in self._function_nodes:  # of this file
+            return self._returns(found[0])
+        compiled = getattr(kind.python, name, None)
+        return scalar_type(getattr(compiled.python, "__annotations__", {}).get("return")) if compiled else None
+
+    def _method_call(self, call: Node, owner: ast.expr, kind: ScalarType | None) -> ast.expr:
+        """``value.method(x)``: the object's method, given the value as ``super``: ``Team.to_string(team)``."""
+        assert self._scope is not None
+        name = _text(call.child_by_field_name("function"))
+        found = self._method(kind, name)
+        if found is None or kind is None:
+            what = display_types(kind.name) if kind is not None else "this value"
+            raise self.error(call, f"{what} has no method {name}")
+        qualified, symbol = found
+        assert isinstance(kind, StructType)
+        pointees = self.project.pointer_params.get(symbol, [])
+        self._give_away(call, qualified if qualified in self._function_nodes else getattr(kind.python, name, None))
+        positional, named = self._arguments(call, pointees)
+        callee = self._at(ast.Attribute(self._global(kind.python, "type"), name, ast.Load()), call)
+        value = self._at(ast.Call(callee, [owner, *positional], named), call)
+        pauses = qualified in self._pausing or symbol in self.project.pausing
+        if not pauses and call.id in self._scope.awaited:
+            raise self.error(call, f"{name}(...) does not pause, so there is nothing to await")
+        if pauses:
+            value = self._awaited(value, call, name)
+        result = self._method_result(kind, name)
+        owning = self._call_expression(call).id in self._owning
+        return value if owning or not owns(result) else self._temporary(value, result, call)
+
+    def _call_expression(self, call: Node) -> Node:
+        """Return the expression a ``user_function_call`` is: ``f(x)``'s ``function_call``, or ``a.f(x)``."""
+        expression = call.parent
+        assert expression is not None
+        outer = expression.parent
+        if outer is not None and outer.type == "child_annotation" and _children(outer)[-1] == expression:
+            return outer
+        return expression
+
+    def _call_result(self, dotted: str, name: str) -> ScalarType | None:
+        """Return the type a call of ``dotted`` returns, when known before it is compiled."""
+        assert self._scope is not None
+        local = self._scope.types.get(name) if "." not in dotted and name in self._scope.names else None
+        if isinstance(local, FnType):
+            return scalar_type(local.result) if local.result is not None else None
+        try:
+            return self._returns(dotted)
+        except BifrostError:
+            return None
+
+    def _builds(self, dotted: str) -> bool:
+        """Whether calling ``dotted`` constructs an object (its arguments become the object's fields)."""
+        names = self._qualify(dotted.split(".", maxsplit=1)[0]).split(".") + dotted.split(".")[1:]
+        target: object = self.globals.get(names[0])
+        for attribute in names[1:]:
+            target = getattr(target, attribute, None)
+        return isinstance(target, type) and hasattr(target, "__lang_struct__")
+
+    def _temporary(self, value: ast.expr, kind: ScalarType, node: Node) -> ast.Name:
+        """Hold a new owned value only lent (``total(make_list())``): freed after the statement."""
+        assert self._scope is not None
+        self._scope.temporaries += 1
+        name = f"__bifrost_temporary_{self._scope.temporaries}"
+        self._scope.before.append(self._at(ast.Assign([self._at(ast.Name(name, ast.Store()), node)], value), node))
+        self._scope.after.append(self._drop(self._at(ast.Name(name, ast.Load()), node), kind, node))
+        return self._at(ast.Name(name, ast.Load()), node)
+
+    def _owned_expression(self, node: Node) -> ast.expr:
+        """Lower an expression whose value is kept (bound, returned, or put in another): what it holds moves in."""
+        core = _unwrap(node)
+        self._owning.add(core.id)
+        if core.type == "await_expression":
+            awaited = core.child_by_field_name("value")
+            if awaited is not None:
+                self._owning.add(_unwrap(awaited).id)
+        return self._expression(node)
+
+    def _fresh(self, node: Node) -> bool:
+        """Whether an expression makes a new list, or a new record or object holding one (see ``ownership``)."""
+        whole = core = _unwrap(node)  # an `await f()` has the type of what it waits for
+        if core.type == "await_expression":
+            awaited = core.child_by_field_name("value")
+            core = _unwrap(awaited) if awaited is not None else core
+        if core.type == "literal":
+            inner = _children(core)[0]
+            return inner.type == "list" or (inner.type == "record" and owns(self._static_type(core)))
+        if core.type == "get_expression" and _children(core)[1].type in _SLICES:
+            return True
+        is_call = core.type == "function_call" or (
+            core.type == "child_annotation" and _children(core)[-1].type == "function_call"
+        )
+        return is_call and owns(self._static_type(whole))
 
     def _language_call(self, node: Node) -> ast.expr:
         """Lower a call of a function of the language itself: ``len(xs)``."""
@@ -1718,8 +2243,11 @@ class SourceUnit:
             raise self._unsupported(node, f"{builtin}()")
         if len(arguments) != 1:
             raise self.error(node, "len takes one list: len(xs)")
-        length = ast.Call(self._at(ast.Name("len", ast.Load()), node), [self._expression(arguments[0])], [])
-        return self._at(length, node)
+        kind = self._static_type(arguments[0])
+        if kind is not None and not is_list(kind):
+            raise self.error(arguments[0], f"len takes a list, not a {display_types(kind.name)}")
+        length = self._at(self._global(list_runtime.bifrost_list_length, "list"), node)
+        return self._at(ast.Call(length, [self._expression(arguments[0])], []), node)
 
     def _builtin_call(self, builtin: fmt.Builtin, node: Node) -> ast.expr:
         """Expand a call of a function built into the compiler: ``fmt.format``, ``json.encode``, ``tasks.*``."""
@@ -1729,7 +2257,10 @@ class SourceUnit:
             tasks.GATHER: self._gather,
             tasks.IGNORE: self._ignore,
         }
-        return expansions[builtin](node)
+        value = expansions[builtin](node)
+        if builtin in (fmt.FORMAT, json.ENCODE) and self._call_expression(node).id not in self._owning:
+            return self._temporary(value, OWNED_STRING, node)  # only lent: freed after the statement
+        return value
 
     def _extern_pointees(self, extern: Function) -> list[object | None]:
         """Return what a C function's parameters take: ``void *``, ``json``, a task callback, or plain values."""
@@ -1777,9 +2308,21 @@ class SourceUnit:
             return self._block(body)
         if returns:
             self._returned(body)
-        value = self._expression(body)
-        result = self._at(ast.Return(value) if returns else ast.Expr(value), body)
-        return [*self._scope.before, *self._retain_returned(body), result]
+            self._expect(body, self._scope.result)
+        value = self._kept(body) if returns else self._expression(body)
+        if not returns:
+            return [*self._scope.before, self._at(ast.Expr(value), body), *self._scope.after]
+        if self._scope.after:  # temporaries freed once the result is made
+            self._scope.temporaries += 1
+            result = self._at(ast.Name(f"__bifrost_result_{self._scope.temporaries}", ast.Store()), body)
+            stored = self._at(ast.Assign([result], value), body)
+            value = self._at(ast.Name(result.id, ast.Load()), body)
+            return [*self._scope.before, stored, *self._scope.after, *self._retain_returned(body), ast.Return(value)]
+        return [*self._scope.before, *self._retain_returned(body), self._at(ast.Return(value), body)]
+
+    def _kept(self, value: Node) -> ast.expr:
+        """Lower a value that is returned (or otherwise kept): a new list or record moves out whole."""
+        return self._owned_expression(value) if self._fresh(value) else self._expression(value)
 
     def _returned(self, value: Node) -> None:
         """Note what a function returns: the shape of its ``Record``, or checked against its written record type."""
@@ -1842,7 +2385,8 @@ class SourceUnit:
         scope, module = self._scope, self._module
         self._module = pending.module
         try:
-            self._lowered[name] = self._function(pending.name, pending.node, pending.symbol)
+            receiver = pending.owner if pending.method else None
+            self._lowered[name] = self._function(pending.name, pending.node, pending.symbol, receiver)
         finally:
             self._scope, self._module = scope, module
         return self._inferred[name]
@@ -1868,6 +2412,8 @@ class SourceUnit:
         assert self._scope is not None
         name = _text(function)
         dotted = ".".join([*path, name]) if path else None
+        if dotted is not None and path[0] not in self._scope.names:
+            self._not_a_method(function, dotted, "call it on one")
         if dotted in self._functions and path[0] not in self._scope.names:
             self._depend(dotted, function)  # an object's static function, e.g. Context.new
             return None
@@ -2052,7 +2598,12 @@ class SourceUnit:
                 raise self.error(call, msg)
             return self._at(ast.Constant(0), call)  # a statement: its value is never read
         record = self._record_type(tuple(fields))
-        return self._at(ast.Call(self._global(record, "record"), [], results), call)
+        value = self._at(ast.Call(self._global(record, "record"), [], results), call)
+        kind = scalar_type(record)
+        if owns(kind) and self._call_expression(call).id not in self._owning:
+            assert kind is not None
+            return self._temporary(value, kind, call)  # only lent: freed after the statement
+        return value
 
     def _task_function(
         self, value: Node, kind: str, result: ScalarType | None, parameters: list[object]
@@ -2067,7 +2618,7 @@ class SourceUnit:
         inner = _unwrap(value)
         function_call = _children(inner)[-1] if inner.type == "child_annotation" else inner
         self._scope.awaited.add(_children(function_call)[0].id)
-        lowered = self._expression(value)
+        lowered = self._owned_expression(value)  # its result is kept: stored for the caller
         assert isinstance(lowered, ast.Await)
         assert isinstance(lowered.value, ast.Call)
         target = lowered.value
@@ -2176,8 +2727,11 @@ class SourceUnit:
 
     # -- records and JSON ----------------------------------------------------------
 
-    def _record(self, node: Node) -> ast.expr:
-        """``#{id: 7, name: n}``: a value of an unnamed object type, its fields typed by their values."""
+    def _record(self, node: Node, *, owning: bool = False) -> ast.expr:
+        """``#{id: 7, name: n}``: a value of an unnamed object type, its fields typed by their values.
+
+        ``owning``: it is kept, so the lists it gets move in; otherwise it only lends them.
+        """
         assert self._scope is not None
         fields: list[tuple[str, object]] = []
         values: list[ast.keyword] = []
@@ -2191,7 +2745,8 @@ class SourceUnit:
                 msg = f"cannot tell the type of field '{name}'; name the value first: let {name}: i64 = ..."
                 raise self.error(value, msg)
             fields.append((name, kind.python if isinstance(kind, StructType) else kind))
-            values.append(self._at(ast.keyword(arg=name, value=self._expression(value)), field))
+            lowered = self._owned_expression(value) if owning and owns(kind) else self._expression(value)
+            values.append(self._at(ast.keyword(arg=name, value=lowered), field))
         if not fields:
             raise self.error(node, "a record needs a field: #{name: value}")
         record = self._record_type(tuple(fields))
@@ -2227,23 +2782,27 @@ class SourceUnit:
         """Encode a record or object passed to a C ``json`` parameter, and free it after the call."""
         assert self._scope is not None
         kind = self._static_type(argument)
-        if not isinstance(kind, StructType):
+        if not isinstance(kind, StructType) and not is_list(kind):
             return self._expression(argument)  # a str: JSON text already
         text = self._encode(argument)
         self._scope.after.append(self._free(text.id, argument))
         return text
 
-    def _encode(self, value: Node) -> ast.Name:
-        """Append statements that write ``value``'s JSON text; return the name holding the owned text."""
+    def _encode(self, value: Node, lowered: ast.expr | None = None, *, printing: bool = False) -> ast.Name:
+        """Append statements that write ``value``'s JSON text; return the name holding the owned text.
+
+        ``lowered``: the value, if already lowered (it is evaluated once). ``printing``:
+        for ``%v``, which writes an object as its ``to_string`` gives it.
+        """
         assert self._scope is not None
         kind = self._static_type(value)
-        if not isinstance(kind, StructType):
-            name = kind.name if kind is not None else "an unknown type"
-            raise self.error(value, f"json.encode takes a record or an object, not {name}")
+        if not isinstance(kind, StructType) and not is_list(kind):
+            name = display_types(kind.name) if kind is not None else "an unknown type"
+            raise self.error(value, f"json.encode takes a record, an object or a list, not {name}")
         self._scope.temporaries += 1
         number = self._scope.temporaries
-        writer = _JsonWriter(self, value, f"__bifrost_json_{number}")
-        writer.write(self._expression(value), kind)
+        writer = _JsonWriter(self, value, f"__bifrost_json_{number}", printing=printing)
+        writer.write(lowered if lowered is not None else self._expression(value), kind)
         writer.flush()
         text = self._at(ast.Name(f"__bifrost_json_text_{number}", ast.Store()), value)
         self.globals["__bifrost_stack"] = stack
@@ -2308,13 +2867,31 @@ class SourceUnit:
         return scalar_type(self._record_type(tuple(fields))) if fields else None
 
     def _list_type(self, literal: Node) -> ScalarType | None:
-        """``#[1, 2]`` is ``i64[]``; ``#[0...n]`` is a list of ``0``'s type."""
+        """``#[1, 2]`` is ``i64[]``, ``#[1, 2.5]`` an ``f64[]``, ``#[...xs, x]`` ``xs``'s type; ``#[0...n]`` counts.
+
+        A list written where its type is known (``let xs: f64[] = #[1, 2]``) has that type.
+        """
+        expected = self._expected.get(literal.id)
+        if expected is not None:
+            return expected
         span = self._span(literal)
-        first = span[0] if span is not None else next(iter(_children(literal)), None)
-        kind = self._static_type(first) if first is not None else None
-        if kind is None and span is not None:
-            kind = i64
-        return scalar_type(Array[kind]) if kind is not None and kind.kind in {"int", "uint", "float", "bool"} else None
+        if span is not None:
+            return list_of(self._static_type(span[0]) or i64)
+        kinds: list[ScalarType | None] = []
+        for item in _children(literal):
+            if item.type == "spread_action":
+                spread = self._static_type(_children(item)[-1])
+                kinds.append(spread.element if spread is not None and is_list(spread) else None)
+            elif item.type == "expression":
+                kinds.append(self._static_type(item))
+        known = [kind for kind in kinds if kind is not None]
+        if not known:
+            return None
+        if cstr in known and OWNED_STRING in known:
+            return list_of(OWNED_STRING)  # every string must be owned: checked item by item
+        if any(kind == f64 for kind in known) and all(kind.kind in {"int", "float"} for kind in known):
+            return list_of(f64)
+        return list_of(known[0])
 
     def _name_type(self, name: str) -> ScalarType | None:
         assert self._scope is not None
@@ -2324,29 +2901,46 @@ class SourceUnit:
         return self._scope.types.get(name)
 
     def _path_type(self, node: Node) -> ScalarType | None:
-        """``user.name``, ``s.hits``, ``http.param(ctx, "id")``, ``Context.new().width``."""
+        """``user.name``, ``s.hits``, ``http.param(ctx, "id")``, ``Context.new().width``, ``team.to_string()``."""
+        return self._parts_type(_children(node))
+
+    def _parts_type(self, parts: list[Node]) -> ScalarType | None:
+        """Return the type of a dotted chain's first ``parts``, when the compiler can tell."""
         assert self._scope is not None
-        parts = _children(node)
         kind: ScalarType | None = None
         path: list[str] = []
         for index, part in enumerate(parts):
-            if part.type == "simple_identifier":
-                if index == 0 and _text(part) in (self._scope.names | set(self._scope.guards)):
-                    kind = self._name_type(_text(part))
-                elif kind is not None:
-                    found = kind.field(_text(part)) if isinstance(kind, StructType) else None
-                    kind = found[1] if found else None
-                else:
-                    path.append(_text(part))
+            if part.type == "get_expression":  # `users[0].name`
+                kind = self._static_type(part)
+            elif part.type == "simple_identifier":
+                kind = self._name_part(kind, part, path, first=index == 0)
+                continue
             else:
                 function = _children(part)[0].child_by_field_name("function")
-                if function is None or kind is not None:
-                    return None  # a call on a value: methods do not exist yet
-                kind = self._returns(".".join([*path, _text(function)]))
-                path = []
-                if kind is None:
+                if function is None:
                     return None
+                if kind is not None:  # a method, called on a value
+                    kind = self._method_result(kind, _text(function))
+                else:
+                    kind = self._returns(".".join([*path, _text(function)]))
+                    path.clear()
+            if kind is None:
+                return None
         return kind
+
+    def _name_part(self, kind: ScalarType | None, part: Node, path: list[str], *, first: bool) -> ScalarType | None:
+        """Take one name of a dotted chain: a local (or ``super``) first, a field of a value, or part of a path."""
+        assert self._scope is not None
+        name = _text(part)
+        if first and name == "super" and self._scope.receiver is not None:
+            return scalar_type(self._scope.receiver)
+        if first and name in (self._scope.names | set(self._scope.guards)):
+            return self._name_type(name)
+        if kind is not None:
+            found = kind.field(name) if isinstance(kind, StructType) else None
+            return found[1] if found else None
+        path.append(name)  # a module or object, the path to a function
+        return None
 
     def _returns(self, dotted: str) -> ScalarType | None:
         """Return the result type of calling ``dotted``: a function of this file, an extern, or a constructor."""
@@ -2358,18 +2952,19 @@ class SourceUnit:
             if _text(parts[1]) == RECORD:
                 return scalar_type(self._record_result(qualified, parts[1]))
             found = self._container(parts[1])
+            if found is not None and found[0] is mem.UNIQUE:
+                return scalar_type(self._stored_type(parts[1]))  # an owned string
             return scalar_type(self._type(found[1] if found is not None else parts[1]))
         names = qualified.split(".")
         target: object = self.globals.get(names[0])
         for attribute in names[1:]:
             target = getattr(target, attribute, None)
         if target is fmt.FORMAT or target is json.ENCODE:
-            return cstr
-        if isinstance(target, type) and hasattr(target, "__lang_struct__"):
-            return scalar_type(target)  # constructing an object
+            return OWNED_STRING
         if isinstance(target, Function):
             return scalar_type(getattr(target.python, "__annotations__", {}).get("return"))
-        return None
+        # Constructing an object gives one.
+        return scalar_type(target) if isinstance(target, type) and hasattr(target, "__lang_struct__") else None
 
     def _binary_type(self, node: Node) -> ScalarType | None:
         operator = _text(node.child_by_field_name("operator"))
@@ -2396,6 +2991,7 @@ class SourceUnit:
         positional, named = self._arguments(call)
         if named or not positional:
             raise self.error(call, 'fmt.format takes a pattern and its values: fmt.format("%s: %d", name, count)')
+        positional = self._checked_format(call, 0, positional)
         self._scope.temporaries += 1
         number = self._scope.temporaries
         text, size = f"__bifrost_text_{number}", f"__bifrost_size_{number}"
@@ -2443,10 +3039,88 @@ class SourceUnit:
         ]
         return name(text)
 
+    def _checked_format(self, call: Node, index: int, positional: list[ast.expr]) -> list[ast.expr]:
+        """Check the values a printf pattern formats (see ``formats``); pass the numbers written as is as it reads them.
+
+        A pattern that is not a literal cannot be checked, but lists and records still cannot be printed.
+        """
+        arguments = [argument for argument in _children(call) if argument.type == "expression"]
+        if len(arguments) <= index:
+            return positional
+        pattern, values = _unwrap(arguments[index]), arguments[index + 1 :]
+        written = _children(pattern)[0] if pattern.type == "literal" else None
+        entries = [(" ".join(_text(v).split()), self._static_type(v), False) for v in values]
+        try:
+            if written is None or written.type != "string":
+                _unprintable(entries)
+                return positional
+            text = self._unescape(written)
+            wanted = formats.check(text, entries)
+        except formats.FormatError as error:
+            raise self.error(values[error.index] if error.index is not None else pattern, error.message) from None
+        checked = list(positional)
+        conversions = []
+        for position, read in enumerate(wanted):
+            if read.what == "value":  # `%v`: as its type calls for
+                at = index + 1 + position
+                conversion, checked[at] = self._printed(values[position], entries[position][1], checked[at])
+                conversions.append(conversion)
+        # Every integer read as 64 bits, and each %v as its value calls for.
+        checked[index] = self._at(ast.Constant(formats.fill(formats.widen(text), conversions)), pattern)
+        for position, read in enumerate(wanted):
+            at = index + 1 + position
+            kind = _read_as(read)
+            if kind is not None and at < len(checked):  # passed as the conversion reads it
+                checked[at] = self._at(ast.Call(self._global(kind, "type"), [checked[at]], []), values[position])
+        return checked
+
+    def _printed(self, value: Node, kind: ScalarType | None, lowered: ast.expr) -> tuple[str, ast.expr]:
+        """Return how ``%v`` prints ``value`` (its conversion, and what to pass): ``("lld", i64(x))``, ...
+
+        A list or record prints its JSON text, made here and freed after the statement.
+        """
+        assert self._scope is not None
+        text = " ".join(_text(value).split())
+        if kind is None:
+            raise self.error(value, f"cannot tell what {text} is, to print it with %v; name it first: let x: T = ...")
+        convert = {"int": ("lld", i64), "uint": ("llu", u64), "float": ("g", f64)}.get(kind.kind)
+        if convert is not None:
+            return convert[0], self._at(ast.Call(self._global(convert[1], "type"), [lowered], []), value)
+        if kind.kind == "bool":
+            return "s", self._at(ast.IfExp(lowered, ast.Constant("true"), ast.Constant("false")), value)
+        if kind.kind == "cstr":
+            return "s", lowered
+        if is_list(kind) or (isinstance(kind, StructType) and kind.name == "record"):
+            json_text = self._encode(value, lowered, printing=True)
+            self._scope.after.append(self._drop(copy.copy(json_text), OWNED_STRING, value))
+            return "s", json_text
+        if isinstance(kind, StructType):
+            return "s", self._object_text(value, kind, lowered)
+        return "p", lowered
+
+    def _object_text(self, value: Node, kind: StructType, lowered: ast.expr) -> ast.expr:
+        """Return the text ``%v`` prints for an object: what its ``to_string`` returns (freed after, if owned)."""
+        if self._method(kind, "to_string") is None:
+            msg = (
+                f"%v prints an object with its to_string, which {kind.name} does not have; add one: "
+                'let to_string = [super, fmt.format] () => mem.Unique[str] fmt.format("...", super.field)'
+            )
+            raise self.error(value, msg)
+        result = self._method_result(kind, "to_string")
+        if result not in (cstr, OWNED_STRING):
+            shown = display_types(result.name) if result is not None else "nothing"
+            raise self.error(value, f"{kind.name}'s to_string returns {shown}; it must return a string")
+        callee = self._at(ast.Attribute(self._global(kind.python, "type"), "to_string", ast.Load()), value)
+        text = self._at(ast.Call(callee, [lowered], []), value)
+        return self._temporary(text, result, value) if result == OWNED_STRING else text
+
     def _arguments(
-        self, call: Node, pointees: list[object | None] | None = None
+        self, call: Node, pointees: list[object | None] | None = None, *, keeping: bool = False
     ) -> tuple[list[ast.expr], list[ast.keyword]]:
-        """Lower a call's arguments: positional ones, then named ones (``width: 800``)."""
+        """Lower a call's arguments: positional ones, then named ones (``width: 800``).
+
+        ``keeping``: the call builds an object that is kept, so the lists its fields get move in.
+        """
         positional: list[ast.expr] = []
         named: list[ast.keyword] = []
         for argument in _children(call):
@@ -2467,6 +3141,9 @@ class SourceUnit:
                 if isinstance(pointee, _Cell):
                     positional.append(self._cell_argument(argument, pointee))
                     continue
+                if keeping and pointee is None and owns(self._static_type(argument)):
+                    positional.append(self._owned_expression(argument))
+                    continue
                 positional.append(
                     self._lend(argument, pointee, call, opaque=opaque)
                     if pointee is not None
@@ -2474,7 +3151,9 @@ class SourceUnit:
                 )
             elif argument.type == "named_argument":
                 name = self._identifier(argument.child_by_field_name("name"))
-                value = self._expression(argument.child_by_field_name("value"))
+                value_node = argument.child_by_field_name("value")
+                kept = keeping and owns(self._static_type(value_node))
+                value = self._owned_expression(value_node) if kept else self._expression(value_node)
                 named.append(self._at(ast.keyword(arg=name, value=value), argument))
         return positional, named
 
@@ -2541,8 +3220,7 @@ class SourceUnit:
         # Copy the local to the stack, pass its address, and copy it back after the call.
         self._scope.temporaries += 1
         slot = f"__bifrost_lend_{self._scope.temporaries}"
-        kind = f"__bifrost_type_{self._scope.temporaries}"
-        self.globals[kind] = pointee
+        kind = self._global(pointee, "type").id  # named by the type itself: globals are shared by every function
         self.globals["__bifrost_stack"] = stack
 
         def name_node(identifier: str, context: ast.expr_context) -> ast.Name:
@@ -2612,10 +3290,11 @@ class SourceUnit:
 class _JsonWriter:
     """The statements that append a value's JSON text to a buffer, for ``json.encode``."""
 
-    def __init__(self, unit: SourceUnit, node: Node, buffer: str) -> None:
+    def __init__(self, unit: SourceUnit, node: Node, buffer: str, *, printing: bool = False) -> None:
         self.unit = unit
         self.node = node
         self.buffer = buffer
+        self.printing = printing  # for %v: an object is written as its to_string gives it
         self.statements: list[ast.stmt] = []
         self.pending: list[str] = []  # constant text not yet appended, merged into one call
 
@@ -2640,6 +3319,9 @@ class _JsonWriter:
         if isinstance(kind, StructType):
             self.write_object(expression, kind)
             return
+        if is_list(kind):
+            self.write_list(expression, kind)
+            return
         self.flush()
         unit = self.unit
         if kind.kind == "cstr":
@@ -2653,8 +3335,51 @@ class _JsonWriter:
         else:
             raise unit.error(self.node, f"a {kind.name} has no JSON form")
 
+    def write_list(self, expression: ast.expr, kind: ScalarType) -> None:
+        """Append a list as a JSON array, item by item."""
+        unit = self.unit
+        assert unit._scope is not None
+        assert kind.element is not None
+        unit._scope.temporaries += 1
+        holder = f"__bifrost_json_list_{unit._scope.temporaries}"
+        index = f"{holder}_index"
+
+        def name(identifier: str, context: ast.expr_context | None = None) -> ast.Name:
+            return unit._at(ast.Name(identifier, context or ast.Load()), self.node)
+
+        self.statements.append(unit._at(ast.Assign([name(holder, ast.Store())], expression), self.node))
+        self.pending.append("[")
+        self.flush()
+        item = _JsonWriter(unit, self.node, self.buffer, printing=self.printing)
+        item.write(unit._at(ast.Subscript(name(holder), name(index), ast.Load()), self.node), kind.element)
+        item.flush()
+        separator = ast.If(
+            ast.Compare(name(index), [ast.Gt()], [ast.Constant(0)]),
+            [self.call("raw", ast.Constant(", "))],
+            [],
+        )
+        length = unit._global(list_runtime.bifrost_list_length, "list")
+        loop = ast.For(
+            name(index, ast.Store()),
+            ast.Call(name("range"), [ast.Call(length, [name(holder)], [])], []),
+            [unit._at(separator, self.node), *item.statements],
+            [],
+        )
+        self.statements.append(unit._at(loop, self.node))
+        self.pending.append("]")
+
     def write_object(self, expression: ast.expr, kind: StructType) -> None:
         unit = self.unit
+        if self.printing and kind.name != "record":  # %v: an object as its to_string gives it
+            self.flush()
+            assert unit._scope is not None
+            outer = unit._scope.before, unit._scope.after
+            unit._scope.before, unit._scope.after = [], []
+            text = unit._object_text(self.node, kind, expression)
+            made, freed = unit._scope.before, unit._scope.after
+            unit._scope.before, unit._scope.after = outer
+            self.statements += [*made, self.call("raw", text), *freed]  # each text freed once written
+            return
         assert unit._scope is not None
         unit._scope.temporaries += 1
         holder = f"__bifrost_json_value_{unit._scope.temporaries}"
@@ -2668,6 +3393,149 @@ class _JsonWriter:
         self.pending.append("}")
 
 
+class _ListWriter:
+    """The statements that make a list: fill a new one, or grow one in place (see ``list_runtime``)."""
+
+    def __init__(self, unit: SourceUnit, node: Node, kind: ScalarType) -> None:
+        assert unit._scope is not None
+        assert kind.element is not None
+        self.unit = unit
+        self.node = node
+        self.kind = kind
+        self.element = kind.element
+        self.scope = unit._scope
+        self.scope.temporaries += 1
+        self.prefix = f"__bifrost_list_{self.scope.temporaries}"
+        self.result = self.name(self.prefix)
+
+    def name(self, identifier: str, context: ast.expr_context | None = None) -> ast.Name:
+        return self.unit._at(ast.Name(identifier, context or ast.Load()), self.node)
+
+    def runtime(self, function: str, *arguments: ast.expr) -> ast.Call:
+        callee = self.unit._global(getattr(list_runtime, f"bifrost_list_{function}"), "list")
+        return self.unit._at(ast.Call(self.unit._at(callee, self.node), list(arguments), []), self.node)
+
+    def assign(self, identifier: str, value: ast.expr) -> None:
+        self.scope.before.append(self.unit._at(ast.Assign([self.name(identifier, ast.Store())], value), self.node))
+
+    def typed(self, pointer: ast.expr) -> ast.Call:
+        """``List[T](p)``: a pointer from the runtime, as this list."""
+        return self.unit._at(ast.Call(self.unit._global(self.kind, "type"), [pointer], []), self.node)
+
+    def size(self) -> ast.Constant:
+        return ast.Constant(self.element.size)
+
+    def range(self, start: Node, end: Node) -> None:
+        """``#[a...b]``: a, a + 1, ... b - 1."""
+        self.assign(f"{self.prefix}_start", self.unit._expression(start))
+        self.assign(
+            f"{self.prefix}_count", ast.BinOp(self.unit._expression(end), ast.Sub(), self.name(f"{self.prefix}_start"))
+        )
+        empty = ast.If(
+            ast.Compare(self.name(f"{self.prefix}_count"), [ast.Lt()], [ast.Constant(0)]),
+            [ast.Assign([self.name(f"{self.prefix}_count", ast.Store())], ast.Constant(0))],
+            [],
+        )
+        self.scope.before.append(self.unit._at(empty, self.node))
+        self.assign(self.prefix, self.typed(self.runtime("new", self.name(f"{self.prefix}_count"), self.size())))
+        index = self.name(f"{self.prefix}_index")
+        value = ast.BinOp(self.name(f"{self.prefix}_start"), ast.Add(), index)
+        store = ast.Assign([ast.Subscript(self.result, index, ast.Store())], value)
+        loop = ast.For(
+            self.name(f"{self.prefix}_index", ast.Store()),
+            ast.Call(self.name("range"), [self.name(f"{self.prefix}_count")], []),
+            [self.unit._at(store, self.node)],
+            [],
+        )
+        self.scope.before.append(self.unit._at(loop, self.node))
+
+    def fill(self, parts: list[tuple[str, ast.expr]]) -> None:
+        """Make a new list of ``parts``: items, and the items of spread lists (copied: those lists stay)."""
+        parts = self.hold(parts)
+        self.assign(f"{self.prefix}_count", self.count(parts))
+        self.assign(self.prefix, self.typed(self.runtime("new", self.name(f"{self.prefix}_count"), self.size())))
+        self.write(self.result, ast.Constant(0), parts)
+
+    def grow(self, owner: str, parts: list[tuple[str, ast.expr]]) -> None:
+        """``let owner = #[...owner, parts...]``: append to ``owner`` in place (it may move; amortized O(1))."""
+        parts = self.hold(parts)  # made first: they may read the old list
+        self.assign(f"{self.prefix}_more", self.count(parts))
+        grown = self.runtime("grow", self.name(owner), self.name(f"{self.prefix}_more"), self.size())
+        self.assign(owner, self.typed(grown))
+        start = ast.BinOp(self.runtime("length", self.name(owner)), ast.Sub(), self.name(f"{self.prefix}_more"))
+        self.assign(f"{self.prefix}_start", start)
+        self.write(self.name(owner), self.name(f"{self.prefix}_start"), parts)
+        self.result = self.name(owner)
+
+    def slice(self, source: ast.Name) -> None:
+        """Make a new list of ``source``'s items from ``<prefix>_start`` up to ``<prefix>_end`` (already bounded)."""
+        count = ast.BinOp(self.name(f"{self.prefix}_end"), ast.Sub(), self.name(f"{self.prefix}_start"))
+        self.assign(f"{self.prefix}_count", ast.Call(self.name("max"), [count, ast.Constant(0)], []))
+        self.assign(self.prefix, self.typed(self.runtime("new", self.name(f"{self.prefix}_count"), self.size())))
+        start = ast.BinOp(copy.copy(source), ast.Add(), self.name(f"{self.prefix}_start"))
+        self.assign(f"{self.prefix}_first", start)
+        self.write(
+            self.result,
+            ast.Constant(0),
+            [("spread", self.name(f"{self.prefix}_first"))],
+            self.name(f"{self.prefix}_count"),
+        )
+
+    def hold(self, parts: list[tuple[str, ast.expr]]) -> list[tuple[str, ast.expr]]:
+        """Compute each part once, in order, before the list is made."""
+        held = []
+        for index, (what, value) in enumerate(parts):
+            if isinstance(value, (ast.Constant, ast.Name)):
+                held.append((what, value))
+                continue
+            self.assign(f"{self.prefix}_part_{index}", value)
+            held.append((what, self.name(f"{self.prefix}_part_{index}")))
+        return held
+
+    def count(self, parts: list[tuple[str, ast.expr]]) -> ast.expr:
+        """How many items ``parts`` make: one per item, and each spread list's length."""
+        total: ast.expr = ast.Constant(sum(1 for what, _ in parts if what == "item"))
+        for what, value in parts:
+            if what == "spread":
+                total = ast.BinOp(total, ast.Add(), self.runtime("length", value))
+        return total
+
+    def write(
+        self, items: ast.expr, start: ast.expr, parts: list[tuple[str, ast.expr]], count: ast.expr | None = None
+    ) -> None:
+        """Store ``parts`` from position ``start`` on.
+
+        ``count``: how many items a spread part gives, when not its whole length (a slice).
+        """
+        position = f"{self.prefix}_at"
+        self.assign(position, start)
+        for what, value in parts:
+            if what == "item":
+                store = ast.Assign([ast.Subscript(copy.copy(items), self.name(position), ast.Store())], value)
+                self.scope.before.append(self.unit._at(store, self.node))
+                self.assign(position, ast.BinOp(self.name(position), ast.Add(), ast.Constant(1)))
+                continue
+            length = count if count is not None else self.runtime("length", value)
+            if owns(self.element):  # a deep copy of each item: the spread list keeps its own
+                clone = self.unit._global(self.unit.project.drops.clone(self.element), "clone")
+                index = self.name(f"{self.prefix}_copy")
+                read = ast.Subscript(copy.copy(value), index, ast.Load())
+                target = ast.Subscript(copy.copy(items), ast.BinOp(self.name(position), ast.Add(), index), ast.Store())
+                body = [self.unit._at(ast.Assign([target], ast.Call(clone, [read], [])), self.node)]
+                loop = ast.For(
+                    self.name(f"{self.prefix}_copy", ast.Store()), ast.Call(self.name("range"), [length], []), body, []
+                )
+                self.scope.before.append(self.unit._at(loop, self.node))
+            else:
+                at = ast.BinOp(copy.copy(items), ast.Add(), self.name(position))
+                copied = self.runtime("copy", at, value, copy.copy(length), self.size())
+                self.scope.before.append(self.unit._at(ast.Expr(copied), self.node))
+            self.assign(position, ast.BinOp(self.name(position), ast.Add(), copy.copy(length)))
+
+
+# The index of a slice: `xs[a...b]`, `xs[a...]`, `xs[...b]`.
+_SLICES = {"spread_between", "rest_of", "spread_action"}
+
 # How the compiler finds each expression node's type before compiling it (see ``SourceUnit._static_type``).
 _STATIC_TYPES: dict[str, Callable[[SourceUnit, Node], ScalarType | None]] = {
     "literal": lambda unit, node: unit._literal_type(_children(node)[0]),
@@ -2677,7 +3545,11 @@ _STATIC_TYPES: dict[str, Callable[[SourceUnit, Node], ScalarType | None]] = {
     "binary_expression": SourceUnit._binary_type,
     "unary_expression": SourceUnit._unary_type,
     "await_expression": SourceUnit._await_type,
-    "get_expression": lambda unit, node: getattr(unit._static_type(_children(node)[0]), "element", None),
+    "get_expression": lambda unit, node: (
+        unit._static_type(_children(node)[0])
+        if _children(node)[1].type in _SLICES
+        else getattr(unit._static_type(_children(node)[0]), "element", None)
+    ),
 }
 
 # How each expression node lowers (see ``SourceUnit._expression``).

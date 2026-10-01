@@ -1,0 +1,18 @@
+package:
+  name: simple
+  version: 0.1.0
+  description: The simple project
+  entry: src/simple/main.bif
+  # async lets main be async (`let main = [...] async () => ...`), run on the event loop.
+  type: sync
+
+flags:
+  optimization: 2
+  linker: clang
+
+# Static libraries (paths, relative to this file) and system ones (names, like m).
+libraries: []
+
+# C declarations Bifrost code can import. Generate them from headers with:
+#   bifrost config traverse -i path/to/header.h
+externs: []

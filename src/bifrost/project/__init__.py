@@ -34,6 +34,7 @@ from bifrost import std
 from bifrost.configs import Config
 from bifrost.configs.schema import Declaration, _Extern, _Function
 from bifrost.naming import to_snake_case
+from bifrost.owned import Drops
 
 # The C functions behind owned values: name -> (parameters, result).
 # `(Request, i32) => None` in an extern declaration: a function type (one level; no nesting).
@@ -121,6 +122,10 @@ class Project:
         self.pausing: set[str] = set()
         # Record fields ((name, type), ...) -> their record type, shared by every file.
         self.records: dict[tuple[tuple[str, object], ...], type] = {}
+        # An object's type -> its methods (functions without `static`) -> (Bifrost name, compiled symbol).
+        self.methods: dict[type, dict[str, tuple[str, str]]] = {}
+        # The functions freeing and copying lists, and the records and objects holding them.
+        self.drops = Drops(self.program)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
         self._runtime_externs: dict[str, Function[..., Any]] = {}
         self._init_declarations()

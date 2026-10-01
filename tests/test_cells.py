@@ -271,7 +271,7 @@ let make = [] () => mem.Shared[Counter] {
         ),
         (
             "let f = [make] () => null {\n    make()\n}",
-            "make(...) returns a mem.Shared or mem.Atomic, which nothing would free",
+            "make(...) returns a mem.Shared or mem.Atomic, which nothing would release",
         ),
         (
             "let f = [] () => null {\n    let x = 1\n    x = 2\n}",

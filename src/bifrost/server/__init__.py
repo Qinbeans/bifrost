@@ -37,6 +37,8 @@ _SYMBOL_KINDS = {
 
 _COMPLETION_KINDS = {
     "function": types.CompletionItemKind.Function,
+    "method": types.CompletionItemKind.Method,
+    "field": types.CompletionItemKind.Field,
     "struct": types.CompletionItemKind.Struct,
     "module": types.CompletionItemKind.Module,
     "constant": types.CompletionItemKind.Constant,

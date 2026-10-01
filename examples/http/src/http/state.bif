@@ -1,7 +1,9 @@
+let mem = import("std:mem")
+
 module state = {
     /* What the handlers share: a mem.Shared owned by main, which the server passes to them */
 
-    let AppState = struct { let hits: i64 }
+    let AppState = struct { let hits: i64, let notes: mem.Unique[str][] }
 }
 
 export(state)

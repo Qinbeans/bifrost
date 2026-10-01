@@ -1,14 +1,32 @@
 """Check owned values, and plan where they are freed.
 
-An owned value (``mem.Unique[str]``, e.g. from ``fmt.format``) has one owner: a
-``let`` or a parameter. It is freed where its owner's scope ends, on every path
-(and before each ``return``), unless ownership moves on first:
+An owned value has one owner, a ``let`` or a parameter, and is freed where
+its owner's scope ends, on every path (and before each ``return``), unless
+ownership moves on first. Owned values are:
+
+- strings from ``fmt.format`` and ``json.encode`` (``mem.Unique[str]``);
+- lists (``T[]``), and records and objects holding one (at any depth).
+
+Ownership moves:
 
 - ``let other = message`` moves it to ``other``;
 - ``return message`` moves it to the caller;
-- passing it to a ``mem.Unique[str]`` parameter moves it to the callee.
+- passing it to a ``mem.Unique[str]`` parameter moves it to the callee;
+- putting it in a new list, record or object that is kept (``let row =
+  #{scores: scores}``, ``#[...rows, row]``) moves it into that value.
 
-Passing it anywhere else (``stdio.puts(message)``) only lends it.
+Passing it anywhere else (``stdio.puts(message)``, ``total(xs)``) only lends
+it. A new list or record that is only lent (``http.json(ctx, 200, #{users:
+users})``) borrows what it holds, and is freed after the statement.
+
+Reading an owned value out of another (``rows[0]``, ``team.members``, the
+``row`` of ``forall row in rows``) gives a view of it: usable, but not an
+owner, so it cannot be kept (returned, or put in a list or record); keep a
+copy (``#[...team.members]``) instead. While a view is alive (to the end of
+its block), what it reads from is not moved or replaced.
+
+``let xs = #[...xs, x]`` gives ``xs`` a new value; the old one is freed
+first, or, when the new list starts with all of the old one, grown in place.
 
 A ``mem.Shared`` or ``mem.Atomic`` local (a cell) is an owner too, released
 where its scope ends, but ``let other = counter`` copies it: both are owners,
@@ -20,11 +38,12 @@ The rules that keep this sound, all checked here at compile time:
 - a moved value is not used again;
 - a value is moved on every path through a branch, or on none, and never
   inside a loop, so where it is freed does not depend on the path taken;
-- an owned result is always given an owner (bound, returned or moved), since
-  nothing else would free it.
+- a cell is always given an owner (bound, returned or
+  moved), since nothing else would free it.
 
 ``check`` returns the plan the lowering follows: which owners to free at the
-end of each block, and before each ``return``.
+end of each block, before each ``return``, and before each ``let`` that
+replaces one.
 """
 
 from collections.abc import Callable
@@ -46,11 +65,17 @@ class OwnershipError(Exception):
 class Oracle:
     """What the compiler knows about calls and types, which the check needs."""
 
-    owned_call: Callable[[Node], bool]  # does this call expression return an owned value?
+    owned_call: Callable[[Node], bool]  # does this call expression return an owned string or cell?
     moved_arguments: Callable[[Node], set[int]]  # which positional arguments of this call are moved?
     owned_type: Callable[[Node], bool]  # is this type node ``mem.Unique[str]``?
     cell_call: Callable[[Node], bool] = lambda _: False  # does this call return a mem.Shared or mem.Atomic?
     cell_type: Callable[[Node], bool] = lambda _: False  # is this type node a mem.Shared or mem.Atomic?
+    owned_value: Callable[[Node], bool] = lambda _: False  # a list, owned string, or record holding one?
+    copy: Callable[[Node], str] = lambda _: ""  # how to write a copy of this expression, if it can be copied
+    constructs: Callable[[Node], bool] = lambda _: False  # does this call build an object (its arguments move in)?
+    # Called at each `let` (and `forall`) before what follows is checked, so that
+    # the types of later expressions, which the checks above ask about, are known.
+    bind: Callable[[str, Node], None] = lambda _name, _node: None
 
 
 @dataclass
@@ -59,15 +84,19 @@ class Plan:
 
     at_end: dict[int, list[str]] = field(default_factory=dict)
     before_return: dict[int, list[str]] = field(default_factory=dict)
+    # A `let` (by node id) giving a new value to an owner whose old value is still alive:
+    # the lowering frees the old one (or grows it in place, for `let xs = #[...xs, x]`).
+    replaced: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
 class _State:
     alive: dict[str, tuple[Node, Node]]  # owner -> (where it became one, the block that frees it)
     moved: dict[str, Node]  # owner -> where it was moved
+    views: dict[str, tuple[str, Node, Node]] = field(default_factory=dict)  # view -> (its owner, where, block)
 
     def copy(self) -> "_State":
-        return _State(dict(self.alive), dict(self.moved))
+        return _State(dict(self.alive), dict(self.moved), dict(self.views))
 
 
 def _text(node: Node) -> str:
@@ -84,8 +113,28 @@ def _unwrap(node: Node) -> Node:
     return node
 
 
+def _awaited(node: Node) -> Node:
+    """``await f(x)`` -> ``f(x)``; other expressions are themselves."""
+    node = _unwrap(node)
+    if node.type == "await_expression":
+        value = node.child_by_field_name("value")
+        return _unwrap(value) if value is not None else node
+    return node
+
+
 def _line(node: Node) -> int:
     return node.start_point[0] + 1
+
+
+def _call_parts(node: Node) -> Node | None:
+    """For a call expression (``f(x)``, ``a.f(x)``), return the ``user_function_call`` with its arguments."""
+    call = node
+    if call.type == "child_annotation":
+        call = _named(call)[-1]
+    if call.type != "function_call":
+        return None
+    inner = _named(call)[0]
+    return inner if inner.type == "user_function_call" else None
 
 
 def _call_arguments(node: Node) -> list[Node] | None:
@@ -99,11 +148,37 @@ def _call_arguments(node: Node) -> list[Node] | None:
     return [argument for argument in _named(inner) if argument.type == "expression"]
 
 
+def _named_values(node: Node) -> list[Node]:
+    """For a call expression, the values of its named arguments (``width: 800``)."""
+    inner = _call_parts(node)
+    if inner is None:
+        return []
+    values = [argument.child_by_field_name("value") for argument in _named(inner) if argument.type == "named_argument"]
+    return [value for value in values if value is not None]
+
+
+def _root(node: Node) -> str | None:
+    """Return the local a read starts from: ``rows`` for ``rows[0].scores``; ``None`` for anything else."""
+    node = _unwrap(node)
+    if node.type == "identifier":
+        return _text(node)
+    if node.type == "get_expression":
+        return _root(_named(node)[0])
+    if node.type == "child_annotation":
+        parts = _named(node)
+        if all(part.type == "simple_identifier" for part in parts[1:]):
+            return _text(parts[0]) if parts[0].type == "simple_identifier" else _root(parts[0])
+    return None
+
+
 class _Checker:
-    def __init__(self, oracle: Oracle, cells: set[str]) -> None:
+    def __init__(self, oracle: Oracle, cells: set[str], parameters: set[str]) -> None:
         self.oracle = oracle
         self.plan = Plan()
         self.cells = set(cells)  # names holding a mem.Shared or mem.Atomic: parameters, then owners
+        self.parameters = parameters
+        self.guards: dict[str, str] = {}  # guard -> the local it locks
+        self.lent: set[str] = set()  # the mem.Weak parameters
 
     # -- statements -------------------------------------------------------------
 
@@ -118,6 +193,9 @@ class _Checker:
                 if owner_block == node:
                     self.plan.at_end.setdefault(node.id, []).append(name)
                     del current.alive[name]
+            for name, (_, _, view_block) in list(current.views.items()):
+                if view_block == node:
+                    del current.views[name]
         return current
 
     def item(self, item: Node, state: _State) -> _State | None:
@@ -128,20 +206,28 @@ class _Checker:
                 return self.return_(item, state)
             case "expression":
                 return self.statement(_unwrap(item), state)
-            case "lock" | "release" | "field_assignment" | "guard_assignment":
+            case "field_assignment":
+                self.field_assignment(item, state)
+            case "lock" | "release" | "guard_assignment":
                 for child in _named(item):
                     self.expression(child, state)
+                self.guard(item)
         return state
 
     def local_assignment(self, item: Node, state: _State) -> None:
         parts = _named(item)
         name, value = _text(parts[0]), _unwrap(parts[-1])
         declared = item.child_by_field_name("type")
+        self.oracle.bind(name, item)
+        block = item.parent
+        assert block is not None
+        if name in state.alive and name not in self.cells:
+            self.replace(name, value, item, state)
+            return
         if name in state.alive:
             where = _line(state.alive[name][0])
             raise OwnershipError(parts[0], f"{name} already owns a value (line {where}); give the new one another name")
-        block = item.parent
-        assert block is not None
+        state.views.pop(name, None)
         if value.type == "identifier" and _text(value) in self.cells:
             self.name(value, state)  # another owner of the same cell
             state.alive[name] = (item, block)
@@ -158,18 +244,100 @@ class _Checker:
             msg = f"only an owned value can start a {_text(declared)}: a call that returns one, like fmt.format(...)"
             raise OwnershipError(value, msg)
         elif declared is not None and self.oracle.cell_type(declared):
-            self.expression(value, state)  # the value moves into a new cell
+            # The value moves into a new cell.
+            if self.oracle.owned_value(value):
+                self.keep(value, state)
+            else:
+                self.expression(value, state)
             state.alive[name] = (item, block)
             self.cells.add(name)
         else:
-            self.expression(value, state)
+            self.value(name, value, item, state)
         state.moved.pop(name, None)
+
+    def value(self, name: str, value: Node, item: Node, state: _State) -> None:
+        """``let name = value`` for the rest: a new list or record it owns, a view, or a plain value."""
+        block = item.parent
+        assert block is not None
+        if self.fresh(value):
+            self.keep(value, state)
+            state.alive[name] = (item, block)
+        elif self.oracle.owned_value(value):
+            self.expression(value, state)  # a view of what it reads
+            self.view(name, value, item, block, state)
+        else:
+            self.expression(value, state)
+
+    def replace(self, name: str, value: Node, item: Node, state: _State) -> None:
+        """``let name = value`` where ``name`` owns a value already: the new one replaces it."""
+        self.unused(name, state, item, "replaced")
+        entry = state.alive[name]
+        if value.type == "identifier" and _text(value) in state.alive and _text(value) != name:
+            self.move(value, state, item)
+        elif self.fresh(value):
+            self.keep(value, state)
+        elif self.oracle.owned_call(value):
+            self.expression(value, state, owned=True)
+        else:
+            where = _line(entry[0])
+            msg = f"{name} already owns a value (line {where}); give the new one another name"
+            raise OwnershipError(_named(item)[0], msg)
+        if name in state.alive:
+            self.plan.replaced[item.id] = name  # its old value is freed (or grown) first
+        state.alive[name] = entry
+        state.moved.pop(name, None)
+
+    def owner(self, name: str | None, state: _State) -> str | None:
+        """Return what a name reads through: a guard's local, cell or lent value; ``None`` if nothing owns it here.
+
+        A cell's value is its cells', and a ``mem.Weak``'s its caller's: a guard on
+        one may replace a list in it (the old one is freed).
+        """
+        name = self.guards.get(name, name) if name is not None else None
+        if name is not None and (name in self.cells or name in self.lent or name in state.alive):
+            return name
+        return None
+
+    def guard(self, item: Node) -> None:
+        """Follow which local each guard locks, so that a field changed through it changes that local's."""
+        guard, source = item.child_by_field_name("guard"), item.child_by_field_name("source")
+        if item.type == "lock" and guard is not None and source is not None:
+            self.guards[_text(guard)] = _root(source) or ""
+        elif item.type == "release" and guard is not None:
+            self.guards.pop(_text(guard), None)
+
+    def view(self, name: str, value: Node, item: Node, block: Node, state: _State) -> None:
+        """Make ``name`` a view of what ``value`` reads, which is then not moved while the view is alive."""
+        root = _root(value)
+        while root is not None and root in state.views:
+            root = state.views[root][0]
+        root = self.guards.get(root, root) if root is not None else None
+        if root is not None and (root in state.alive or root in self.cells or root in self.lent):
+            state.views[name] = (root, item, block)
+
+    def field_assignment(self, item: Node, state: _State) -> None:
+        target, value = item.child_by_field_name("target"), item.child_by_field_name("value")
+        if target is None or value is None:
+            return
+        if self.oracle.owned_value(value):
+            root = self.owner(_root(target), state)
+            if root is None:
+                what = _root(target) or _text(target)
+                raise OwnershipError(target, f"{what} is not an owner here, so a list in it cannot be replaced")
+            self.unused(root, state, item, "changed")
+            self.keep(value, state)
+            self.name(target, state)
+        else:
+            self.expression(target, state)
+            self.expression(value, state)
 
     def return_(self, node: Node, state: _State) -> None:
         values = _named(node)
         value = _unwrap(values[0]) if values else None
         if value is not None and value.type == "identifier" and _text(value) in state.alive:
             self.move(value, state, node)
+        elif value is not None and self.oracle.owned_value(value):
+            self.keep(value, state)
         elif value is not None:
             self.expression(value, state, owned=self.oracle.owned_call(value))
         if state.alive:
@@ -203,17 +371,21 @@ class _Checker:
         return self.merge(paths, node)
 
     def forall(self, node: Node, state: _State) -> _State:
-        _, iterated, body = _named(node)
-        return self.loop(node, iterated, body, state)
+        identifier, iterated, body = _named(node)
+        self.oracle.bind(_text(identifier), node)
+        # The loop reads the list it goes through, which is not moved or replaced meanwhile.
+        inside = state.copy()
+        self.view(_text(identifier), iterated, node, body, inside)
+        return self.loop(node, iterated, body, state, inside)
 
     def while_(self, node: Node, state: _State) -> _State:
         condition, body = _named(node)
-        return self.loop(node, condition, body, state)
+        return self.loop(node, condition, body, state, state.copy())
 
-    def loop(self, node: Node, head: Node, body: Node, state: _State) -> _State:
+    def loop(self, node: Node, head: Node, body: Node, state: _State, inside: _State) -> _State:
         """Check a loop, whose body runs zero times or many: nothing alive before it may move inside it."""
         self.expression(head, state)
-        after = self.block(body, state.copy())
+        after = self.block(body, inside)
         if after is not None:
             for name in state.alive:
                 if name not in after.alive:
@@ -267,8 +439,97 @@ class _Checker:
 
     # -- expressions ------------------------------------------------------------
 
+    def fresh(self, node: Node) -> bool:
+        """Whether an expression makes a new list, or a new record or object holding one."""
+        core = _awaited(node)
+        if core.type == "literal":
+            inner = _named(core)[0]
+            return inner.type == "list" or (inner.type == "record" and self.oracle.owned_value(core))
+        if core.type == "get_expression" and _named(core)[1].type in {"spread_between", "rest_of", "spread_action"}:
+            return True  # a slice: a new list
+        # `await f()` has the type of what it waits for.
+        return _call_arguments(core) is not None and self.oracle.owned_value(_unwrap(node))
+
+    def keep(self, node: Node, state: _State) -> None:
+        """Check a list, record or object that is kept (bound, returned, or put in another): what it holds moves in."""
+        core = _awaited(node)
+        if core.type == "identifier" and _text(core) in state.alive:
+            self.move(core, state, core)
+            return
+        if core.type == "literal" and _named(core)[0].type in {"list", "record"}:
+            self.literal(_named(core)[0], state)
+            return
+        if core.type == "get_expression":  # a slice copies what it reads
+            self.expression(core, state)
+            return
+        arguments = _call_arguments(core)
+        if arguments is not None and self.oracle.constructs(core):
+            for argument in [*arguments, *_named_values(core)]:
+                self.part(argument, state)
+            return
+        if arguments is not None:
+            self.expression(node, state, owned=True)  # a call making a new one; its arguments are lent
+            return
+        raise OwnershipError(core, self.borrowed(core, state))
+
+    def literal(self, inner: Node, state: _State) -> None:
+        """Check a ``#[...]`` or ``#{...}`` that is kept: its items or fields move in."""
+        if inner.type == "record":
+            values = [record_field.child_by_field_name("value") for record_field in _named(inner)]
+            for value in values:
+                if value is not None:
+                    self.part(value, state)
+            return
+        for item in _named(inner):
+            if item.type == "expression":
+                self.part(item, state)
+            else:
+                for child in _named(item):  # `...xs` copies xs; `#[a...b]` counts
+                    self.expression(child, state)
+
+    def part(self, node: Node, state: _State) -> None:
+        """Check a value put in a list, record or object that is kept."""
+        inner = _unwrap(node)
+        if self.oracle.owned_value(inner):
+            self.keep(inner, state)
+            return
+        if inner.type == "identifier" and _text(inner) in self.cells:
+            msg = f"{_text(inner)} is a mem.Shared or mem.Atomic, which cannot be kept in a list, record or object yet"
+            raise OwnershipError(inner, msg)
+        self.expression(inner, state)
+
+    def borrowed(self, node: Node, state: _State) -> str:
+        """Explain why ``node``, a list or a record holding one, cannot be kept here, and what to do."""
+        text = " ".join(_text(node).split())
+        root = _root(node)
+        if root is not None and root in state.moved and root not in state.alive:
+            return f"{root} was moved on line {_line(state.moved[root])}, so it is no longer here"
+        if node.type == "identifier" and root in self.parameters:
+            source = f"{text} is a parameter, lent by the caller"
+        elif node.type == "identifier" and root in state.views:
+            source = f"{text} reads from {state.views[root][0]}"
+        elif root is not None and root != text:
+            source = f"{text} is part of {root}"
+        else:
+            source = f"{text} is not an owner"
+        copy = self.oracle.copy(node)
+        if copy:
+            return f"{source}, so it cannot be kept here; keep a copy: {copy}"
+        return f"{source}, so it cannot be kept here (a record or object holding a list cannot be copied yet)"
+
+    def unused(self, name: str, state: _State, where: Node, verb: str) -> None:
+        """Reject moving or replacing ``name`` while a view of it is alive."""
+        for view, (owner, since, _) in state.views.items():
+            if owner == name:
+                msg = (
+                    f"{name} is read by {view} (line {_line(since)}) until the end of its block, "
+                    f"so it cannot be {verb} here"
+                )
+                raise OwnershipError(where, msg)
+
     def move(self, value: Node, state: _State, where: Node) -> None:
         name = _text(value)
+        self.unused(name, state, where, "moved")
         del state.alive[name]
         state.moved[name] = where
 
@@ -285,23 +546,29 @@ class _Checker:
         elif node.type == "identifier":
             self.name(node, state)
         elif node.type == "child_annotation":
-            self.name(_named(node)[0], state)
-            for part in _named(node)[1:]:
-                if part.type == "function_call":
-                    for argument in _named(_named(part)[0]):
-                        self.expression(argument, state)
+            self.chain(node, state)
         else:
             for child in _named(node):
                 self.expression(child, state)
 
+    def chain(self, node: Node, state: _State) -> None:
+        """Check ``a.b.f(x)`` or ``users[0].name``: what it starts from, and the arguments of its calls."""
+        first = _named(node)[0]
+        if first.type == "get_expression":
+            self.expression(first, state)
+        else:
+            self.name(first, state)
+        for part in _named(node)[1:]:
+            if part.type == "function_call":
+                for argument in _named(_named(part)[0]):
+                    self.expression(argument, state)
+
     def call(self, node: Node, arguments: list[Node], state: _State, *, owned: bool) -> None:
         """Check a call: its owned result must have an owner, and its moved arguments move."""
-        if not owned and self.oracle.owned_call(node):
-            cell = self.oracle.cell_call(node)
-            what, name = ("a mem.Shared or mem.Atomic", "value") if cell else ("an owned string", "text")
+        if not owned and self.oracle.cell_call(node):
             msg = (
-                f"{_text(node).split('(')[0]}(...) returns {what}, which nothing would free; "
-                f"give it an owner first (`let {name} = ...`), then use that"
+                f"{_text(node).split('(')[0]}(...) returns a mem.Shared or mem.Atomic, which nothing would release; "
+                "give it an owner first (`let value = ...`), then use that"
             )
             raise OwnershipError(node, msg)
         moved = self.oracle.moved_arguments(node)
@@ -309,33 +576,50 @@ class _Checker:
             inner = _unwrap(argument)
             if index in moved and inner.type == "identifier" and _text(inner) in state.alive:
                 self.move(inner, state, argument)
+            elif index in moved and self.oracle.owned_value(inner) and not self.oracle.owned_call(inner):
+                raise OwnershipError(inner, self.borrowed(inner, state))  # given away, but not ours to give
             else:
                 self.expression(argument, state, owned=index in moved)
+        for value in _named_values(node):
+            self.expression(value, state)
         if node.type == "child_annotation":
             self.name(_named(node)[0], state)
 
     @staticmethod
     def name(node: Node, state: _State) -> None:
-        name = _text(node)
+        name = _root(node) or _text(node) if node.type == "child_annotation" else _text(node)
         if name in state.moved and name not in state.alive:
             raise OwnershipError(node, f"{name} was moved on line {_line(state.moved[name])}, so it is no longer here")
 
 
-def check(body: Node, owned_parameters: set[str], oracle: Oracle, cell_parameters: set[str] = frozenset()) -> Plan:
+def check(
+    body: Node,
+    owned_parameters: set[str],
+    oracle: Oracle,
+    cell_parameters: set[str] = frozenset(),
+    parameters: dict[str, bool] | None = None,
+) -> Plan:
     """Check the owned values in a function ``body``; return where the lowering frees them.
 
     ``cell_parameters`` are the ``mem.Shared`` and ``mem.Atomic`` parameters,
-    which ``let`` copies rather than moves.
+    which ``let`` copies rather than moves; ``parameters`` are all of them
+    (lent by the caller, for messages), each with whether it is a ``mem.Weak``.
 
     Raises:
         OwnershipError: At the first rule broken.
 
     """
-    checker = _Checker(oracle, cell_parameters)
+    parameters = parameters or {}
+    checker = _Checker(oracle, cell_parameters, set(parameters))
+    checker.lent = {name for name, weak in parameters.items() if weak}
     if body.type != "block_expression":
         if owned_parameters:
             raise OwnershipError(body, "a function taking a mem.Unique[str] needs a block body, to free it")
-        checker.expression(body, _State({}, {}), owned=oracle.owned_call(_unwrap(body)))
+        state = _State({}, {})
+        if oracle.owned_value(_unwrap(body)):
+            checker.keep(body, state)
+        else:
+            checker.expression(body, state, owned=oracle.owned_call(_unwrap(body)))
         return checker.plan
     state = _State(dict.fromkeys(sorted(owned_parameters), (body, body)), {})
     checker.block(body, state)

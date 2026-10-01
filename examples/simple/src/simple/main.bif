@@ -1,0 +1,25 @@
+let stdio = import("std:stdio")
+let mem = import("std:mem")
+let fmt = import("std:fmt")
+
+let Member = struct {
+    let name: str,
+    let to_string = [super, fmt.format] () => mem.Unique[str] {
+        return fmt.format("Member(name=%s)", super.name)
+    }
+}
+
+let Team = struct {
+    let name: str,
+    let members: Member[],
+    let to_string = [super, fmt.format] () => mem.Unique[str] {
+        return fmt.format("Team(name=%s, members=%v)", super.name, super.members)
+    }
+}
+
+let main = [stdio.printf] () => null {
+    let member1 = Member("Alice")
+    let member2 = Member("Bob")
+    let team = Team("Developers", #[member1, member2])
+    stdio.printf("%v\n", team)
+}

@@ -41,6 +41,7 @@ let main = [helper.greet, helper.shout, stdio.puts, fmt.format] () => null {
         stdio.puts(line)
         let i = i + 1
     }
+    stdio.puts(fmt.format("lent, then freed: %d", i))
     if i > 2 {
         let done = fmt.format("done after %d, %.1f%%", i, 99.5)
         stdio.puts(done)
@@ -102,11 +103,12 @@ def test_formats_and_frees_every_string(tmp_path: Path) -> None:
         "line 1 of 3",
         "line 2 of 3",
         "line 3 of 3",
+        "lent, then freed: 3",
         "done after 3, 99.5%",
     ]
     allocations, frees = map(int, result.stderr.split())
-    # Six strings, each freed once; libc allocates one more buffer for stdout, which it keeps.
-    assert (allocations, frees) == (7, 6)
+    # Seven strings, each freed once; libc allocates one more buffer for stdout, which it keeps.
+    assert (allocations, frees) == (8, 7)
 
 
 HEAD = (
@@ -134,16 +136,8 @@ HEAD = (
             "t is moved inside a loop",
         ),
         (
-            'let f = [fmt.format, stdio.puts] () => null {\n    stdio.puts(fmt.format("x"))\n}\n',
-            "fmt.format(...) returns an owned string, which nothing would free",
-        ),
-        (
             'let f = () => null {\n    let t: mem.Unique[str] = "x"\n}\n',
             "only an owned value can start a mem.Unique[str]",
-        ),
-        (
-            'let f = [fmt.format] () => null {\n    let t = fmt.format("a")\n    let t = fmt.format("b")\n}\n',
-            "t already owns a value (line 6)",
         ),
         ('let f = () => null {\n    let t = fmt.format("a")\n}\n', "add it to the dependency list: [fmt.format]"),
     ],
@@ -162,6 +156,10 @@ def test_ownership_errors(tmp_path: Path, source: str, message: str) -> None:
         'let f = [fmt.format, take] () => null {\n    take(fmt.format("x %d", 1))\n}\n',
         'let f = [fmt.format, take] (x: i32) => null {\n    let t = fmt.format("x")\n    if x > 0 {\n'
         "        take(t)\n    } else {\n        take(t)\n    }\n}\n",
+        # Only lent, it is freed after the statement.
+        'let f = [fmt.format, stdio.puts] () => null {\n    stdio.puts(fmt.format("x"))\n}\n',
+        # A new value replaces the old, which is freed.
+        'let f = [fmt.format] () => null {\n    let t = fmt.format("a")\n    let t = fmt.format("b")\n}\n',
     ],
 )
 def test_valid_moves(tmp_path: Path, source: str) -> None:

@@ -24,6 +24,7 @@ from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.configs.schema import Declaration, _Extern
 from bifrost.lowering import RECORD, BifrostError, display_types, lower_file
 from bifrost.naming import extern_name, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
+from bifrost.owned import is_list
 from bifrost.project import Project
 from bifrost.std import fmt, json, mem, tasks
 from bifrost.syntax import syntax_errors
@@ -503,9 +504,24 @@ class Document:
         return f"let {name}: {kind}{rest}"
 
     def type_of(self, name: str, node: Node) -> str | None:
-        """Return the type of local ``name`` where ``node`` is, when known: ``Context``, ``Guard[Context]``."""
+        """Return the type of local ``name`` where ``node`` is, when known: ``Context``, ``Guard[Context]``.
+
+        In a method, ``super`` is the object it is called on.
+        """
+        if name == "super":
+            return self._receiver(node)
         local = self._local(name, node)
         return self._type_of_binding(local) if local is not None else None
+
+    def _receiver(self, node: Node) -> str | None:
+        """Return the object a method is a member of, for ``super`` in it: ``Team``."""
+        function = self._enclosing_function(node)
+        member = function.parent if function is not None else None
+        if member is None or member.type != "struct_field" or member.child_by_field_name("modifier") is not None:
+            return None
+        owner = member.parent.parent if member.parent is not None else None  # struct_assignment, then its `let`
+        name = _name_of(owner) if owner is not None and owner.type == "assignment" else None
+        return _text(name) if name is not None else None
 
     def _type_of_binding(self, local: Node) -> str | None:
         parts = _named(local)
@@ -556,7 +572,7 @@ class Document:
         if identifier is None or symbol is None:
             return None
         kind = self._compiled[1].get(symbol, {}).get(_text(identifier))
-        if kind is None or kind.kind == "ptr":
+        if kind is None or (kind.kind == "ptr" and not is_list(kind)):
             return None
         return _type_name(kind)
 
@@ -604,12 +620,32 @@ class Document:
             function = call.child_by_field_name("function")
             return self._type_of_call([], _text(function)) if function is not None else None
         if value.type == "child_annotation":
-            parts = _named(value)
-            last = parts[-1]
-            if last.type != "function_call" or not all(p.type == "simple_identifier" for p in parts[:-1]):
-                return None
-            function = _named(last)[0].child_by_field_name("function")
-            return self._type_of_call([_text(p) for p in parts[:-1]], _text(function)) if function else None
+            return self._type_of_chain_call(value, where)
+        return None
+
+    def _type_of_chain_call(self, value: Node, where: Node) -> str | None:
+        """Return what ``a.b.f(x)`` gives: a module's or object's function, or a method of a local."""
+        parts = _named(value)
+        last = parts[-1]
+        if last.type != "function_call" or not all(p.type == "simple_identifier" for p in parts[:-1]):
+            return None
+        function = _named(last)[0].child_by_field_name("function")
+        if function is None:
+            return None
+        owner = [_text(p) for p in parts[:-1]]
+        method = self._method_node(owner, _text(function), where)
+        return self._result_of(method) if method is not None else self._type_of_call(owner, _text(function))
+
+    def _method_node(self, owner: list[str], name: str, where: Node) -> Node | None:
+        """For ``value.name(...)`` on a local (or ``super``), return the method's definition."""
+        if len(owner) != 1 or (owner[0] != "super" and self._local(owner[0], where) is None):
+            return None
+        found = self._struct_of(owner[0], where)
+        if found is None:
+            return None
+        for member in _named(found[1]):
+            if member.type == "struct_field" and _declares(member, name):
+                return next((p for p in _named(member) if p.type == "local_function_definition"), None)
         return None
 
     def _type_of_name(self, name: str, where: Node) -> str | None:
@@ -665,6 +701,20 @@ class Document:
         shown = self._record_text(self._returned_entries(function))
         return self._record_returned(function) or shown or written
 
+    def _list_text(self, value: Node, where: Node) -> str | None:
+        """Write a list literal's type from its first item as written: ``#[1, 2]`` is ``i64[]``."""
+        items = [item for item in _named(value) if item.type in {"expression", "spread_action", "spread_between"}]
+        if not items:
+            return None
+        first = items[0]
+        if first.type == "spread_between":  # `#[0...n]`: numbers from the first
+            return f"{self._written_type(_named(first)[0], where) or 'i64'}[]"
+        if first.type == "spread_action":  # `#[...xs, x]`: what xs is
+            return self._written_type(_named(first)[-1], where)
+        kinds = [self._written_type(item, where) for item in items if item.type == "expression"]
+        element = "f64" if "f64" in kinds and set(kinds) <= {"i64", "f64"} else kinds[0]
+        return f"{element}[]" if element else None
+
     def _record_text(self, entries: list[tuple[str, Node]] | None) -> str | None:
         """Write a record's type from its fields as written: ``#{name: str, ms: i64}``.
 
@@ -708,10 +758,10 @@ class Document:
         return sorted((_shortened(hint) for hint in hints), key=lambda hint: hint.position)
 
     def _argument_hints(self, call: Node) -> list[InlayHint]:
-        """Name the parameter each positional argument fills, as clangd does: ``http.text(ctx, status: 200)``.
+        """Name the parameter (or field) each positional argument fills, as clangd does: ``Member(name: "ada")``.
 
         Not for an argument that already says it (``ctx`` for ``ctx``, ``s.hits``
-        for ``hits``), a named one, or one of a C function's variadic arguments.
+        for ``hits``), a named one, or one of a variadic function's extra arguments.
         """
         called = self._called(call)
         names = self._parameter_names(*called, call) if called is not None else None
@@ -745,6 +795,9 @@ class Document:
         """
         if len(owner) != 1:
             return self._own_callee(name, where) if not owner else None
+        method = self._method_node(owner, name, where)
+        if method is not None:  # `team.greet(...)`: a method of the object a local holds
+            return self, method
         binding = self.bindings().get(owner[0])
         if binding is not None and binding[1].type == "struct_assignment":
             member = next((m for m in _named(binding[1]) if m.type == "struct_field" and _declares(m, name)), None)
@@ -767,15 +820,21 @@ class Document:
         return (self, binding[1]) if binding is not None else None
 
     def _parameter_names(self, owner: list[str], name: str, where: Node) -> list[str] | None:
-        """Return the parameter names of the function ``owner.name`` calls, when it has them.
+        """Return the names of the parameters ``owner.name(...)`` takes, in order, when they have names.
 
-        A Bifrost function, a lambda a local holds, an object's static function,
-        or a C function (its declaration's names, in snake_case). A function value
-        of a function type (``(i32) => null``) has no names.
+        A Bifrost function, a lambda a local holds, an object's static function or
+        method, an object's constructor (its stored fields), a C function (its
+        declaration's names, in snake_case) or a builtin (``fmt.format``). A function
+        value of a function type (``(i32) => null``) has no names.
         """
+        if len(owner) == 1 and self._module_of(owner[0]) in _BUILTIN_FUNCTIONS:
+            builtin = _BUILTIN_FUNCTIONS[self._module_of(owner[0]) or ""].get(name)
+            return _signature_names(builtin.signature) if builtin is not None else None
         callee = self._callee(owner, name, where)
         if isinstance(callee, Declaration):
-            return [to_snake_case(parameter) for parameter in callee.parameters] if callee.type == "function" else None
+            if callee.type != "function":
+                return None
+            return [to_snake_case(parameter) for parameter in callee.parameters]
         return _parameter_names(callee[1]) if callee is not None else None
 
     def _argument_target(self, node: Node) -> "tuple[str, Location | None, str] | None":
@@ -994,8 +1053,10 @@ class Document:
             return access or None
         name = _text(node)
         local = self._local(name, node)
-        if local is not None:
-            return _code(self._describe_local(local))
+        receiver = self._receiver(node) if name == "super" else None
+        if local is not None or receiver is not None:
+            described = self._describe_local(local) if local is not None else f"super: {receiver}"
+            return _code(described if local is not None else f"{described}\n// the {receiver} this method is called on")
         binding = self.bindings().get(name)
         if binding is None:
             return None
@@ -1155,12 +1216,13 @@ class Document:
         if value.type == "literal":
             value = _named(value)[0]
         match value.type:
-            case "string" | "boolean":
-                return {"string": "str", "boolean": "bool"}[value.type]
-            case "number":
-                return "f64" if _named(value)[0].type == "float" else "i64"
+            case "string" | "boolean" | "number":
+                number = value.type == "number" and _named(value)[0].type == "float"
+                return "f64" if number else {"string": "str", "boolean": "bool", "number": "i64"}[value.type]
             case "record" | "await_expression":
                 return self._record_text(self._entries(value, where))
+            case "list":
+                return self._list_text(value, where)
             case "binary_expression" | "unary_expression":
                 return self._operation_type(value, where)
             case "child_annotation" if all(part.type == "simple_identifier" for part in _named(value)):
@@ -1413,13 +1475,17 @@ class Document:
         return std.load(name).description
 
     def _fields(self, struct: Node) -> list[Completion]:
-        """Offer an object's stored fields after ``value.``."""
+        """Offer an object's stored fields and methods (not its static functions) after ``value.``."""
         found = []
         for member in struct.named_children:
             identifier = _name_of(member) if member.type == "struct_field" else None
-            if identifier is None or any(part.type == "local_function_definition" for part in _named(member)):
+            if identifier is None or member.child_by_field_name("modifier") is not None:
                 continue
-            found.append(Completion(_text(identifier), "field", self._member_signature(member)))
+            function = next((part for part in _named(member) if part.type == "local_function_definition"), None)
+            kind = "method" if function is not None else "field"
+            found.append(
+                Completion(_text(identifier), kind, self._member_signature(member), documentation=_doc(function))
+            )
         return found
 
     def _record_completions(self, owner: str, where: Node) -> list[Completion]:
@@ -1654,13 +1720,40 @@ def _written_entries(value: Node) -> list[tuple[str, Node]] | None:
 
 
 def _parameter_names(function: Node) -> list[str] | None:
-    """Return the names in a function's (or lambda's) parameter list; ``None`` for anything else."""
-    if function.type not in {"function_definition", "local_function_definition"}:
+    """Return the names of the parameters a function, lambda or object constructor takes.
+
+    A constructor takes its object's stored fields, in order; ``None`` for anything else.
+    """
+    if function.type == "struct_assignment":
+        members = [m for m in _named(function) if m.type == "struct_field" and _named(m)[-1].type == "type_or_object"]
+    elif function.type in {"function_definition", "local_function_definition"}:
+        found = next((part for part in _named(function) if part.type == "parameter_list"), None)
+        if found is None:
+            return None
+        members = _named(found)
+    else:
         return None
-    parameters = next((part for part in _named(function) if part.type == "parameter_list"), None)
-    if parameters is None:
-        return None
-    return [_text(identifier) for p in _named(parameters) if (identifier := _name_of(p)) is not None]
+    return [_text(identifier) for member in members if (identifier := _name_of(member)) is not None]
+
+
+def _signature_names(signature: str) -> list[str]:
+    """Return the names of the parameters in a builtin's signature, before any ``...``.
+
+    ``(pattern: str, ...) => mem.Unique[str]`` gives ``["pattern"]``.
+    """
+    inside, depth = "", 0
+    for character in signature:
+        depth += {"(": 1, ")": -1}.get(character, 0)
+        if depth == 0:
+            break
+        inside += character
+    names = []
+    for part in inside[1:].split(","):
+        name, colon, _ = part.strip().partition(":")
+        if not colon or not name.isidentifier():
+            break
+        names.append(name)
+    return names
 
 
 def _declares(member: Node, name: str) -> bool:
@@ -1724,6 +1817,8 @@ def _type_name(kind: Any) -> str:  # noqa: ANN401 - a compiler type
         return display_types(kind.name)
     if kind.kind == "struct" and kind.name == "record":
         return "#{" + ", ".join(f"{name}: {_type_name(field)}" for name, field in kind.fields) + "}"
+    if is_list(kind):
+        return f"{_type_name(kind.element)}[]"
     return {"cstr": "str"}.get(kind.name, kind.name)
 
 

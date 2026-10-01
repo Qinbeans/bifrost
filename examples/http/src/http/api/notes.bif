@@ -1,0 +1,27 @@
+let http = import("http")
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+let state = import("http.state:state")
+
+module api = {
+    let add = [
+        http.json,
+        http.body,
+        fmt.format
+    ] (ctx: http.Context, app: mem.Shared[state.AppState]) => null {
+        /* POST /notes: keep the request's body (a copy: the request's own text is gone after it) */
+        let s <- app
+        s.notes = #[...s.notes, fmt.format("%s", http.body(ctx))]
+        http.json(ctx, 201, #{count: len(s.notes)})
+        s -> app
+    }
+
+    let list = [http.json] (ctx: http.Context, app: mem.Shared[state.AppState]) => null {
+        /* GET /notes: every note so far */
+        let s <- app
+        http.json(ctx, 200, #{notes: s.notes})
+        s -> app
+    }
+}
+
+export(api)

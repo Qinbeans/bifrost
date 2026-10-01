@@ -361,6 +361,28 @@ def test_arguments_show_the_parameters_they_fill(tmp_path: Path) -> None:
     ]
 
 
+def test_constructor_and_builtin_arguments_show_what_they_fill(tmp_path: Path) -> None:
+    source = (
+        'let fmt = import("std:fmt")\n'
+        "let Member = struct { let name: str, let age: i64, let size = [] () => i64 1 }\n"
+        "let main = [fmt.format] () => null {\n"
+        '    let ada = Member("ada", 36)\n'
+        '    let text = fmt.format("%s", ada.name)\n'
+        "}\n"
+    )
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    hints = [hint for hint in Document.open(tmp_path / "main.bif", source).inlay_hints() if hint.parameter]
+    lines = source.splitlines()
+    # A constructor fills the stored fields in order (not methods); fmt.format's values are variadic.
+    assert [(lines[h.position[0]][h.position[1] :][:4], h.label) for h in hints] == [
+        ('"ada', "name:"),
+        ("36)", "age:"),
+        ('"%s"', "pattern:"),
+    ]
+
+
 NAMED = """\
 let time = import("std:time")
 let tasks = import("std:tasks")
@@ -543,3 +565,103 @@ def test_completions_carry_documentation() -> None:
     line = len(DOCUMENTED.splitlines()) + 1
     documented = {c.label: c.documentation for c in document.completions((line, 4)) if c.documentation}
     assert documented == {"Point": "A point on the screen,\nin pixels", "shift": "Move `p` right by `by` pixels"}
+
+
+def test_lists_show_their_types(tmp_path: Path) -> None:
+    source = (
+        'let json = import("std:json")\n'
+        "let f = [json.encode] (n: i64) => null {\n"
+        "    let rows: #{name: str, ids: i64[]}[] = #[]\n"
+        '    let rows = #[...rows, #{name: "a", ids: #[1, 2]}]\n'
+        "    let grid = #[#[1.5], #[2.5]]\n"
+        '    let text = json.encode(#{rows: rows, tags: #["x"]})\n'
+        "}\n"
+    )
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    document = Document.open(tmp_path / "main.bif", source)
+    assert [d.message for d in document.diagnostics() if d.severity == Severity.ERROR] == []
+    lines = source.splitlines()
+    hints = {
+        (lines[h.position[0]][: h.position[1]].split()[-1].lstrip("#{(["), h.label)
+        for h in document.inlay_hints()
+        if not h.parameter
+    }
+    assert ("rows", ": #{name: str, ids: i64[]}[]") in hints  # the second `let rows`
+    assert ("ids", ": i64[]") in hints
+    assert ("grid", ": f64[][]") in hints
+    assert ("tags", ": str[]") in hints
+
+
+METHODS = """\
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+
+let Team = struct {
+    let name: str,
+    let count: i64,
+    let size = [super] () => i64 super.count,
+    let to_string = [super, fmt.format] () => mem.Unique[str] fmt.format("%s of %d", super.name, super.size()),
+    let greet = [] (who: str) => str who
+}
+
+let main = [] () => null {
+    let team = Team(name: "core", count: 2)
+    let hello = team.greet("ada")
+}
+"""
+
+
+def test_methods_in_the_editor(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    document = Document.open(tmp_path / "main.bif", METHODS)
+    assert [d.message for d in document.diagnostics() if d.severity == Severity.ERROR] == []
+    assert document.hover(_position(METHODS, "super.name")) == (
+        "```bifrost\nsuper: Team\n// the Team this method is called on\n```"
+    )
+    assert document.hover(_position(METHODS, "size())")) == "```bifrost\nlet size = () => i64\n// a member of Team\n```"
+    hints = [(hint.label, hint.parameter) for hint in document.inlay_hints()]
+    assert ("who:", True) in hints  # team.greet(who: "ada")
+    assert (": str", False) in hints  # let hello: str
+    typing = METHODS.replace('    let hello = team.greet("ada")', "    team.")
+    line = typing.splitlines().index("    team.")
+    completions = Document.open(tmp_path / "main.bif", typing).completions((line, 9))
+    assert [(c.label, c.kind) for c in completions] == [
+        ("name", "field"),
+        ("count", "field"),
+        ("size", "method"),
+        ("to_string", "method"),
+        ("greet", "method"),
+    ]
+
+
+def test_an_edited_object_in_a_list_is_seen_again(tmp_path: Path) -> None:
+    # List types are shared between analyses; an edit to what they hold must not be missed.
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    method = '    let to_string = [super, fmt.format] () => mem.Unique[str] fmt.format("%s", super.name),\n'
+    source = """\
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+let stdio = import("std:stdio")
+
+let Member = struct {
+METHOD    let name: str
+}
+
+let main = [stdio.printf] () => null {
+    let members = #[Member(name: "ada")]
+    stdio.printf("%v\\n", members)
+}
+"""
+
+    def errors(text: str) -> list[str]:
+        document = Document.open(tmp_path / "main.bif", text)
+        return [d.message for d in document.diagnostics() if d.severity == Severity.ERROR]
+
+    assert len(errors(source.replace("METHOD", ""))) == 1
+    assert errors(source.replace("METHOD", method)) == []

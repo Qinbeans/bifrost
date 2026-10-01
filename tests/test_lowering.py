@@ -96,8 +96,8 @@ def test_structs(tmp_path: Path) -> None:
         ("let a = 1\nlet a = 2\n", "'a' is already defined", 2),
         ('let m = import("nope")\n', "unknown module 'nope'", 1),
         (
-            "let f = () => i32 {\n  let x = #[1, ...y]\n  return 0\n}\n",
-            "spreading into a list is not supported yet",
+            "let f = () => i32 {\n  let x = #[1, ...3]\n  return 0\n}\n",
+            "only a list can be spread into a list, not 3",
             2,
         ),
     ],
@@ -237,11 +237,11 @@ def test_objects_have_static_functions_and_named_construction(tmp_path: Path) ->
         ),
         (
             OBJECT.replace("static let new = []", "static let new = [super]"),
-            "static function Point.new has no instance, so it cannot depend on super",
+            "Point.new is not called on an object, so it has no super to depend on",
         ),
         (
             OBJECT.replace("static let new", "let new"),
-            "a method (a function without `static`) is not supported yet",
+            "Point.new is a method, called on a Point (value.new(...)); it needs no entry in a dependency list",
         ),
         (OBJECT.replace("let y: i32", "static let y: i32"), "static data is not supported"),
         (OBJECT.replace("let y: i32", "let x: i32"), "Point already has a member named 'x'"),

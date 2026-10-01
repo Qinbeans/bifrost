@@ -39,7 +39,7 @@ def test_fields_of_an_object_from_another_file() -> None:
     document = Document.open(path, source)
     row = source.splitlines().index("        s.hits = s.hits + 1")
     assert document.hover((row, 10)) == "```bifrost\nlet hits: i64\n// a member of state.AppState (state.bif)\n```"
-    assert [c.label for c in document.completions((row, 10))] == ["hits"]
+    assert [c.label for c in document.completions((row, 10))] == ["hits", "notes"]
     location = document.definition((row, 10))
     assert location is not None
     assert location.path.name == "state.bif"

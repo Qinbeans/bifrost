@@ -1,0 +1,14 @@
+let http = import("http")
+
+module api = {
+    let users = [http.json, http.query_int] (ctx: http.Context) => null {
+        /* The first ?count= users (3 by default), as a JSON array */
+        let found: #{id: i64, name: str, admin: bool}[] = #[]
+        forall id in #[1...http.query_int(ctx, "count", 3) + 1] {
+            let found = #[...found, #{id: id, name: "user", admin: id == 1}]
+        }
+        http.json(ctx, 200, #{count: len(found), users: found})
+    }
+}
+
+export(api)

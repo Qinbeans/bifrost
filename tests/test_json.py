@@ -76,7 +76,7 @@ def test_records_encode_as_json(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("body", "message"),
     [
-        ("    let t = json.encode(3)\n", "json.encode takes a record or an object, not i64"),
+        ("    let t = json.encode(3)\n", "json.encode takes a record, an object or a list, not i64"),
         ("    let r = #{a: 1, a: 2}\n", "the record already has a field 'a'"),
         ("    let r = #{a: nothing()}\n", "cannot tell the type of field 'a'"),
         ("    let t = json.encode(1, 2)\n", "json.encode takes one value"),
