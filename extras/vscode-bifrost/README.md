@@ -11,7 +11,7 @@ Syntax highlighting for [Bifrost](https://github.com/Qinbeans/bifrost) (`.bif`) 
 
 ## Language server
 
-Diagnostics (including naming: snake_case variables and functions, PascalCase objects), formatting, outline, go-to-definition, hover and completion come from the Bifrost language server (`bifrost lsp`). The extension runs the `bifrost` executable from a `.venv` in a workspace folder (or one of its subfolders), else `bifrost` on `PATH`; set `bifrost.server.path` to use another. **Bifrost: Restart Language Server** restarts it.
+Diagnostics (including naming: snake_case variables and functions, PascalCase objects), formatting, outline, go-to-definition, hover and completion come from the Bifrost language server (`bfc lsp`). The extension runs the `bfc` executable from a `.venv` in a workspace folder (or one of its subfolders), else `bfc` on `PATH`; set `bifrost.server.path` to use another. **Bifrost: Restart Language Server** restarts it.
 
 ## Development
 

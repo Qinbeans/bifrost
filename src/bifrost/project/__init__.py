@@ -124,6 +124,8 @@ class Project:
         self.records: dict[tuple[tuple[str, object], ...], type] = {}
         # An object's type -> its methods (functions without `static`) -> (Bifrost name, compiled symbol).
         self.methods: dict[type, dict[str, tuple[str, str]]] = {}
+        # Compiled symbols of the methods that change their object (they lock `super`): it is lent to them.
+        self.changing: set[str] = set()
         # The functions freeing and copying lists, and the records and objects holding them.
         self.drops = Drops(self.program)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.

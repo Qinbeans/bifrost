@@ -1,4 +1,4 @@
-// Starts the Bifrost language server (`bifrost lsp`) for .bif files.
+// Starts the Bifrost language server (`bfc lsp`) for .bif files.
 const fs = require("fs");
 const path = require("path");
 const vscode = require("vscode");
@@ -6,18 +6,18 @@ const { LanguageClient } = require("vscode-languageclient/node");
 
 let client;
 
-/** The `bifrost` executable of a project virtualenv under `folder`, if any. */
+/** The `bfc` executable of a project virtualenv under `folder`, if any. */
 function venvExecutable(folder) {
   const candidates = [
-    path.join(folder, ".venv", "bin", "bifrost"),
-    path.join(folder, ".venv", "Scripts", "bifrost.exe"),
+    path.join(folder, ".venv", "bin", "bfc"),
+    path.join(folder, ".venv", "Scripts", "bfc.exe"),
   ];
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
 /**
  * The configured `bifrost.server.path`; else a `.venv` in a workspace folder
- * or one of its immediate subfolders; else `bifrost` on PATH.
+ * or one of its immediate subfolders; else `bfc` on PATH.
  */
 function serverExecutable() {
   const configured = vscode.workspace.getConfiguration("bifrost").get("server.path");
@@ -45,7 +45,7 @@ function serverExecutable() {
       }
     }
   }
-  return "bifrost";
+  return "bfc";
 }
 
 async function activate(context) {
@@ -69,7 +69,7 @@ async function activate(context) {
   } catch (error) {
     vscode.window.showErrorMessage(
       `Could not start the Bifrost language server (${command} lsp): ${error.message}. ` +
-        "Set bifrost.server.path to your bifrost executable.",
+        "Set bifrost.server.path to your bfc executable.",
     );
   }
 }

@@ -2,7 +2,7 @@
   "name": "vscode-bifrost",
   "displayName": "vscode-bifrost",
   "description": "Bifrost syntax highlighting and language server",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "qinbeans",
   "repository": {
     "type": "git",
@@ -49,7 +49,7 @@
         "bifrost.server.path": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `bifrost` executable that runs the language server. Empty: use `.venv/bin/bifrost` in a workspace folder (or one of its subfolders), then `bifrost` on `PATH`."
+          "markdownDescription": "Path to the `bfc` executable that runs the language server. Empty: use `.venv/bin/bfc` in a workspace folder (or one of its subfolders), then `bfc` on `PATH`."
         }
       }
     },

@@ -76,15 +76,37 @@ def _line(node: Node) -> int:
     return node.start_point[0] + 1
 
 
+def _target(node: Node) -> tuple[Node, list[Node]]:
+    """Split an assignment target into its root name and the indexes it reads on the way.
+
+    ``g.items[i].name`` gives ``g`` and ``[i]``; ``g[0]`` gives ``g`` and ``[0]``.
+    """
+    node = _unwrap(node)
+    if node.type == "get_expression":
+        owner, index = _named(node)
+        root, indexes = _target(owner)
+        return root, [*indexes, index]
+    if node.type == "child_annotation":
+        return _target(_named(node)[0])
+    return node, []
+
+
 def _release_hint(lock: _Lock) -> str:
     return f"`{lock.guard} -> {lock.source}`"
 
 
 class _Checker:
-    def __init__(self, held: dict[str, str], pauses: Callable[[Node], bool], values: set[str]) -> None:
+    def __init__(
+        self,
+        held: dict[str, str],
+        pauses: Callable[[Node], bool],
+        values: set[str],
+        lends: Callable[[str, str], bool],
+    ) -> None:
         self.held = held  # name -> its container, e.g. "mem.Weak"
         self.pauses = pauses  # whether a call can pause
         self.values = values  # held names whose value is not an object: a guard on one is read as a value
+        self.lends = lends  # whether calling a method (name, method) lends the held name: it changes its object
 
     # -- statements ---------------------------------------------------------------
 
@@ -180,11 +202,20 @@ class _Checker:
 
     def field_assignment(self, node: Node, state: _State) -> None:
         target = node.child_by_field_name("target")
-        root = _named(target)[0]
+        root, indexes = _target(target)
         name = _text(root)
         if name not in state.held:
             self.not_held(root, name, state)
-            raise GuardError(root, f"fields change only through a guard: lock {name} first (`let guard <- {name}`)")
+            locker = state.locker_of(name)
+            if locker is not None:
+                raise GuardError(
+                    root,
+                    f"{name} is locked by {locker.guard} (line {_line(locker.node)}); change it through {locker.guard}",
+                )
+            what = "items" if target.type == "get_expression" else "fields"
+            raise GuardError(root, f"{what} change only through a guard: lock {name} first (`let guard <- {name}`)")
+        for index in indexes:
+            self.uses(index, state)
         self.uses(node.child_by_field_name("value"), state)
 
     def guard_assignment(self, node: Node, state: _State) -> None:
@@ -301,14 +332,11 @@ class _Checker:
             case "identifier":
                 self.name(node, state, field_access=False, lent=self.is_argument(node))
                 return
+            case "get_expression":
+                self.index_read(node, state)
+                return
             case "child_annotation":
-                parts = _named(node)
-                self.name(parts[0], state, field_access=len(parts) > 1, lent=False)
-                for part in parts[1:]:
-                    if part.type == "function_call":
-                        self.arguments(part, state)
-                if parts[-1].type == "function_call":
-                    self.pause(node, state)
+                self.chain(node, state)
                 return
             case "function_call":
                 self.arguments(node, state)
@@ -316,6 +344,39 @@ class _Checker:
                 return
         for child in _named(node):
             self.uses(child, state)
+
+    def index_read(self, node: Node, state: _State) -> None:
+        """Check ``g[i]``, which reaches into what ``g`` holds, as ``g.x`` does."""
+        owner, index = _named(node)
+        inner = _unwrap(owner)
+        if inner.type == "identifier":
+            self.name(inner, state, field_access=True, lent=False)
+        else:
+            self.uses(inner, state)
+        self.uses(index, state)
+
+    def chain(self, node: Node, state: _State) -> None:
+        """Check ``a.b.f(x)``: what it starts from, and its calls' arguments."""
+        first, *rest = _named(node)
+        if first.type == "get_expression":
+            self.uses(first, state)
+        elif self.lent_to(node):
+            self.name(first, state, field_access=False, lent=True)  # `ctx.bump()` lends ctx
+        else:
+            self.name(first, state, field_access=bool(rest), lent=False)
+        for part in rest:
+            if part.type == "function_call":
+                self.arguments(part, state)
+        if rest and rest[-1].type == "function_call":
+            self.pause(node, state)
+
+    def lent_to(self, node: Node) -> bool:
+        """Whether ``node`` calls a method that changes its object on a held name (``ctx.bump()``), lending it."""
+        first, *rest = _named(node)
+        if len(rest) != 1 or rest[0].type != "function_call":
+            return False
+        called = _named(rest[0])[0].child_by_field_name("function")
+        return called is not None and self.lends(_text(first), _text(called))
 
     def pause(self, call: Node, state: _State) -> None:
         """Reject a call that can pause while a guard is held."""
@@ -349,7 +410,10 @@ class _Checker:
         name = _text(node)
         if name in state.held:
             if not (field_access or lent or state.held[name].source in self.values):
-                msg = f"{name} is a guard: use it to reach fields ({name}.x) or lend it to a call, not as a value"
+                msg = (
+                    f"{name} is a guard: use it to reach fields ({name}.x) or items ({name}[i]), "
+                    "or lend it to a call, not as a value"
+                )
                 raise GuardError(node, msg)
             return
         locker = state.locker_of(name)
@@ -388,17 +452,19 @@ def check(
     held: dict[str, str],
     pauses: Callable[[Node], bool] = lambda _: False,
     values: frozenset[str] = frozenset(),
+    lends: Callable[[str, str], bool] = lambda _name, _method: False,
 ) -> None:
     """Check the guards in a function ``body``; ``held`` maps its ``mem`` parameters and locals to their container.
 
     ``pauses`` tells whether a call (a ``function_call`` or ``child_annotation``) can pause;
-    ``values`` names the held values that are not objects, whose guards read and write them whole.
+    ``values`` names the held values that are not objects, whose guards read and write them whole;
+    ``lends`` tells whether calling a method on a held name lends it (the method changes its object).
 
     Raises:
         GuardError: At the first rule broken.
 
     """
-    checker = _Checker(held, pauses, set(values))
+    checker = _Checker(held, pauses, set(values), lends)
     state = _State({}, {})
     if body.type == "block_expression":
         checker.block(body, state)

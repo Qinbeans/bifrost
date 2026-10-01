@@ -33,7 +33,7 @@ def init(
         print(f"[bold red]✘ ERROR[/bold red]: {error}", file=sys.stderr)
         raise typer.Exit(1) from None
     print(f"[bold green]✔ SUCCESS[/bold green]: created {project}")
-    print(f"  cd {name}\n  bifrost build\n  ./build/{name}")
+    print(f"  cd {name}\n  bfc build\n  ./build/{name}")
 
 
 @cli.command()
@@ -49,7 +49,7 @@ def build(
     try:
         config = ConfigBuilder(config_path).build()
     except FileNotFoundError:
-        msg = f"no {config_path}; create a project with `bifrost init <name>`"
+        msg = f"no {config_path}; create a project with `bfc init <name>`"
         print(f"[bold red]✘ ERROR[/bold red]: {msg}", file=sys.stderr)
         raise typer.Exit(1) from None
     project_folder = config_path.parent
@@ -124,7 +124,7 @@ def version(
             versioning.write(config, new)
     except FileNotFoundError:
         print(
-            f"[bold red]✘ ERROR[/bold red]: no {config}; create a project with `bifrost init <name>`", file=sys.stderr
+            f"[bold red]✘ ERROR[/bold red]: no {config}; create a project with `bfc init <name>`", file=sys.stderr
         )
         raise typer.Exit(1) from None
     except versioning.VersionError as error:

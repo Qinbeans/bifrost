@@ -176,6 +176,17 @@ class BifrostError(SyntaxError):
         return f"{location}: {self.msg}\n    {self.text}\n    {caret}"
 
 
+def _copy_tree(node: ast.expr) -> ast.expr:
+    """Copy a lowered expression, node by node, to use it twice (values it holds are shared, not copied)."""
+    copied = copy.copy(node)
+    for field, value in ast.iter_fields(node):
+        if isinstance(value, ast.expr):
+            setattr(copied, field, _copy_tree(value))
+        elif isinstance(value, list):
+            setattr(copied, field, [_copy_tree(item) if isinstance(item, ast.expr) else item for item in value])
+    return copied
+
+
 def _children(node: Node) -> list[Node]:
     """Named children, without comments (an extra that can appear anywhere)."""
     return [child for child in node.named_children if child.type != "comment"]
@@ -343,6 +354,7 @@ class _FunctionScope:
         self.is_async = False  # written `async`: an `async def`, which may `await` calls that pause
         self.awaited: set[int] = set()  # ids of the call nodes written `await f(x)`
         self.names = set(parameters)
+        self.parameters = set(parameters)
         self.temporaries = 0
         self.receiver: type | None = None  # a method's object type: it reads the object it is called on as `super`
         # Dependency ("raylib.InitWindow", or the function's own name for
@@ -526,9 +538,14 @@ class SourceUnit:
             case "struct_assignment":
                 scope[name], members = self._struct(name, value)
                 methods = self.project.methods.setdefault(scope[name], {})
-                for member, _, method in members:
+                for member, definition, method in members:
                     if method:
                         methods[member] = (f"{qualified}.{member}", f"{symbol}_{member}")
+                    if method and any(
+                        _text(_unwrap(lock.child_by_field_name("source"))) == "super"
+                        for lock in self._descendants(definition, "lock")
+                    ):  # it changes its object, which is then lent to it
+                        self.project.changing.add(f"{symbol}_{member}")
                 return [
                     _PendingFunction(
                         f"{qualified}.{member}", f"{symbol}_{member}", definition, scope[name], module, method
@@ -959,13 +976,14 @@ class SourceUnit:
     ) -> Callable[..., Any]:
         """Lower a function; ``name`` is how Bifrost calls it, ``symbol`` its compiled name.
 
-        ``receiver``: for a method, its object's type; the object it is called on is its first parameter, ``super``.
+        ``receiver``: for a method, its object's type; the object it is called on is its first parameter, ``super``:
+        a copy, or, for a method that changes it (locks it), the object itself, lent like a ``mem.Weak``.
         """
         parts = _children(node)
         dependency_list = parts[0] if parts[0].type in {"dependency_list", "local_dependency_list"} else None
         parameter_list, return_node, body = parts[1:] if dependency_list else parts
-        annotations: dict[str, object] = {"super": receiver} if receiver is not None else {}
-        arguments = [self._at(ast.arg("super"), node)] if receiver is not None else []
+        changing = receiver is not None and symbol in self.project.changing
+        annotations, arguments = self._receiver_parameter(receiver, node, changing=changing)
         for parameter in _children(parameter_list):
             identifier, type_node = _children(parameter)
             parameter_name = self._identifier(identifier)
@@ -976,7 +994,7 @@ class SourceUnit:
         self._check_returns(name, return_node, body, annotations["return"])
         if inferring:
             self._inferring.add(name)
-        held = self._held(parameter_list, return_node, body)
+        held = self._held(parameter_list, return_node, body, receiver if changing else None)
         self._check_guards(body, held)
         owned_parameters = {
             self._identifier(_children(parameter)[0])
@@ -1040,6 +1058,14 @@ class SourceUnit:
         )
         return self._compile(definition, annotations)
 
+    def _receiver_parameter(
+        self, receiver: type | None, node: Node, *, changing: bool
+    ) -> tuple[dict[str, object], list[ast.arg]]:
+        """Return a method's first parameter, ``super``: its object, or a pointer to it when it changes it."""
+        if receiver is None:
+            return {}, []
+        return {"super": Ptr[receiver] if changing else receiver}, [self._at(ast.arg("super"), node)]
+
     def _check_local_names(self, body: Node) -> None:
         """Reject a ``let`` named like a module of this file: calls through the module would stop working."""
         for let in self._descendants(body, "local_assignment"):
@@ -1053,22 +1079,31 @@ class SourceUnit:
         kinds = {name: repr(container) for name, (container, _) in held.items()}
         values = frozenset(name for name, (_, kind) in held.items() if not isinstance(scalar_type(kind), StructType))
         try:
-            guards.check(body, kinds, pauses=lambda call: self._pauses(self._callee(call)), values=values)
+            guards.check(
+                body,
+                kinds,
+                pauses=lambda call: self._pauses(self._callee(call)),
+                values=values,
+                lends=lambda name, method: name in held and self._changes(scalar_type(held[name][1]), method),
+            )
         except guards.GuardError as error:
             raise self.error(error.node, error.message) from None
 
-    def _held(self, parameter_list: Node, return_node: Node, body: Node) -> dict[str, tuple[mem.Container, object]]:
+    def _held(
+        self, parameter_list: Node, return_node: Node, body: Node, lent: type | None = None
+    ) -> dict[str, tuple[mem.Container, object]]:
         """Check where each ``mem`` container may appear; return each held name's container and type.
 
         ``mem.Weak`` is for parameters (lent to the call), ``mem.Unique`` for
-        locals (the owner); neither may be returned.
+        locals (the owner); neither may be returned. ``lent``: the object a method
+        that changes it is lent, held as its ``super``.
         """
         if self._is(mem.WEAK, return_node):
             msg = "a function cannot return a mem.Weak: it cannot outlive the call that lends it"
             raise self.error(return_node, msg)
         if self._is(mem.UNIQUE, return_node) and not self._owned_type(return_node):
             raise self._unsupported(return_node, "returning ownership of anything but a str (a mem.Unique result)")
-        held: dict[str, tuple[mem.Container, object]] = {}
+        held: dict[str, tuple[mem.Container, object]] = {"super": (mem.WEAK, lent)} if lent is not None else {}
         for parameter in _children(parameter_list):
             identifier, type_node = _children(parameter)
             found = self._container(type_node)
@@ -1154,6 +1189,7 @@ class SourceUnit:
             owned_value=lambda node: owns(kind(node)),
             copy=lambda node: self._copy_hint(node, kind(node)),
             constructs=self._constructs,
+            changes=self._changing_call,
             bind=self._bind_local,
         )
 
@@ -1347,6 +1383,8 @@ class SourceUnit:
                 guard = self._identifier(item.child_by_field_name("guard"))
                 source = _text(_unwrap(item.child_by_field_name("source")))
                 self._scope.guards[guard] = source
+                if source == "super":
+                    self._super(_unwrap(item.child_by_field_name("source")))  # checks [super], and uses it
                 self._check_guard_type(item)
                 if source in self._scope.cells:
                     statements.append(self._lock(source, item, f"{source} is already locked by another guard"))
@@ -1456,12 +1494,14 @@ class SourceUnit:
         assert self._scope is not None
         target_node, value_node = item.child_by_field_name("target"), item.child_by_field_name("value")
         target = self._field_target(target_node)
-        kind = self._static_type(value_node)
+        stored = self._static_type(target_node)
+        kind = stored if owns(stored) else self._static_type(value_node)  # an owned part takes only owned values
+        self._check_string(value_node, stored, f"{' '.join(_text(target_node).split())} is")
         if not owns(kind):
             return [self._at(ast.Assign([target], self._expression(value_node)), item)]
         assert kind is not None
         self._expect(value_node, kind)
-        old = self._field_target(target_node)
+        old = _copy_tree(target)
         old.ctx = ast.Load()
         self._scope.temporaries += 1
         new = f"__bifrost_new_{self._scope.temporaries}"
@@ -1989,7 +2029,7 @@ class SourceUnit:
                 raise self.error(called, f"{display_types(kind.name)} has no method {_text(called)}")
             if kind is not None and called is not None and self._method(kind, _text(called)) is not None:
                 # A method, called on the value so far: `team.to_string()`, `users[0].label()`.
-                value = self._method_call(_children(part)[0], value, kind)
+                value = self._method_call(_children(part)[0], value, kind, parts[:index])
                 path = []
             elif part.type == "get_expression":  # `users[0].name`: reading on from an item
                 value = self._expression(part)
@@ -2037,14 +2077,53 @@ class SourceUnit:
         return self._at(ast.Name(source, context or ast.Load()), part)
 
     def _field_target(self, target: Node) -> ast.expr:
-        """``guard.a.b`` as an assignment target."""
-        root, *fields = _children(target)
-        value = self._guarded(root)
-        assert value is not None  # `guards` allows field assignment only through a guard
-        for index, field_node in enumerate(fields):
-            context = ast.Store() if index == len(fields) - 1 else ast.Load()
-            value = self._at(ast.Attribute(value, _text(field_node), context), field_node)
+        """``guard.a.b``, ``guard[i]`` or ``guard.items[i].name`` as an assignment target."""
+        value = self._target_part(target)
+        assert isinstance(value, (ast.Attribute, ast.Subscript))
+        value.ctx = ast.Store()
         return value
+
+    def _target_parts(self, parts: list[Node]) -> ast.expr:
+        """Read what the first parts of a chain reach (``g.users[0]`` of ``g.users[0].bump()``), from a guard."""
+        value = self._target_part(parts[0])
+        for part in parts[1:]:
+            value = self._at(ast.Attribute(value, _text(part), ast.Load()), part)
+        return value
+
+    def _target_part(self, node: Node) -> ast.expr:
+        """Read what part of an assignment target reaches, starting from its guard.
+
+        An index is checked (out of range stops the program) once, before the statement,
+        so a target read twice (to free what it replaces) does not compute it again.
+        """
+        assert self._scope is not None
+        node = _unwrap(node)
+        if node.type == "child_annotation":
+            root, *fields = _children(node)
+            value = self._target_part(root)
+            for field_node in fields:
+                value = self._at(ast.Attribute(value, _text(field_node), ast.Load()), field_node)
+            return value
+        if node.type != "get_expression":
+            guarded = self._guarded(node)
+            assert guarded is not None  # `guards` allows changes only through a guard
+            return guarded
+        owner, index = _children(node)
+        kind = self._static_type(owner)
+        if index.type in _SLICES:
+            raise self.error(index, "a slice is a new list, so changing it changes nothing; change items: g[i] = x")
+        if kind is None or not is_list(kind):
+            shown = display_types(kind.name) if kind is not None else _text(owner)
+            raise self.error(owner, f"only a list's items can be changed this way, not {shown}'s")
+        items = self._target_part(owner)
+        where = f"{_display(self.path, self.root)}:{node.start_point[0] + 1}"
+        check = self._at(self._global(list_runtime.bifrost_list_index, "list"), node)
+        message = ast.Constant(f"{where}: index out of range\n")
+        position = self._at(ast.Call(check, [items, self._expression(index), message], []), node)
+        self._scope.temporaries += 1
+        at = f"__bifrost_at_{self._scope.temporaries}"
+        self._scope.before.append(self._at(ast.Assign([self._at(ast.Name(at, ast.Store()), node)], position), node))
+        return self._at(ast.Subscript(_copy_tree(items), self._at(ast.Name(at, ast.Load()), node), ast.Load()), node)
 
     def _call(self, node: Node, owner: ast.expr | None, path: list[str] | None = None) -> ast.expr:
         if node.type == "builtin_call":
@@ -2148,8 +2227,64 @@ class SourceUnit:
         compiled = getattr(kind.python, name, None)
         return scalar_type(getattr(compiled.python, "__annotations__", {}).get("return")) if compiled else None
 
-    def _method_call(self, call: Node, owner: ast.expr, kind: ScalarType | None) -> ast.expr:
-        """``value.method(x)``: the object's method, given the value as ``super``: ``Team.to_string(team)``."""
+    def _changes(self, kind: ScalarType | None, name: str) -> bool:
+        """Whether ``name`` is a method of ``kind`` objects that changes its object (lent to it)."""
+        found = self._method(kind, name)
+        return found is not None and found[1] in self.project.changing
+
+    def _changing_call(self, node: Node) -> bool:
+        """Whether a call expression (``counter.bump(2)``) calls a method that changes its object."""
+        parts = _children(node) if node.type == "child_annotation" else []
+        if not parts[1:] or parts[-1].type != "function_call":
+            return False
+        called = _children(parts[-1])[0].child_by_field_name("function")
+        try:
+            kind = self._parts_type(parts[:-1])
+        except BifrostError:
+            return False  # reported where it is lowered
+        return called is not None and self._changes(kind, _text(called))
+
+    def _receiver(self, parts: list[Node], kind: ScalarType, call: Node) -> ast.expr:
+        """Lend the object a changing method is called on: a pointer to it, which the method writes through.
+
+        A ``mem.Weak`` parameter or a guard on one passes its pointer; a ``mem.Shared`` or
+        ``mem.Atomic`` is locked for the call; an owned local, or a part of what a guard holds
+        (``g.users[i]``), is copied to the stack and copied back after the call. (``ownership``
+        has rejected copies and views, whose change no one would see.)
+        """
+        assert self._scope is not None
+        written = "".join(_text(part) if part.type != "simple_identifier" else f".{_text(part)}" for part in parts)
+        written = written.lstrip(".")
+        method = _text(call.child_by_field_name("function"))
+        first = parts[0]
+        if first.type not in {"simple_identifier", "get_expression"}:
+            msg = f"{method} changes its object, so call it on a name or through a guard (g[i].{method}()), not on "
+            raise self.error(first, msg + written)
+        while first.type == "get_expression":
+            first = _unwrap(_children(first)[0])
+            first = _children(first)[0] if first.type == "child_annotation" else first
+        root = _text(first)
+        name = self._scope.guards.get(root, root)
+        whole = len(parts) == 1 and parts[0].type == "simple_identifier"
+        if whole and name in self._scope.cells and name == root:
+            return self._lend_cell(name, parts[0], call)
+        if whole and name in self._scope.pointers:
+            return self._at(ast.Name(name, ast.Load()), parts[0])
+        if not whole and root not in self._scope.guards:
+            raise self.error(parts[0], f"{method} changes {written}; change it through a guard: `let g <- {root}`")
+        if call != self._scope.lend_call:
+            raise self.error(parts[0], f"call {method} in a statement of its own: it lends {written} for the call")
+        if whole and root not in self._scope.guards:
+            return self._stack_copy(self._at(ast.Name(root, ast.Load()), parts[0]), kind.python, parts[0])
+        return self._stack_copy(self._target_parts(parts), kind.python, parts[0])
+
+    def _method_call(
+        self, call: Node, owner: ast.expr, kind: ScalarType | None, receiver: list[Node] | None = None
+    ) -> ast.expr:
+        """``value.method(x)``: the object's method, given the value as ``super``: ``Team.to_string(team)``.
+
+        A method that changes its object is lent it instead (see ``_receiver``).
+        """
         assert self._scope is not None
         name = _text(call.child_by_field_name("function"))
         found = self._method(kind, name)
@@ -2160,6 +2295,8 @@ class SourceUnit:
         assert isinstance(kind, StructType)
         pointees = self.project.pointer_params.get(symbol, [])
         self._give_away(call, qualified if qualified in self._function_nodes else getattr(kind.python, name, None))
+        if symbol in self.project.changing:
+            owner = self._receiver(receiver or [], kind, call)
         positional, named = self._arguments(call, pointees)
         callee = self._at(ast.Attribute(self._global(kind.python, "type"), name, ast.Load()), call)
         value = self._at(ast.Call(callee, [owner, *positional], named), call)
@@ -3205,11 +3342,7 @@ class SourceUnit:
             raise self.error(inner, "a mem.Weak parameter takes a name: an owned value, a lent one, or a guard")
         name = self._scope.guards.get(_text(inner), _text(inner))
         if name in self._scope.cells and name == _text(inner) and not opaque:
-            if call != self._scope.lend_call:
-                raise self.error(inner, f"lend {name} in a call that is a statement of its own, like `draw({name})`")
-            self._scope.before.append(self._lock(name, inner, f"{name} is locked, so it cannot be lent"))
-            self._scope.after.append(self._cell_statement("unlock", name, inner))
-            return self._at(ast.Name(name, ast.Load()), inner)
+            return self._lend_cell(name, inner, call)
         if name in self._scope.pointers:
             return self._at(ast.Name(name, ast.Load()), inner)
         if name not in self._scope.shared_locals:
@@ -3217,24 +3350,42 @@ class SourceUnit:
             raise self.error(inner, msg)
         if call != self._scope.lend_call:
             raise self.error(inner, f"lend {name} in a call that is a statement of its own, like `draw({name})`")
-        # Copy the local to the stack, pass its address, and copy it back after the call.
+        return self._stack_copy(self._at(ast.Name(name, ast.Load()), inner), pointee, inner)
+
+    def _lend_cell(self, name: str, node: Node, call: Node) -> ast.expr:
+        """Lend the cell ``name`` to a call, locked for the call (which must be a statement of its own)."""
+        assert self._scope is not None
+        if call != self._scope.lend_call:
+            raise self.error(node, f"lend {name} in a call that is a statement of its own, like `draw({name})`")
+        self._scope.before.append(self._lock(name, node, f"{name} is locked, so it cannot be lent"))
+        self._scope.after.append(self._cell_statement("unlock", name, node))
+        return self._at(ast.Name(name, ast.Load()), node)
+
+    def _stack_copy(self, value: ast.expr, kind: object, node: Node) -> ast.expr:
+        """Copy ``value`` (a local, or a part of what a guard holds) to the stack, to pass its address.
+
+        It is copied back after the call, which may have changed it.
+        """
+        assert self._scope is not None
         self._scope.temporaries += 1
         slot = f"__bifrost_lend_{self._scope.temporaries}"
-        kind = self._global(pointee, "type").id  # named by the type itself: globals are shared by every function
+        type_name = self._global(kind, "type").id  # named by the type itself: globals are shared by every function
         self.globals["__bifrost_stack"] = stack
 
         def name_node(identifier: str, context: ast.expr_context) -> ast.Name:
-            return self._at(ast.Name(identifier, context), inner)
+            return self._at(ast.Name(identifier, context), node)
 
         def element(context: ast.expr_context) -> ast.Subscript:
-            return self._at(ast.Subscript(name_node(slot, ast.Load()), ast.Constant(0), context), inner)
+            return self._at(ast.Subscript(name_node(slot, ast.Load()), ast.Constant(0), context), node)
 
-        allocate = ast.Call(name_node("__bifrost_stack", ast.Load()), [name_node(kind, ast.Load())], [])
+        allocate = ast.Call(name_node("__bifrost_stack", ast.Load()), [name_node(type_name, ast.Load())], [])
+        stored = _copy_tree(value)
+        stored.ctx = ast.Store()
         self._scope.before += [
-            self._at(ast.Assign([name_node(slot, ast.Store())], self._at(allocate, inner)), inner),
-            self._at(ast.Assign([element(ast.Store())], name_node(name, ast.Load())), inner),
+            self._at(ast.Assign([name_node(slot, ast.Store())], self._at(allocate, node)), node),
+            self._at(ast.Assign([element(ast.Store())], value), node),
         ]
-        self._scope.after.append(self._at(ast.Assign([name_node(name, ast.Store())], element(ast.Load())), inner))
+        self._scope.after.append(self._at(ast.Assign([stored], element(ast.Load())), node))
         return name_node(slot, ast.Load())
 
     def _if_expression(self, node: Node) -> ast.expr:

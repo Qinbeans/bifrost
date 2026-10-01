@@ -84,7 +84,30 @@ let Team = struct {
 stdio.printf("%v\n", team)    // core (2 members)
 ```
 
-A method reads its object; it does not change it (fields change through a guard, where the object is held).
+A method that locks `super` changes its object: the object is lent to it, as to a `mem.Weak` parameter, and the caller sees the change. It is called on something the caller may change: a local it owns, a `mem.Weak` parameter, a `mem.Shared` or `mem.Atomic` (locked for the call), or a part of what a guard holds, like a list's item:
+
+```bifrost
+let Counter = struct {
+    let hits: i64,
+    let bump = [super] (by: i64) => null {
+        let c <- super                   // super is lent: changed through a lock
+        c.hits = c.hits + by
+        c -> super
+    }
+}
+
+let main = [] () => null {
+    let counter = Counter(hits: 0)
+    counter.bump(2)                      // counter.hits is 2
+
+    let counters = #[Counter(hits: 0), Counter(hits: 5)]
+    let g <- counters
+    g[1].bump(10)                        // an item, through a guard on its list
+    g -> counters
+}
+```
+
+A copy cannot call one, since no one would see the change: a parameter (take it as a `mem.Weak[Counter]` instead), the item a `forall` reads, or `super` in a method that does not lock it.
 
 ### Owners, guards and shared values
 
@@ -109,7 +132,7 @@ The compiler checks that:
 
 - the release is in the scope that took the lock, or a scope nested in it, and every path releases exactly once (an `if` without `else`, a `match` arm, a loop body or an early `return` that skips or repeats the release is an error);
 - a held value is not used while it is locked, and a guard is not used after it is released;
-- fields change only through a guard, so every mutation is inside a visible lock;
+- fields and list items change only through a guard, so every mutation is inside a visible lock;
 - a lent value is only lent on or locked: it is never copied, returned or stored in an object, so it cannot outlive the call that lends it.
 
 None of this reaches the generated code: a `mem.Weak[T]` parameter is a plain pointer, and a guard compiles to what it locks. Raw `ptr` exists only in C extern declarations.
@@ -236,6 +259,16 @@ let main = [total, io.printf] () => null {
 ```
 
 A list holds values of any one type: numbers, strings, records, objects, or other lists (`#{name: str, ids: i64[]}[]`, `i64[][]`). Records and objects can hold lists, and `json.encode` writes lists as JSON arrays. An empty list needs its type written: `let xs: i64[] = #[]`.
+
+Items change through a guard, as fields do: `g[i] = x`, `g[i].name = x`, `g.members[-1] = x`. The function must own the list (a parameter's or a view's items are someone else's), and an item holding lists or owned strings frees what it held when replaced:
+
+```bifrost
+let grid = #[#[1, 2], #[3, 4]]
+let g <- grid
+g[0][1] = 20                     // [[1, 20], [3, 4]]
+g[1] = #[30, 40, 50]             // the old row is freed
+g -> grid
+```
 
 `xs[a...b]` is a new list of the items from `a` up to `b` (`xs[1...]`, `xs[...-1]`: either left out is the end), with Python's rules: negative counts from the end, and bounds past either end stop there. `users[0].name` reads on from an item.
 
@@ -392,11 +425,11 @@ let draw = [rl.begin_drawing, rl.end_drawing] (ctx: mem.Weak[Context]) => null {
 
 | Command | What it does |
 |---|---|
-| `bifrost init my_api` | Create a project: `config.yaml`, `.gitignore`, `README.md`, `src/my_api/main.bif` |
-| `bifrost build` (or `bifrost build file.bif -c config.yaml -o out`) | Compile the project's entry (or a given file) to a native executable in `build/` |
-| `bifrost fmt main.bif` (`--check` to only report) | Format source files; only ever changes whitespace |
-| `bifrost lsp` | Run the language server (diagnostics, formatting, outline, hover, go-to-definition, completion) |
-| `bifrost config traverse -c config.yaml -i path/to/include/` | Generate extern declarations in `config.yaml` from C/C++ headers |
+| `bfc init my_api` | Create a project: `config.yaml`, `.gitignore`, `README.md`, `src/my_api/main.bif` |
+| `bfc build` (or `bfc build file.bif -c config.yaml -o out`) | Compile the project's entry (or a given file) to a native executable in `build/` |
+| `bfc fmt main.bif` (`--check` to only report) | Format source files; only ever changes whitespace |
+| `bfc lsp` | Run the language server (diagnostics, formatting, outline, hover, go-to-definition, completion) |
+| `bfc config traverse -c config.yaml -i path/to/include/` | Generate extern declarations in `config.yaml` from C/C++ headers |
 
 [vscode-bifrost](./extras/vscode-bifrost) adds syntax highlighting and connects VS Code to the language server.
 
@@ -434,7 +467,7 @@ externs:
 
 Library paths are relative to `config.yaml`. A parameter that takes a C callback has a function type, `handler: "(http_Context) => None"`: Bifrost passes it a function (or a lambda), and C calls it back. A declaration's `as:` gives it a Bifrost name other than the default, and `doc:` a line shown in the editor.
 
-Writing `externs` by hand is rarely needed: `bifrost config traverse` reads the headers with libclang and generates them, one module per header. It reports each declaration it skips and why (variadic functions, structs with array members, C++ functions without `extern "C"`, ...).
+Writing `externs` by hand is rarely needed: `bfc config traverse` reads the headers with libclang and generates them, one module per header. It reports each declaration it skips and why (variadic functions, structs with array members, C++ functions without `extern "C"`, ...).
 
 ## Architecture
 
@@ -481,9 +514,9 @@ uv sync
 Start a project:
 
 ```bash
-bifrost init my_api
+bfc init my_api
 cd my_api
-bifrost build          # compiles package.entry (src/my_api/main.bif) into build/
+bfc build          # compiles package.entry (src/my_api/main.bif) into build/
 ./build/my_api
 ```
 
@@ -502,10 +535,10 @@ my_api/
 Read or change the version in config.yaml, like `uv version`:
 
 ```bash
-bifrost version                    # my_api 0.1.0
-bifrost version --bump minor       # my_api 0.1.0 => 0.2.0 (also major, patch)
-bifrost version 1.0.0 --dry-run    # show the change without writing it
-bifrost version --short            # 0.1.0
+bfc version                    # my_api 0.1.0
+bfc version --bump minor       # my_api 0.1.0 => 0.2.0 (also major, patch)
+bfc version 1.0.0 --dry-run    # show the change without writing it
+bfc version --short            # 0.1.0
 ```
 
 The raylib example needs raylib built first:
@@ -513,7 +546,7 @@ The raylib example needs raylib built first:
 ```bash
 cd examples/raylib
 cmake -S . -B build && cmake --build build   # builds build/lib/libraylib.a
-bifrost build
+bfc build
 ./build/hello_raylib
 ```
 
@@ -537,12 +570,11 @@ uv run ruff format     # format
 ## Roadmap
 
 - **Closures**: lambdas that capture the locals around them
-- **Methods that change their object**: a method taking `super` as a guard, so it can write its fields
 - **More of `std:mem`**: owned values other than strings (lists, buffers), and objects that hold a `mem.Shared` or `mem.Atomic`
 - **String interpolation**: `"Hello, {name}!"`, compiled to a checked `fmt.format`
 - **Opaque C types** in extern declarations, such as `FILE`
 - **Trailing commas**
-- **More of lists**: changing an item in place (`xs[i] = x`, `rows[i].name = ...`), and a list's own functions (sorting, searching)
+- **More of lists**: a list's own functions (sorting, searching)
 - **Quick fixes** in the language server, such as adding a missing dependency
 
 ## Project Goals

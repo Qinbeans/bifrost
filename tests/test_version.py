@@ -1,4 +1,4 @@
-"""``bifrost version``: print, set or bump ``package.version`` in config.yaml, like ``uv version``."""
+"""``bfc version``: print, set or bump ``package.version`` in config.yaml, like ``uv version``."""
 
 from pathlib import Path
 

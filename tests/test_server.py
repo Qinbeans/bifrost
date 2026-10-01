@@ -665,3 +665,37 @@ let main = [stdio.printf] () => null {
 
     assert len(errors(source.replace("METHOD", ""))) == 1
     assert errors(source.replace("METHOD", method)) == []
+
+
+CHANGING = """\
+let mem = import("std:mem")
+
+let Counter = struct {
+    let hits: i64,
+    let size = [super] () => i64 super.hits,
+    let bump = [super] (by: i64) => null {
+        let c <- super
+        c.hits = c.hits + by
+        c -> super
+    }
+}
+"""
+
+
+def test_a_method_that_changes_its_object_is_lent_it(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    document = Document.open(tmp_path / "main.bif", CHANGING)
+    assert [d.message for d in document.diagnostics() if d.severity == Severity.ERROR] == []
+    # `bump` locks super: it is lent the object (a mem.Weak); `size` reads a copy.
+    assert document.hover(_position(CHANGING, "super\n")) == (
+        "```bifrost\nsuper: mem.Weak[Counter]\n"
+        "// the Counter this method is called on, lent to it: it changes it through a lock\n```"
+    )
+    assert document.hover(_position(CHANGING, "super.hits")) == (
+        "```bifrost\nsuper: Counter\n// the Counter this method is called on\n```"
+    )
+    assert [hint.label for hint in document.inlay_hints()] == [": mem.WeakGuard[Counter]"]
+    row, column = _position(CHANGING, ".hits + by")
+    assert [c.label for c in document.completions((row, column + 1))] == ["hits", "size", "bump"]

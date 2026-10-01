@@ -14,7 +14,7 @@ class _Package(BaseModel):
     name: str
     version: str
     description: str
-    # The file `bifrost build` compiles when given none, relative to config.yaml: src/<name>/main.bif.
+    # The file `bfc build` compiles when given none, relative to config.yaml: src/<name>/main.bif.
     entry: str | None = None
     # `async` lets `main` be async (`let main = [...] async () => ...`): it runs on the event
     # loop, and the program ends when it is done. `sync` (the default) does not.

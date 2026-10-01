@@ -1,4 +1,4 @@
-"""``bifrost init <name>``: create a project, laid out the way the compiler expects.
+"""``bfc init <name>``: create a project, laid out the way the compiler expects.
 
 ```
 name/
@@ -45,7 +45,7 @@ flags:
 libraries: []
 
 # C declarations Bifrost code can import. Generate them from headers with:
-#   bifrost config traverse -i path/to/header.h
+#   bfc config traverse -i path/to/header.h
 externs: []
 """
 
@@ -67,11 +67,11 @@ README = """\
 ## Build and run
 
 ```bash
-bifrost build
+bfc build
 ./build/{name}
 ```
 
-`bifrost build` compiles `src/{name}/main.bif` (the `entry` in `config.yaml`).
+`bfc build` compiles `src/{name}/main.bif` (the `entry` in `config.yaml`).
 Modules in `src/` import each other from there: `import("{name}.utils:text")`
 is the module `text` of `src/{name}/utils.bif`.
 """

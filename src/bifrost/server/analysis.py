@@ -506,10 +506,10 @@ class Document:
     def type_of(self, name: str, node: Node) -> str | None:
         """Return the type of local ``name`` where ``node`` is, when known: ``Context``, ``Guard[Context]``.
 
-        In a method, ``super`` is the object it is called on.
+        In a method, ``super`` is the object it is called on (lent to it, ``mem.Weak[Team]``, when it changes it).
         """
         if name == "super":
-            return self._receiver(node)
+            return self._receiver_type(node)
         local = self._local(name, node)
         return self._type_of_binding(local) if local is not None else None
 
@@ -522,6 +522,22 @@ class Document:
         owner = member.parent.parent if member.parent is not None else None  # struct_assignment, then its `let`
         name = _name_of(owner) if owner is not None and owner.type == "assignment" else None
         return _text(name) if name is not None else None
+
+    def _receiver_type(self, node: Node) -> str | None:
+        """Return the type of ``super`` at ``node``: ``Team``, or ``mem.Weak[Team]`` in a method that changes it."""
+        receiver = self._receiver(node)
+        if receiver is None or not self._changes_super(node):
+            return receiver
+        alias = next((name for name in self.bindings() if self._module_of(name) == f"{std.PREFIX}mem"), None)
+        return f"{alias}.Weak[{receiver}]" if alias else f"Weak[{receiver}]"
+
+    def _changes_super(self, node: Node) -> bool:
+        """Whether the method around ``node`` changes its object: it locks ``super``."""
+        function = self._enclosing_function(node)
+        return function is not None and any(
+            _text(_unwrap(lock.child_by_field_name("source"))) == "super"
+            for lock in _descendants(function, "lock", own=True)
+        )
 
     def _type_of_binding(self, local: Node) -> str | None:
         parts = _named(local)
@@ -551,6 +567,9 @@ class Document:
         held = re.fullmatch(r"(\w+)\.(Unique|Weak|Shared|Atomic)\[(.*)\]", locked)
         if held is not None and self._module_of(held.group(1)) == f"{std.PREFIX}mem":
             return f"{held.group(1)}.{held.group(2)}Guard[{held.group(3).strip()}]"
+        bare = re.fullmatch(r"Weak\[(.*)\]", locked)  # `super` lent to a method, in a file without std:mem
+        if bare is not None:
+            return f"WeakGuard[{bare.group(1)}]"
         alias = next((name for name in self.bindings() if self._module_of(name) == f"{std.PREFIX}mem"), None)
         return f"{alias}.UniqueGuard[{locked}]" if alias else f"UniqueGuard[{locked}]"
 
@@ -1053,10 +1072,8 @@ class Document:
             return access or None
         name = _text(node)
         local = self._local(name, node)
-        receiver = self._receiver(node) if name == "super" else None
-        if local is not None or receiver is not None:
-            described = self._describe_local(local) if local is not None else f"super: {receiver}"
-            return _code(described if local is not None else f"{described}\n// the {receiver} this method is called on")
+        if local is not None or (name == "super" and self._receiver(node) is not None):
+            return _code(self._describe_local(local)) if local is not None else self._hover_super(node)
         binding = self.bindings().get(name)
         if binding is None:
             return None
@@ -1064,6 +1081,14 @@ class Document:
         if value.type in {"function_definition", "struct_assignment"}:
             return _documented(self._describe_binding(assignment), _doc(value))
         return _documented(_text(assignment), self._module_doc(value))
+
+    def _hover_super(self, node: Node) -> str:
+        """Describe ``super``: the object a method is called on, lent to it when it changes it."""
+        receiver = self._receiver(node)
+        if self._changes_super(node):
+            lent = f"// the {receiver} this method is called on, lent to it: it changes it through a lock"
+            return _code(f"super: {self._receiver_type(node)}\n{lent}")
+        return _code(f"super: {receiver}\n// the {receiver} this method is called on")
 
     def _hover_member_declaration(self, node: Node) -> str | None:
         """Describe an object's member where it is declared: ``static let origin = ...`` in ``struct { ... }``."""

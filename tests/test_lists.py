@@ -316,6 +316,53 @@ def test_lists_in_shared_values(tmp_path: Path) -> None:
     assert allocations < 30
 
 
+ITEMS = r"""
+let io = import("std:stdio")
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+
+let User = struct { let name: mem.Unique[str], let age: i64 }
+let Team = struct { let users: User[], let tags: mem.Unique[str][] }
+
+let main = [io.printf, fmt.format] () => null {
+    let grid = #[#[1, 2], #[3, 4]]
+    let g <- grid
+    g[0][1] = 20
+    g[1] = #[30, 40, 50]
+    g[0] = #[...g[0], 99]
+    g[-1][-1] = g[0][0] + 1
+    g -> grid
+    io.printf("%v\n", grid)
+
+    let team = Team(users: #[User(name: fmt.format("ada"), age: 36)], tags: #[fmt.format("a"), fmt.format("b")])
+    let t <- team
+    t.users[0].age = t.users[0].age + 1
+    t.users[0].name = fmt.format("ada %d", 2)
+    t.tags[-1] = fmt.format("z")
+    t.users = #[...t.users, User(name: fmt.format("bob"), age: 5)]
+    t.users[1] = User(name: fmt.format("cy"), age: 7)
+    t -> team
+    let first = team.users[0]
+    io.printf("%s %d %s %s %d\n", first.name, first.age, team.tags[1], team.users[1].name, len(team.users))
+
+    let shared: mem.Shared[Team] = Team(users: #[], tags: #[fmt.format("x")])
+    let s <- shared
+    s.tags[0] = fmt.format("y")
+    s -> shared
+    let r <- shared
+    io.printf("%s\n", r.tags[0])
+    r -> shared
+}
+"""
+
+
+def test_items_change_through_a_guard(tmp_path: Path) -> None:
+    # An item (or a field of one) replaced through a guard frees what it held, once.
+    lines, allocations, frees = _counted(tmp_path, ITEMS)
+    assert lines == ["[[1, 20, 99], [30, 40, 2]]", "ada 2 37 z cy 2", "y"]
+    assert allocations - frees == 1
+
+
 HEAD = (
     'let io = import("std:stdio")\nlet mem = import("std:mem")\nlet fmt = import("std:fmt")\n'
     "let Team = struct { let members: i64[] }\nlet User = struct { let name: mem.Unique[str] }\n"
@@ -374,6 +421,42 @@ HEAD = (
         (
             "let f = [take] (users: User[]) => null {\n    take(users[0].name)\n}",
             "users[0].name is part of users, so it cannot be kept here",
+        ),
+        (
+            "let f = [] () => null {\n    let xs = #[1]\n    xs[0] = 2\n}",
+            "items change only through a guard: lock xs first (`let guard <- xs`)",
+        ),
+        (
+            "let f = [] () => null {\n    let xs = #[1]\n    let g <- xs\n    xs[0] = 2\n    g -> xs\n}",
+            "xs is locked by g (line 9); change it through g",
+        ),
+        (
+            "let f = [] (xs: i64[]) => null {\n    let g <- xs\n    g[0] = 2\n    g -> xs\n}",
+            "xs is lent to this function, so the items of its lists cannot change here (they are its caller's)",
+        ),
+        (
+            "let f = [] () => null {\n    let grid = #[#[1]]\n    forall row in grid {\n        let g <- row\n"
+            "        g[0] = 5\n        g -> row\n    }\n}",
+            "row is a view of grid, so its items cannot change; change them through grid",
+        ),
+        (
+            "let f = [] () => null {\n    let xs = #[1, 2]\n    let g <- xs\n    g[0...1] = #[3]\n    g -> xs\n}",
+            "a slice is a new list, so changing it changes nothing; change items: g[i] = x",
+        ),
+        (
+            'let f = [fmt.format] () => null {\n    let xs = #[fmt.format("a")]\n    let g <- xs\n    g[0] = "b"\n'
+            "    g -> xs\n}",
+            'g[0] is owned (mem.Unique[str]), but "b" is not; keep an owned copy: fmt.format("%s", "b")',
+        ),
+        (
+            'let f = [fmt.format] () => null {\n    let u = User(name: fmt.format("a"))\n    let g <- u\n'
+            '    g.name = "b"\n    g -> u\n}',
+            'g.name is owned (mem.Unique[str]), but "b" is not',
+        ),
+        (
+            "let f = [io.printf] () => null {\n    let rows = #[#[1], #[2]]\n    let first = rows[0]\n"
+            '    let g <- rows\n    g[0] = #[9]\n    g -> rows\n    io.printf("%v", first)\n}',
+            "rows is read by first (line 9) until the end of its block, so it cannot be changed here",
         ),
     ],
 )

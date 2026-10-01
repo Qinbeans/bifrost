@@ -7,10 +7,10 @@ the whole value (`count = count + 1`).
 ## Build and run
 
 ```bash
-bifrost build
+bfc build
 ./build/async
 ```
 
-`bifrost build` compiles `src/async/main.bif` (the `entry` in `config.yaml`).
+`bfc build` compiles `src/async/main.bif` (the `entry` in `config.yaml`).
 Modules in `src/` import each other from there: `import("async.utils:text")`
 is the module `text` of `src/async/utils.bif`.

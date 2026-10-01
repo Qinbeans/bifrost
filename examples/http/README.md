@@ -36,7 +36,7 @@ h2o needs OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt inst
 
 ```bash
 cmake -B build -G Ninja && cmake --build build --target bifrost_http   # h2o and c/http.c, once
-bifrost build
+bfc build
 ./build/http                 # http://localhost:8080 ($PORT to change it)
 ```
 

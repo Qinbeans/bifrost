@@ -1,4 +1,4 @@
-"""A language server for Bifrost, speaking LSP over stdio (``bifrost lsp``).
+"""A language server for Bifrost, speaking LSP over stdio (``bfc lsp``).
 
 It reports syntax, lowering and type errors as you type, formats documents,
 outlines their top-level bindings, jumps to definitions (externs jump to their

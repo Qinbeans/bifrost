@@ -73,6 +73,7 @@ class Oracle:
     owned_value: Callable[[Node], bool] = lambda _: False  # a list, owned string, or record holding one?
     copy: Callable[[Node], str] = lambda _: ""  # how to write a copy of this expression, if it can be copied
     constructs: Callable[[Node], bool] = lambda _: False  # does this call build an object (its arguments move in)?
+    changes: Callable[[Node], bool] = lambda _: False  # does this call (`a.f(x)`) change the object it is called on?
     # Called at each `let` (and `forall`) before what follows is checked, so that
     # the types of later expressions, which the checks above ask about, are known.
     bind: Callable[[str, Node], None] = lambda _name, _node: None
@@ -155,6 +156,14 @@ def _named_values(node: Node) -> list[Node]:
         return []
     values = [argument.child_by_field_name("value") for argument in _named(inner) if argument.type == "named_argument"]
     return [value for value in values if value is not None]
+
+
+def _writes_item(target: Node) -> bool:
+    """Whether an assignment target goes through a list's item: ``g[0] = x``, ``g.users[i].name = x``."""
+    node = _unwrap(target)
+    if node.type == "get_expression":
+        return True
+    return node.type == "child_annotation" and _writes_item(_named(node)[0])
 
 
 def _root(node: Node) -> str | None:
@@ -319,17 +328,35 @@ class _Checker:
         target, value = item.child_by_field_name("target"), item.child_by_field_name("value")
         if target is None or value is None:
             return
-        if self.oracle.owned_value(value):
+        owned = self.oracle.owned_value(value)
+        if owned or _writes_item(target):
             root = self.owner(_root(target), state)
             if root is None:
-                what = _root(target) or _text(target)
-                raise OwnershipError(target, f"{what} is not an owner here, so a list in it cannot be replaced")
+                raise OwnershipError(target, self.not_owner(target, state, replacing=owned))
+        if owned:
+            assert root is not None
             self.unused(root, state, item, "changed")
             self.keep(value, state)
             self.name(target, state)
         else:
             self.expression(target, state)
             self.expression(value, state)
+
+    def not_owner(self, target: Node, state: _State, *, replacing: bool) -> str:
+        """Say why a change through ``target`` is not this function's to make."""
+        name = _root(target) or _text(target)
+        source = self.guards.get(name, name)
+        if source in state.views:
+            what = f"{source} is a view of {state.views[source][0]}"
+            return f"{what}, so its items cannot change; change them through {state.views[source][0]}"
+        if source in self.parameters:
+            return (
+                f"{source} is lent to this function, so the items of its lists cannot change here "
+                f"(they are its caller's); take it as a mem.Weak to change it, or change a copy"
+            )
+        if replacing:
+            return f"{name} is not an owner here, so a list in it cannot be replaced"
+        return f"{name} is not an owner here, so the items of its lists cannot change"
 
     def return_(self, node: Node, state: _State) -> None:
         values = _named(node)
@@ -584,6 +611,35 @@ class _Checker:
             self.expression(value, state)
         if node.type == "child_annotation":
             self.name(_named(node)[0], state)
+            if self.oracle.changes(node):
+                self.changed(node, state)
+
+    def changed(self, node: Node, state: _State) -> None:
+        """Check that the object ``node`` calls a changing method on (which may replace its lists) is ours."""
+        first = _named(node)[0]
+        root = _text(first) if first.type == "simple_identifier" else _root(first)
+        owner = self.owner(root, state)
+        source = self.guards.get(root, root) if root is not None else None
+        if owner is not None:
+            self.unused(owner, state, node, "changed")
+            return
+        call = _named(_named(node)[-1])[0]
+        method = _text(call.child_by_field_name("function") or call)
+        if source == "super":
+            msg = f"{method} changes its object, but this method reads super as a copy; lock super here to change it"
+            raise OwnershipError(first, msg)
+        if source in state.views:
+            msg = (
+                f"{method} changes its object, but {source} is a view of {state.views[source][0]} (a copy of an item); "
+                f"change it through a guard on {state.views[source][0]}, like g[i].{method}()"
+            )
+            raise OwnershipError(first, msg)
+        if source in self.parameters:
+            msg = (
+                f"{method} changes its object, but {source} is a copy given to this function, so its caller would "
+                f"not see the change; take it as a mem.Weak to change the caller's"
+            )
+            raise OwnershipError(first, msg)
 
     @staticmethod
     def name(node: Node, state: _State) -> None:

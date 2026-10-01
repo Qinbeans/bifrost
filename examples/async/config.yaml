@@ -14,5 +14,5 @@ flags:
 libraries: []
 
 # C declarations Bifrost code can import. Generate them from headers with:
-#   bifrost config traverse -i path/to/header.h
+#   bfc config traverse -i path/to/header.h
 externs: []
