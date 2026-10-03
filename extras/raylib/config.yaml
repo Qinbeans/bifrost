@@ -1,6 +1,6 @@
 package:
   name: raylib
-  version: 0.1.1
+  version: 0.1.2
   build: library
   description: raylib 6.0 for Bifrost, a library for games and graphics (https://www.raylib.com)
 
@@ -12,6 +12,8 @@ flags:
 libraries:
   - ./build/lib/libraylib.a
   - m
+  # raylib's own clipboard-image code calls X11 directly (GLFW loads X11 and Wayland itself).
+  - X11
 
 externs:
   - module: raylib

@@ -4,6 +4,7 @@ from typing import Annotated
 
 import typer
 import yaml
+from mlir_python.codegen import LinkError
 from rich import print  # noqa: A004
 from rich.markup import escape
 from typer import Typer
@@ -82,7 +83,12 @@ def build(
     except BifrostError as error:
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
-    except (FileNotFoundError, RuntimeError) as error:  # a missing library, or a failed link
+    except (
+        FileNotFoundError,
+        RuntimeError,
+        ValueError,
+        LinkError,
+    ) as error:  # a missing or misnamed library, a failed link
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     print(f"[bold green]✔ SUCCESS[/bold green]: built {executable}")
@@ -144,6 +150,33 @@ def add(
     else:
         where = f"{added} {source.version} from index {source.index}"
     print(f"[bold green]✔ SUCCESS[/bold green]: added {escape(where)} to {escape(str(config))}")
+
+
+@cli.command()
+def sync(
+    config: Annotated[Path, typer.Option("--config", "-c", help="Project configuration.")] = Path("config.yaml"),
+) -> None:
+    """Install the packages config.yaml lists into build/pkg/ (for the editor, say), without building."""
+    if not config.is_file():
+        print(
+            f"[bold red]✘ ERROR[/bold red]: no {escape(str(config))}; create a project with `bfc init <name>`",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+    try:
+        synced = packages.sync(config)
+    except (PackageError, ValueError) as error:  # ValueError: pydantic's, for a config that does not validate
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
+        raise typer.Exit(1) from None
+    for package in synced.found:
+        how = "installed" if package.name in synced.unpacked else "up to date"
+        if not package.root.is_relative_to(config.parent.resolve() / "build" / "pkg"):
+            how = f"by path, {package.root}"
+        print(f"  {escape(package.name)} {escape(package.config.package.version)} ({escape(how)})")
+    for name in synced.removed:
+        print(f"  {escape(name)} (removed: no longer listed)")
+    count = len(synced.found)
+    print(f"[bold green]✔ SUCCESS[/bold green]: synced {count} package{'s' if count != 1 else ''}")
 
 
 @cli.command()

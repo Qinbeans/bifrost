@@ -15,6 +15,10 @@ FetchContent_Declare(
 set(RAYLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(RAYLIB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# Both of GLFW's Linux backends: it uses Wayland when the program runs under it, else X11, and
+# loads either's libraries itself when the program starts, so neither is linked.
+set(GLFW_BUILD_WAYLAND ON CACHE BOOL "" FORCE)
+set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 FetchContent_MakeAvailable(raylib)

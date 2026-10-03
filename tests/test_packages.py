@@ -136,6 +136,23 @@ def _serve(folder: Path) -> Iterator[str]:
         thread.join()
 
 
+def test_the_link_check(tmp_path: Path) -> None:
+    # CI links everything a package's C libraries hold with only what its config.yaml lists, so a
+    # library it forgot fails the release; Bifrost's runtime is the app's to give.
+    (tmp_path / "lib.c").write_text(
+        "#include <math.h>\nvoid forgot(void);\nvoid bifrost_async_pending(void);\n"
+        "double use(double x) { forgot(); bifrost_async_pending(); return cbrt(x); }\n"
+    )
+    (tmp_path / "build").mkdir()
+    subprocess.run(["clang", "-c", "-O0", "-fno-builtin", "lib.c", "-o", "lib.o"], cwd=tmp_path, check=True)  # noqa: S607
+    subprocess.run(["ar", "rcs", "build/liblib.a", "lib.o"], cwd=tmp_path, check=True)  # noqa: S607
+    index: Any = _package_index()
+    (tmp_path / "config.yaml").write_text("libraries: [./build/liblib.a]\n")
+    assert index.check(tmp_path) == ["cbrt", "forgot"]
+    (tmp_path / "config.yaml").write_text("libraries: [./build/liblib.a, m]\n")
+    assert index.check(tmp_path) == ["forgot"]
+
+
 @pytest.mark.parametrize("tampered", [False, True])
 def test_a_package_from_a_url_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, tampered: bool) -> None:
     # The index CI publishes: a page of links to the releases' archives, each with its SHA-256,
@@ -296,16 +313,42 @@ def test_add_errors(tmp_path: Path, arguments: list[str], message: str) -> None:
     assert (app / "config.yaml").read_text() == before
 
 
+def _sync(app: Path) -> list[str]:
+    """Run ``bfc sync`` in ``app``; return its output's lines."""
+    result = CliRunner().invoke(cli, ["sync", "--config", str(app / "config.yaml")])
+    assert result.exit_code == 0, result.output
+    return [" ".join(line.split()) for line in result.output.splitlines()]
+
+
+def test_sync(tmp_path: Path) -> None:
+    # Installs what config.yaml lists, without building, for the editor; removes what it no longer lists.
+    packages.build(_project(tmp_path / "greeting", "greeting"), tmp_path / "index")
+    extra = "index:\n  default: ../index\npackages:\n  greeting: 0.2.0\n"
+    app = _project(tmp_path / "app", "app", extra, source=APP)
+    main = app / "src" / "app" / "main.bif"
+    assert _sync(app) == ["greeting 0.2.0 (installed)", "✔ SUCCESS: synced 1 package"]
+    assert [d.message for d in Document.open(main, main.read_text()).diagnostics()] == []
+    assert not (app / "build" / "app").exists()  # nothing built
+    assert _sync(app) == ["greeting 0.2.0 (up to date)", "✔ SUCCESS: synced 1 package"]
+
+    config = app / "config.yaml"
+    config.write_text(config.read_text().replace(extra, "packages:\n  greeting:\n    path: ../greeting\n"))
+    lines = _sync(app)
+    assert lines[0].startswith("greeting 0.2.0 (by path, ")
+    assert lines[1:] == ["greeting (removed: no longer listed)", "✔ SUCCESS: synced 1 package"]
+    assert not (app / "build" / "pkg" / "greeting").exists()
+
+
 def test_the_editor_does_not_install(tmp_path: Path) -> None:
     # Unpacking is `bfc build`'s; until then the editor says so, and still checks the rest.
     packages.build(_project(tmp_path / "greeting", "greeting"), tmp_path / "index")
     app = _project(tmp_path / "app", "app", "index:\n  default: ../index\npackages:\n  greeting: 0.2.0\n", source=APP)
     with pytest.raises(
-        PackageError, match=re.escape("not installed; run `bfc build` to unpack greeting-0.2.0-any.bifpkg")
+        PackageError, match=re.escape("not installed; run `bfc sync` to unpack greeting-0.2.0-any.bifpkg")
     ):
         ConfigBuilder(app / "config.yaml").build()
     main = app / "src" / "app" / "main.bif"
     messages = [d.message for d in Document.open(main, main.read_text()).diagnostics()]
-    assert "package greeting is not installed; run `bfc build` to unpack greeting-0.2.0-any.bifpkg" in messages
-    _run(app)  # installs it
+    assert "package greeting is not installed; run `bfc sync` to unpack greeting-0.2.0-any.bifpkg" in messages
+    _sync(app)  # installs it
     assert [d.message for d in Document.open(main, main.read_text()).diagnostics()] == []

@@ -28,7 +28,8 @@ A package listed only by version comes from the index named ``default``, or else
 ``DEFAULT_INDEX``, where the packages in ``extras/`` are published.
 
 ``bfc add`` writes these entries (see ``add``). Packages from an index or a
-``.bifpkg`` are unpacked into ``build/pkg/<name>/``.
+``.bifpkg`` are unpacked into ``build/pkg/<name>/`` by ``bfc sync`` (``sync``),
+``bfc build`` and ``bfc add``.
 Their externs and libraries join the project's, and ``import("a.b:module")``
 looks in their sources after the project's own.
 """
@@ -40,7 +41,7 @@ import shutil
 import tarfile
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -152,8 +153,18 @@ def resolve(config: Config, folder: Path, *, install: bool) -> Config:
     resolver = _Resolver(folder, install=install)
     for name, source in config.packages.items():
         resolver.resolve(name, source, folder, config.index)
+    return _merge(config, resolver.found.values())
+
+
+def _merge(config: Config, found: Iterable[Package]) -> Config:
+    """Add the externs, libraries and sources of the packages ``found`` to ``config``.
+
+    Raises:
+        PackageError: If two declare one module.
+
+    """
     modules = {extern.module for extern in config.externs}
-    for package in resolver.found.values():
+    for package in found:
         for extern in package.config.externs:
             if extern.module in modules:
                 raise PackageError(f"package {package.name} declares module {extern.module}, which is already declared")
@@ -165,6 +176,42 @@ def resolve(config: Config, folder: Path, *, install: bool) -> Config:
     return config
 
 
+@dataclass(frozen=True)
+class Synced:
+    """What ``sync`` did: the packages the project uses, which of them it unpacked, and what it removed."""
+
+    found: list[Package]
+    unpacked: set[str]
+    removed: list[str]
+
+
+def sync(config_path: Path) -> Synced:
+    """Install the packages ``config.yaml`` lists (and theirs) into ``build/pkg/``, without building.
+
+    Unpacked packages it no longer lists (or now uses by path) are removed.
+
+    Raises:
+        PackageError: If a package cannot be found or used.
+
+    """
+    from bifrost.configs import ConfigBuilder  # noqa: PLC0415 - it resolves packages in turn
+
+    folder = config_path.parent
+    config = ConfigBuilder(config_path, resolve=False).build()
+    resolver = _Resolver(folder, install=True)
+    for name, source in config.packages.items():
+        resolver.resolve(name, source, folder, config.index)
+    _merge(config, resolver.found.values())  # checks that they fit together
+    installed = folder / "build" / "pkg"
+    removed = []
+    for path in sorted(installed.iterdir()) if installed.is_dir() else []:
+        package = resolver.found.get(path.name)
+        if (path / _MARKER).is_file() and (package is None or package.root != path):
+            shutil.rmtree(path)
+            removed.append(path.name)
+    return Synced(list(resolver.found.values()), resolver.unpacked, removed)
+
+
 class _Resolver:
     """Finds the packages a project uses, and theirs, unpacking them into the project's ``build/pkg/``."""
 
@@ -172,6 +219,7 @@ class _Resolver:
         self.project = project
         self.install = install
         self.found: dict[str, Package] = {}  # in the order C libraries link: a package before what it uses
+        self.unpacked: set[str] = set()  # the packages unpacked now, not already
 
     def resolve(self, name: str, source: str | _PackageSource, folder: Path, indexes: dict[str, str]) -> None:
         """Find package ``name`` as ``source`` says (relative to ``folder``, whose config names ``indexes``)."""
@@ -212,12 +260,13 @@ class _Resolver:
         if marker.is_file() and marker.read_text() == archive.name:
             return target
         if not self.install:
-            raise PackageError(f"package {name} is not installed; run `bfc build` to unpack {archive.name}")
+            raise PackageError(f"package {name} is not installed; run `bfc sync` to unpack {archive.name}")
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True)
         with tarfile.open(archive, "r:gz") as tar:
             tar.extractall(target, filter="data")
         marker.write_text(archive.name)
+        self.unpacked.add(name)
         return target
 
 
@@ -249,7 +298,7 @@ def _from_index(name: str, version: str, folder: Path, index: str, *, install: b
         if (cache / file).is_file():
             return cache / file
     if not install:
-        raise PackageError(f"package {name} {version} is not installed; run `bfc build` to fetch it")
+        raise PackageError(f"package {name} {version} is not installed; run `bfc sync` to fetch it")
     links = _links(index)
     for file in wanted:
         if file in links:
@@ -528,6 +577,7 @@ __all__ = [
     "DEFAULT_INDEX",
     "Package",
     "PackageError",
+    "Synced",
     "add",
     "archive_name",
     "build",
@@ -535,5 +585,6 @@ __all__ = [
     "index_location",
     "package_name",
     "resolve",
+    "sync",
     "versions",
 ]

@@ -71,20 +71,27 @@ jobs:
       - uses: astral-sh/setup-uv@v7
 
       # What the packages' C libraries build with: h2o (http_server) needs
-      # OpenSSL and zlib; raylib, X11 and OpenGL.
+      # OpenSSL and zlib; raylib, X11, Wayland (and wayland-scanner) and OpenGL.
       - name: Install build tools and libraries
         if: matrix.native
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build \
             libssl-dev zlib1g-dev \
-            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev \
+            libwayland-dev libxkbcommon-dev pkg-config
 
       - name: Build the C libraries
         if: matrix.native
         run: |
           cmake -S "${{ matrix.folder }}" -B "${{ matrix.folder }}/build" -G Ninja
           cmake --build "${{ matrix.folder }}/build"
+
+      # Every object in its libraries, linked with only what config.yaml lists:
+      # a system library it forgot fails here, not in an app's build.
+      - name: Check that the C libraries link
+        if: matrix.native
+        run: uv run --no-project --with pyyaml python tools/package_index.py check "${{ matrix.folder }}"
 
       - name: Package
         run: uv run --frozen bfc package --config "${{ matrix.folder }}/config.yaml" --output dist

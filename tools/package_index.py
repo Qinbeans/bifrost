@@ -8,10 +8,13 @@ when it links no C libraries of its own).
 Usage::
 
     python tools/package_index.py plan [--all]     # the build matrix, as JSON
+    python tools/package_index.py check extras/raylib   # its C libraries link with what it lists
     gh api --paginate --slurp repos/OWNER/REPO/releases | python tools/package_index.py index > index.html
 
 ``plan`` lists the packages whose version has no release tag yet (``--all``:
-every package, to check that they build). ``index`` writes one HTML page of
+every package, to check that they build). ``check`` links everything a package's
+C libraries hold with only the libraries its ``config.yaml`` lists, so that a
+missing one fails the release rather than an app's build. ``index`` writes one HTML page of
 links to every ``.bifpkg`` on a published release, each with its SHA-256: what
 a project's ``index:`` names, and what ``bfc build`` reads.
 """
@@ -19,8 +22,10 @@ a project's ``index:`` names, and what ``bfc build`` reads.
 import argparse
 import html
 import json
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +83,38 @@ def plan(*, every: bool) -> dict[str, Any]:
         targets = TARGETS if package["native"] else TARGETS[:1]  # `any`: one archive serves every target
         builds += [{**package, **target, "tag": tag} for target in targets]
     return {"builds": builds, "releases": releases}
+
+
+# What a package's C code may leave to the program using it: Bifrost's runtime.
+RUNTIME = ("bifrost_", "mlirAsyncRuntime")
+
+
+def check(folder: Path) -> list[str]:
+    """Return the symbols the package's C libraries need that neither they nor the libraries it lists give.
+
+    Every object they hold is linked (``--whole-archive``) into a program that does nothing, with
+    the system libraries its ``config.yaml`` lists: what an app using any of it links.
+
+    Raises:
+        RuntimeError: If linking fails other than by undefined symbols.
+
+    """
+    raw = yaml.safe_load((folder / "config.yaml").read_text()) or {}
+    libraries = [str(library) for library in raw.get("libraries", [])]
+    archives = [str(folder / library) for library in libraries if "/" in library]
+    if not archives:
+        return []
+    with tempfile.TemporaryDirectory() as temporary:
+        main = Path(temporary) / "main.c"
+        main.write_text("int main(void) { return 0; }\n")
+        command = ["clang", str(main), "-o", str(Path(temporary) / "check"), "-Wl,--warn-unresolved-symbols"]
+        command += ["-Wl,--whole-archive", *archives, "-Wl,--no-whole-archive"]
+        command += [f"-l{library}" for library in libraries if "/" not in library]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603 - clang
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    missing = sorted(set(re.findall(r"undefined reference to `([^']+)'", result.stderr)))
+    return [symbol for symbol in missing if not symbol.startswith(RUNTIME)]
 
 
 def archive_links(releases: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -147,10 +184,22 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     planning = commands.add_parser("plan", help="the build matrix, as JSON")
     planning.add_argument("--all", action="store_true", help="every package, released or not")
+    checking = commands.add_parser("check", help="link a package's C libraries with what it lists")
+    checking.add_argument("folder", type=Path)
     commands.add_parser("index", help="the index page of the releases on stdin")
     arguments = parser.parse_args()
     if arguments.command == "plan":
         sys.stdout.write(json.dumps(plan(every=arguments.all)) + "\n")
+    elif arguments.command == "check":
+        missing = check(arguments.folder)
+        if missing:
+            sys.stderr.write(
+                f"{arguments.folder}: its C libraries need what config.yaml's libraries do not give:\n  "
+                + "\n  ".join(missing)
+                + "\n"
+            )
+            sys.exit(1)
+        sys.stdout.write(f"{arguments.folder}: its C libraries link with what config.yaml lists\n")
     else:
         sys.stdout.write(render(archive_links(read_releases(sys.stdin.read()))))
 
