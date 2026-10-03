@@ -161,14 +161,13 @@ def _misfit(read: Read, text: str, kind: ScalarType | None, *, literal: bool) ->
         return ""
     names = {"int": "integers", "float": "numbers", "string": "strings", "pointer": "addresses"}
     by_kind = {"int": "%d", "uint": "%u", "bool": "%d", "float": "%f", "cstr": "%s"}.get(kind.kind, "%p")
-    article = _article(shown)
-    return f"{read.conversion} prints {names[read.what]}, but {text} is {article} {shown}: use {by_kind}"
+    return f"{read.conversion} prints {names[read.what]}, but {text} is {article(shown)} {shown}: use {by_kind}"
 
 
-def _article(name: str) -> str:
+def article(name: str) -> str:
     """Return "a" or "an" for a type's name, as it is said: an i64, an f64, a u64, a str."""
     spelled = re.match(r"[a-z]\d", name) is not None  # said letter by letter: "eff sixty-four"
     return "an" if name[:1] in ("aefhilmnorsx" if spelled else "aeiou") else "a"
 
 
-__all__ = ["PATTERNS", "FormatError", "Read", "check", "fill", "reads", "widen"]
+__all__ = ["PATTERNS", "FormatError", "Read", "article", "check", "fill", "reads", "widen"]

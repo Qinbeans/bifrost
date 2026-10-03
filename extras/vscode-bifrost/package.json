@@ -2,7 +2,7 @@
   "name": "vscode-bifrost",
   "displayName": "vscode-bifrost",
   "description": "Bifrost syntax highlighting and language server",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "qinbeans",
   "repository": {
     "type": "git",

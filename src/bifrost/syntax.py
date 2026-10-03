@@ -99,6 +99,71 @@ def _missing(node: Node) -> SyntaxProblem:
     return SyntaxProblem(f"expected {what}{after}", previous or node)
 
 
+def _string_brace(root: Node) -> SyntaxProblem | None:
+    """Find a brace in a string that is not part of ``{value}``, ``{{`` or ``}}``.
+
+    A string is on one line, so each line is read on its own: its strings, and in
+    them, the values in braces (which may hold strings of their own).
+    """
+    for row, line in enumerate((root.text or b"").decode(errors="replace").split("\n")):
+        found = _line_brace(line)
+        if found is not None:
+            column, message = found
+            point = (row, len(line[:column].encode()))
+            node = root.descendant_for_point_range(point, point) or root
+            return SyntaxProblem(message, node)
+    return None
+
+
+def _line_brace(line: str) -> tuple[int, str] | None:
+    """Return where a line's strings have a stray brace, and what to write instead."""
+    index = 0
+    while index < len(line) and not line.startswith("//", index):
+        if line[index] != '"':
+            index += 1
+            continue
+        found, index = _string_brace_at(line, index + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _string_brace_at(line: str, index: int) -> tuple[tuple[int, str] | None, int]:
+    """Read a string from ``index`` (just past its quote): a stray brace in it, and where it ends."""
+    while index < len(line) and line[index] != '"':
+        if line[index] == "\\" or line.startswith(("{{", "}}"), index):
+            index += 2
+        elif line[index] == "}":
+            return (index, "a '}' in a string closes nothing; write }} for a brace"), len(line)
+        elif line[index] == "{":
+            opened, index = index, _value_end(line, index + 1)
+            if index > len(line):
+                message = "a '{' in a string starts a value ({name}) that is never closed; write {{ for a brace"
+                return (opened, message), len(line)
+        else:
+            index += 1
+    return None, index + 1
+
+
+def _value_end(line: str, index: int) -> int:
+    """Return the index past the ``}`` closing a ``{value}`` (braces nest; strings in it are skipped whole)."""
+    depth = 1
+    while index < len(line) and depth:
+        if line[index] == '"':
+            index = _string_end(line, index + 1)
+            continue
+        depth += {"{": 1, "}": -1}.get(line[index], 0)
+        index += 1
+    return index if not depth else len(line) + 1
+
+
+def _string_end(line: str, index: int) -> int:
+    """Return the index just past the string that starts before ``index``."""
+    while index < len(line) and line[index] != '"':
+        index += 2 if line[index] == "\\" else 1
+    return index + 1
+
+
 def _unbalanced(root: Node) -> SyntaxProblem | None:
     """Find a bracket without its match, across the whole file."""
     stack: list[Node] = []
@@ -184,6 +249,9 @@ def syntax_errors(root: Node) -> list[SyntaxProblem]:
     """
     if not root.has_error:
         return []
+    brace = _string_brace(root)
+    if brace is not None:
+        return [brace]
     unbalanced = _unbalanced(root)
     if unbalanced is not None:
         return [unbalanced]

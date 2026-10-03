@@ -1,0 +1,12 @@
+let http = import("http")
+
+module handlers = {
+    /* Handlers most apps want, ready to route to: http.get(app, "/health", handlers.health) */
+
+    let health = [http.text] (ctx: http.Context) => null {
+        /* 200 "ok": for load balancers and uptime checks */
+        http.text(ctx, 200, "ok")
+    }
+}
+
+export(handlers)

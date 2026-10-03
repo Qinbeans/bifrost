@@ -5,12 +5,14 @@ from typing import Annotated
 import typer
 import yaml
 from rich import print  # noqa: A004
+from rich.markup import escape
 from typer import Typer
 
-from bifrost import scaffold, versioning
+from bifrost import packages, scaffold, versioning
 from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.formatter import FormatError, format_source
 from bifrost.lowering import BifrostError, lower_file
+from bifrost.packages import PackageError
 from bifrost.project import Project
 
 cli = Typer()
@@ -30,7 +32,7 @@ def init(
     try:
         project = scaffold.create(name, Path.cwd(), description)
     except scaffold.ScaffoldError as error:
-        print(f"[bold red]✘ ERROR[/bold red]: {error}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     print(f"[bold green]✔ SUCCESS[/bold green]: created {project}")
     print(f"  cd {name}\n  bfc build\n  ./build/{name}")
@@ -47,16 +49,26 @@ def build(
     """Compile a Bifrost source file (by default, the project's entry) into the configured executable."""
     config_path = config
     try:
-        config = ConfigBuilder(config_path).build()
+        config = ConfigBuilder(config_path, install=True).build()  # fetching and unpacking its packages
     except FileNotFoundError:
         msg = f"no {config_path}; create a project with `bfc init <name>`"
-        print(f"[bold red]✘ ERROR[/bold red]: {msg}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(msg)}", file=sys.stderr)
+        raise typer.Exit(1) from None
+    except PackageError as error:
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     project_folder = config_path.parent
+    if config.package.build == "library":
+        msg = (
+            f"{config_path} is a library (package.build: library), which builds no executable; "
+            "`bfc package` packages it, and projects use it from their packages:"
+        )
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(msg)}", file=sys.stderr)
+        raise typer.Exit(1)
     if source is None:
         if config.package.entry is None:
             msg = f"give a file to build, or set package.entry in {config_path}"
-            print(f"[bold red]✘ ERROR[/bold red]: {msg}", file=sys.stderr)
+            print(f"[bold red]✘ ERROR[/bold red]: {escape(msg)}", file=sys.stderr)
             raise typer.Exit(1)
         source = project_folder / config.package.entry
     config.path = path or project_folder / "build"
@@ -67,12 +79,31 @@ def build(
         with unit.errors():
             executable = project.build()
     except BifrostError as error:
-        print(f"[bold red]✘ ERROR[/bold red]: {error!s}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     except (FileNotFoundError, RuntimeError) as error:  # a missing library, or a failed link
-        print(f"[bold red]✘ ERROR[/bold red]: {error}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     print(f"[bold green]✔ SUCCESS[/bold green]: built {executable}")
+
+
+@cli.command()
+def package(
+    config: Annotated[Path, typer.Option("--config", "-c", help="Project configuration.")] = Path("config.yaml"),
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Folder for the .bifpkg; default: dist/.")
+    ] = None,
+) -> None:
+    """Package the project for others to use: its sources, config.yaml and built C libraries, as a .bifpkg."""
+    if not config.is_file():
+        print(f"[bold red]✘ ERROR[/bold red]: no {escape(str(config))}; package a project folder", file=sys.stderr)
+        raise typer.Exit(1)
+    try:
+        archive = packages.build(config.parent, output)
+    except PackageError as error:
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
+        raise typer.Exit(1) from None
+    print(f"[bold green]✔ SUCCESS[/bold green]: packaged {archive}")
 
 
 @cli.command()
@@ -123,12 +154,10 @@ def version(
         if new is not None and not dry_run:
             versioning.write(config, new)
     except FileNotFoundError:
-        print(
-            f"[bold red]✘ ERROR[/bold red]: no {config}; create a project with `bfc init <name>`", file=sys.stderr
-        )
+        print(f"[bold red]✘ ERROR[/bold red]: no {config}; create a project with `bfc init <name>`", file=sys.stderr)
         raise typer.Exit(1) from None
     except versioning.VersionError as error:
-        print(f"[bold red]✘ ERROR[/bold red]: {error}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     if new is None:
         typer.echo(current if short else f"{name} {current}")
@@ -172,7 +201,7 @@ def traverse(  # noqa: PLR0913 - each argument is a command-line option
     try:
         modules = traverse_headers(paths, include_dirs or [], clang_args or [])
     except TraverseError as error:
-        print(f"[bold red]✘ ERROR[/bold red]: {error}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
 
     data = yaml.safe_load(config.read_text()) or {}
@@ -180,13 +209,13 @@ def traverse(  # noqa: PLR0913 - each argument is a command-line option
     try:
         Project(Config(**updated))  # declares every extern, as a build would
     except Exception as error:  # noqa: BLE001 - any failure means the result must not be written
-        print(f"[bold red]✘ ERROR[/bold red]: the generated externs do not load: {error}", file=sys.stderr)
+        print(f"[bold red]✘ ERROR[/bold red]: the generated externs do not load: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
 
     for module in modules:
         if module.error is not None:
             print(f"[bold yellow]! {module.module}[/bold yellow] ({module.header.name}): not parsed, left unchanged")
-            print(f"[dim]{module.error}[/dim]")
+            print(f"[dim]{escape(str(module.error))}[/dim]")
             continue
         after = f", parsed after {', '.join(h.name for h in module.context)}" if module.context else ""
         print(
@@ -194,7 +223,7 @@ def traverse(  # noqa: PLR0913 - each argument is a command-line option
             f"{len(module.structs)} structs, {len(module.skipped)} skipped"
         )
         for skipped in module.skipped if verbose else []:
-            print(f"  [dim]skipped {skipped.name}: {skipped.reason}[/dim]")
+            print(f"  [dim]skipped {skipped.name}: {escape(skipped.reason)}[/dim]")
     if not verbose and any(module.skipped for module in modules):
         print("[dim]Use --verbose to see why each declaration was skipped.[/dim]")
     if dry_run:

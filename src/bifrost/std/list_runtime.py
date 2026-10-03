@@ -46,6 +46,10 @@ def c_memcpy(target: ptr, source: ptr, size: u64) -> ptr: ...
 def c_strlen(text: cstr) -> u64: ...
 
 
+@runtime.extern(name="strcmp")
+def c_strcmp(first: cstr, second: cstr) -> i32: ...
+
+
 @runtime.extern(name="write")
 def c_write(descriptor: i32, data: cstr, size: u64) -> i64: ...
 
@@ -74,6 +78,18 @@ def bifrost_list_new(length: i64, size: i64) -> ptr:
 @runtime.function
 def bifrost_list_length(items: ptr) -> i64:
     return (Ptr[i64](items) - 2)[0]
+
+
+@runtime.function
+def bifrost_list_set_length(items: ptr, length: i64) -> None:
+    """Keep the first ``length`` items written (at most its capacity), as ``filter`` does."""
+    (Ptr[i64](items) - 2)[0] = length
+
+
+@runtime.function
+def bifrost_string_compare(first: cstr, second: cstr) -> i32:
+    """Order two strings as C's ``strcmp`` does: negative, zero (equal), or positive."""
+    return c_strcmp(first, second)
 
 
 @runtime.function
@@ -142,6 +158,21 @@ def bifrost_string_copy(text: cstr) -> cstr:
 @runtime.function
 def bifrost_string_free(text: cstr) -> None:
     c_free(text)
+
+
+@runtime.function
+def bifrost_env_new(size: i64) -> ptr:
+    """Allocate what a closure captured (see ``bifrost.owned.closure_of``); out of memory stops the program."""
+    found = c_malloc(u64(size))
+    if found == ptr(0):
+        bifrost_list_fail("out of memory\n")
+    return found
+
+
+@runtime.function
+def bifrost_env_free(env: ptr) -> None:
+    """Free what a closure captured (what its captures own is freed first, by its drop function)."""
+    c_free(env)
 
 
 @runtime.function

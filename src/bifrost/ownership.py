@@ -74,6 +74,8 @@ class Oracle:
     copy: Callable[[Node], str] = lambda _: ""  # how to write a copy of this expression, if it can be copied
     constructs: Callable[[Node], bool] = lambda _: False  # does this call build an object (its arguments move in)?
     changes: Callable[[Node], bool] = lambda _: False  # does this call (`a.f(x)`) change the object it is called on?
+    lent_arguments: Callable[[Node], set[int]] = lambda _: set()  # which positional arguments go to a mem.Weak?
+    function_value: Callable[[Node], bool] = lambda _: False  # a lambda, or a function named as a value: a new closure
     # Called at each `let` (and `forall`) before what follows is checked, so that
     # the types of later expressions, which the checks above ask about, are known.
     bind: Callable[[str, Node], None] = lambda _name, _node: None
@@ -188,6 +190,7 @@ class _Checker:
         self.parameters = parameters
         self.guards: dict[str, str] = {}  # guard -> the local it locks
         self.lent: set[str] = set()  # the mem.Weak parameters
+        self.captured: set[str] = set()  # a lambda's captured locals
 
     # -- statements -------------------------------------------------------------
 
@@ -467,11 +470,13 @@ class _Checker:
     # -- expressions ------------------------------------------------------------
 
     def fresh(self, node: Node) -> bool:
-        """Whether an expression makes a new list, or a new record or object holding one."""
+        """Whether an expression makes a new list, closure, or record or object holding one."""
         core = _awaited(node)
+        if self.oracle.function_value(core):
+            return True
         if core.type == "literal":
             inner = _named(core)[0]
-            return inner.type == "list" or (inner.type == "record" and self.oracle.owned_value(core))
+            return inner.type == "list" or (inner.type in {"record", "string"} and self.oracle.owned_value(core))
         if core.type == "get_expression" and _named(core)[1].type in {"spread_between", "rest_of", "spread_action"}:
             return True  # a slice: a new list
         # `await f()` has the type of what it waits for.
@@ -480,6 +485,10 @@ class _Checker:
     def keep(self, node: Node, state: _State) -> None:
         """Check a list, record or object that is kept (bound, returned, or put in another): what it holds moves in."""
         core = _awaited(node)
+        string = core.type == "literal" and _named(core)[0].type == "string" and self.fresh(core)
+        if self.oracle.function_value(core) or string:
+            self.expression(core, state)  # a new closure, or string (`"Hi {name}"`): its values are read
+            return
         if core.type == "identifier" and _text(core) in state.alive:
             self.move(core, state, core)
             return
@@ -531,7 +540,9 @@ class _Checker:
         root = _root(node)
         if root is not None and root in state.moved and root not in state.alive:
             return f"{root} was moved on line {_line(state.moved[root])}, so it is no longer here"
-        if node.type == "identifier" and root in self.parameters:
+        if node.type == "identifier" and root in self.captured:
+            source = f"{text} is what this lambda captured, which its closure keeps"
+        elif node.type == "identifier" and root in self.parameters:
             source = f"{text} is a parameter, lent by the caller"
         elif node.type == "identifier" and root in state.views:
             source = f"{text} reads from {state.views[root][0]}"
@@ -566,7 +577,8 @@ class _Checker:
             return
         node = _unwrap(node)
         if node.type == "local_function_definition":
-            return  # a lambda is a function of its own, checked when it is lowered
+            self.captures(node, state)  # its body is a function of its own, checked when it is lowered
+            return
         arguments = _call_arguments(node)
         if arguments is not None:
             self.call(node, arguments, state, owned=owned)
@@ -577,6 +589,31 @@ class _Checker:
         else:
             for child in _named(node):
                 self.expression(child, state)
+
+    def captures(self, node: Node, state: _State) -> None:
+        """Check what a lambda captures: copies of the locals its dependency list names (an owned one moves in).
+
+        A view or a parameter of an owned type is not this function's to give; capturing one
+        asks for a copy.
+        """
+        listed = _named(node)[0] if _named(node) and _named(node)[0].type == "local_dependency_list" else None
+        for entry in _named(listed) if listed is not None else []:
+            name = _text(entry)
+            if name in state.alive:
+                self.move(entry, state, entry)
+            elif name in state.views or (
+                name in self.parameters and name not in self.lent and self.oracle.owned_value(entry)
+            ):  # a mem.Weak is reported where the lambda is lowered
+                copy = self.oracle.copy(entry)
+                how = f"; capture a copy: `let mine = {copy}`, then [mine]" if copy else " (it cannot be copied yet)"
+                source = (
+                    f"{name} reads from {state.views[name][0]}"
+                    if name in state.views
+                    else (f"{name} is a parameter, lent by the caller")
+                )
+                raise OwnershipError(entry, f"{source}, so a lambda cannot capture it{how}")
+            else:
+                self.name(entry, state)
 
     def chain(self, node: Node, state: _State) -> None:
         """Check ``a.b.f(x)`` or ``users[0].name``: what it starts from, and the arguments of its calls."""
@@ -599,6 +636,12 @@ class _Checker:
             )
             raise OwnershipError(node, msg)
         moved = self.oracle.moved_arguments(node)
+        callee = _text(node).split("(")[0]
+        for index in self.oracle.lent_arguments(node):
+            inner = _unwrap(arguments[index]) if index < len(arguments) else None
+            if inner is not None and _root(inner) is not None:
+                what = f"{callee} is lent {_text(inner)} (a mem.Weak, which it may change)"
+                self.lending(inner, _root(inner), state, what)
         for index, argument in enumerate(arguments):
             inner = _unwrap(argument)
             if index in moved and inner.type == "identifier" and _text(inner) in state.alive:
@@ -618,26 +661,34 @@ class _Checker:
         """Check that the object ``node`` calls a changing method on (which may replace its lists) is ours."""
         first = _named(node)[0]
         root = _text(first) if first.type == "simple_identifier" else _root(first)
+        call = _named(_named(node)[-1])[0]
+        method = _text(call.child_by_field_name("function") or call)
+        self.lending(first, root, state, f"{method} changes its object", f"g[i].{method}()")
+
+    def lending(self, first: Node, root: str | None, state: _State, action: str, example: str = "") -> None:
+        """Check that what ``first`` reads, lent to a call that may change it (``action``), is ours to change.
+
+        Nothing may read its lists meanwhile; a view or a copy (a parameter, ``super``
+        in a method that reads it) cannot be lent, since no one would see the change.
+        """
         owner = self.owner(root, state)
         source = self.guards.get(root, root) if root is not None else None
         if owner is not None:
-            self.unused(owner, state, node, "changed")
+            self.unused(owner, state, first, "changed")
             return
-        call = _named(_named(node)[-1])[0]
-        method = _text(call.child_by_field_name("function") or call)
         if source == "super":
-            msg = f"{method} changes its object, but this method reads super as a copy; lock super here to change it"
-            raise OwnershipError(first, msg)
-        if source in state.views:
-            msg = (
-                f"{method} changes its object, but {source} is a view of {state.views[source][0]} (a copy of an item); "
-                f"change it through a guard on {state.views[source][0]}, like g[i].{method}()"
+            raise OwnershipError(
+                first, f"{action}, but this method reads super as a copy; lock super here to change it"
             )
-            raise OwnershipError(first, msg)
+        if source in state.views:
+            item = state.views[source][0]
+            like = f", like {example}" if example else ""
+            msg = f"{action}, but {source} is a view of {item} (a copy of an item); change it through a guard on {item}"
+            raise OwnershipError(first, msg + like)
         if source in self.parameters:
             msg = (
-                f"{method} changes its object, but {source} is a copy given to this function, so its caller would "
-                f"not see the change; take it as a mem.Weak to change the caller's"
+                f"{action}, but {source} is a parameter, which this function may not change (a copy, or its "
+                "caller's list); take it as a mem.Weak to change the caller's"
             )
             raise OwnershipError(first, msg)
 
@@ -653,13 +704,14 @@ def check(
     owned_parameters: set[str],
     oracle: Oracle,
     cell_parameters: set[str] = frozenset(),
-    parameters: dict[str, bool] | None = None,
+    parameters: dict[str, str] | None = None,
 ) -> Plan:
     """Check the owned values in a function ``body``; return where the lowering frees them.
 
     ``cell_parameters`` are the ``mem.Shared`` and ``mem.Atomic`` parameters,
     which ``let`` copies rather than moves; ``parameters`` are all of them
-    (lent by the caller, for messages), each with whether it is a ``mem.Weak``.
+    (lent by the caller, for messages), each ``"weak"`` (a ``mem.Weak``), ``"lent"``,
+    or ``"captured"`` (a lambda's captured local, which its closure keeps and lends it).
 
     Raises:
         OwnershipError: At the first rule broken.
@@ -667,7 +719,8 @@ def check(
     """
     parameters = parameters or {}
     checker = _Checker(oracle, cell_parameters, set(parameters))
-    checker.lent = {name for name, weak in parameters.items() if weak}
+    checker.lent = {name for name, kind in parameters.items() if kind == "weak"}
+    checker.captured = {name for name, kind in parameters.items() if kind == "captured"}
     if body.type != "block_expression":
         if owned_parameters:
             raise OwnershipError(body, "a function taking a mem.Unique[str] needs a block body, to free it")

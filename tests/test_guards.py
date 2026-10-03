@@ -121,8 +121,12 @@ def test_valid_guards(tmp_path: Path, source: str) -> None:
             "c is a mem.Unique: lend it to a call or lock it",
         ),
         (
-            "let g = (c: mem.Weak[C]) => null {}\nlet f = [g] () => null {\n    let c = C(n: 1)\n    g(c)\n}\n",
-            "c is not owned; declare it `let c: mem.Unique[...] = ...` to lend it",
+            "let g = (c: mem.Weak[C]) => null {}\nlet f = [g] () => null {\n    let n = 1\n    g(n)\n}\n",
+            "n is an i64, but this parameter takes a mem.Weak[C]",
+        ),
+        (
+            "let g = (c: mem.Weak[C]) => null {}\nlet f = [g] (c: C) => null {\n    g(c)\n}\n",
+            "g is lent c (a mem.Weak, which it may change), but c is a parameter, which this function may not change",
         ),
         ("let f = () => null {\n    let c = C(n: 1)\n    c.n = 2\n}\n", "fields change only through a guard"),
         ("let f = (c: mem.Weak[C]) => null {\n    let g <- c\n    let h = g\n    g -> c\n}\n", "g is a guard"),

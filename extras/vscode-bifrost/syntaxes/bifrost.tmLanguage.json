@@ -78,6 +78,45 @@
 			"end": "\"",
 			"patterns": [
 				{
+					"comment": "{{ and }}: braces in the text",
+					"name": "constant.character.escape.bifrost",
+					"match": "\\{\\{|\\}\\}"
+				},
+				{
+					"comment": "{value} or {value:spec}: a value interpolated into the string",
+					"name": "meta.interpolation.bifrost",
+					"begin": "\\{",
+					"beginCaptures": {
+						"0": {
+							"name": "punctuation.section.interpolation.begin.bifrost"
+						}
+					},
+					"end": "\\}",
+					"endCaptures": {
+						"0": {
+							"name": "punctuation.section.interpolation.end.bifrost"
+						}
+					},
+					"contentName": "source.bifrost.embedded",
+					"patterns": [
+						{
+							"comment": "a printf conversion for the value: {price:.2f}",
+							"match": "(:)([^}\"]*)(?=\\})",
+							"captures": {
+								"1": {
+									"name": "punctuation.separator.format.bifrost"
+								},
+								"2": {
+									"name": "constant.other.placeholder.bifrost"
+								}
+							}
+						},
+						{
+							"include": "$self"
+						}
+					]
+				},
+				{
 					"comment": "printf-style placeholders, as fmt.format and stdio.printf read them: %s, %d, %.2f, %-5d, %lld, %%",
 					"name": "constant.other.placeholder.bifrost",
 					"match": "%(?:%|[-+ #0]*(?:\\d+|\\*)?(?:\\.(?:\\d+|\\*))?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfFgGaAcspn])"

@@ -2,8 +2,8 @@
 #   libh2o-evloop.a   h2o (HTTP/1.1, HTTP/2, HTTP/3), fetched at a pinned commit
 #   libbifrost_http.a c/http.c, the fasthttp-style API Bifrost calls
 #
-#   cmake -B build -G Ninja && cmake --build build --target bifrost_http
-cmake_minimum_required(VERSION 3.14)
+#   cmake -B build -G Ninja && cmake --build build
+cmake_minimum_required(VERSION 3.28)
 project(bifrost_http C)
 
 include(FetchContent)
@@ -11,9 +11,12 @@ set(FETCHCONTENT_QUIET OFF)
 
 FetchContent_Declare(
   h2o
-  GIT_REPOSITORY https://github.com/h2o/h2o.git
-  # h2o has no tagged release with HTTP/3; this is master of 2026-09-10.
-  GIT_TAG cac7e6568ad98a848f099ecd0a18b881f632479a
+  # h2o has no tagged release with HTTP/3; this is master of 2026-09-10, as a tarball.
+  URL https://github.com/h2o/h2o/archive/cac7e6568ad98a848f099ecd0a18b881f632479a.tar.gz
+  URL_HASH SHA256=be4a7792211ab0d70513e5a2eea4e360b223dd1f8e43af4eacac214d1fba011b
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  # Only what bifrost_http needs (libh2o-evloop) builds: not h2o's server, tools and tests.
+  EXCLUDE_FROM_ALL
 )
 
 set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)

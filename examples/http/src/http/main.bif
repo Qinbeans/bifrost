@@ -2,7 +2,7 @@ let http = import("http")
 let mem = import("std:mem")
 let state = import("http.state:state")
 let add = import("http.api.add:api")
-let health = import("http.api.health:api")
+let handlers = import("http_server.handlers:handlers")
 let hello = import("http.api.hello:api")
 let echo = import("http.api.echo:api")
 let hits = import("http.api.hits:api")
@@ -16,7 +16,7 @@ let main = [
     http.post,
     http.get_with,
     http.run_with,
-    health.health,
+    handlers.health,
     hello.hello,
     add.add,
     echo.echo,
@@ -28,7 +28,7 @@ let main = [
     http.post_with
 ] () => i32 {
     let app = http.app()
-    http.get(app, "/health", health.health)
+    http.get(app, "/health", handlers.health)
     http.get(app, "/hello/:name", hello.hello)
     http.get(app, "/add", add.add)
     http.post(app, "/echo", echo.echo)

@@ -1,0 +1,5776 @@
+package:
+  name: raylib
+  version: 0.1.0
+  build: library
+  description: raylib 6.0 for Bifrost, a library for games and graphics (https://www.raylib.com)
+
+flags:
+  optimization: 2
+  linker: clang
+
+# Built by CMake first (see CMakeLists.txt): cmake -S . -B build && cmake --build build
+libraries:
+  - ./build/lib/libraylib.a
+  - m
+
+externs:
+  - module: raylib
+    description: Raylib module
+    declarations:
+      - name: Vector2
+        type: struct
+        fields:
+          x: f32
+          y: f32
+      - name: Vector3
+        type: struct
+        fields:
+          x: f32
+          y: f32
+          z: f32
+      - name: Vector4
+        type: struct
+        fields:
+          x: f32
+          y: f32
+          z: f32
+          w: f32
+      - name: Matrix
+        type: struct
+        fields:
+          m0: f32
+          m4: f32
+          m8: f32
+          m12: f32
+          m1: f32
+          m5: f32
+          m9: f32
+          m13: f32
+          m2: f32
+          m6: f32
+          m10: f32
+          m14: f32
+          m3: f32
+          m7: f32
+          m11: f32
+          m15: f32
+      - name: Color
+        type: struct
+        fields:
+          r: u8
+          g: u8
+          b: u8
+          a: u8
+      - name: Rectangle
+        type: struct
+        fields:
+          x: f32
+          y: f32
+          width: f32
+          height: f32
+      - name: Image
+        type: struct
+        fields:
+          data: ptr
+          width: i32
+          height: i32
+          mipmaps: i32
+          format: i32
+      - name: Texture
+        type: struct
+        fields:
+          id: u32
+          width: i32
+          height: i32
+          mipmaps: i32
+          format: i32
+      - name: RenderTexture
+        type: struct
+        fields:
+          id: u32
+          texture: raylib_Texture
+          depth: raylib_Texture
+      - name: NPatchInfo
+        type: struct
+        fields:
+          source: raylib_Rectangle
+          left: i32
+          top: i32
+          right: i32
+          bottom: i32
+          layout: i32
+      - name: GlyphInfo
+        type: struct
+        fields:
+          value: i32
+          offsetX: i32
+          offsetY: i32
+          advanceX: i32
+          image: raylib_Image
+      - name: Font
+        type: struct
+        fields:
+          baseSize: i32
+          glyphCount: i32
+          glyphPadding: i32
+          texture: raylib_Texture
+          recs: ptr
+          glyphs: ptr
+      - name: Camera3D
+        type: struct
+        fields:
+          position: raylib_Vector3
+          target: raylib_Vector3
+          up: raylib_Vector3
+          fovy: f32
+          projection: i32
+      - name: Camera2D
+        type: struct
+        fields:
+          offset: raylib_Vector2
+          target: raylib_Vector2
+          rotation: f32
+          zoom: f32
+      - name: Mesh
+        type: struct
+        fields:
+          vertexCount: i32
+          triangleCount: i32
+          vertices: ptr
+          texcoords: ptr
+          texcoords2: ptr
+          normals: ptr
+          tangents: ptr
+          colors: ptr
+          indices: ptr
+          boneCount: i32
+          boneIndices: ptr
+          boneWeights: ptr
+          animVertices: ptr
+          animNormals: ptr
+          vaoId: u32
+          vboId: ptr
+      - name: Shader
+        type: struct
+        fields:
+          id: u32
+          locs: ptr
+      - name: MaterialMap
+        type: struct
+        fields:
+          texture: raylib_Texture
+          color: raylib_Color
+          value: f32
+      - name: Transform
+        type: struct
+        fields:
+          translation: raylib_Vector3
+          rotation: raylib_Vector4
+          scale: raylib_Vector3
+      - name: ModelSkeleton
+        type: struct
+        fields:
+          boneCount: i32
+          bones: ptr
+          bindPose: ptr
+      - name: Model
+        type: struct
+        fields:
+          transform: raylib_Matrix
+          meshCount: i32
+          materialCount: i32
+          meshes: ptr
+          materials: ptr
+          meshMaterial: ptr
+          skeleton: raylib_ModelSkeleton
+          currentPose: ptr
+          boneMatrices: ptr
+      - name: Ray
+        type: struct
+        fields:
+          position: raylib_Vector3
+          direction: raylib_Vector3
+      - name: RayCollision
+        type: struct
+        fields:
+          hit: bool
+          distance: f32
+          point: raylib_Vector3
+          normal: raylib_Vector3
+      - name: BoundingBox
+        type: struct
+        fields:
+          min: raylib_Vector3
+          max: raylib_Vector3
+      - name: Wave
+        type: struct
+        fields:
+          frameCount: u32
+          sampleRate: u32
+          sampleSize: u32
+          channels: u32
+          data: ptr
+      - name: AudioStream
+        type: struct
+        fields:
+          buffer: ptr
+          processor: ptr
+          sampleRate: u32
+          sampleSize: u32
+          channels: u32
+      - name: Sound
+        type: struct
+        fields:
+          stream: raylib_AudioStream
+          frameCount: u32
+      - name: Music
+        type: struct
+        fields:
+          stream: raylib_AudioStream
+          frameCount: u32
+          looping: bool
+          ctxType: i32
+          ctxData: ptr
+      - name: FilePathList
+        type: struct
+        fields:
+          count: u32
+          paths: ptr
+      - name: AutomationEventList
+        type: struct
+        fields:
+          capacity: u32
+          count: u32
+          events: ptr
+      - name: InitWindow
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          title: cstr
+        return: None
+      - name: CloseWindow
+        type: function
+        parameters: {}
+        return: None
+      - name: WindowShouldClose
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowReady
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowFullscreen
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowHidden
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowMinimized
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowMaximized
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowFocused
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowResized
+        type: function
+        parameters: {}
+        return: bool
+      - name: IsWindowState
+        type: function
+        parameters:
+          flag: u32
+        return: bool
+      - name: SetWindowState
+        type: function
+        parameters:
+          flags: u32
+        return: None
+      - name: ClearWindowState
+        type: function
+        parameters:
+          flags: u32
+        return: None
+      - name: ToggleFullscreen
+        type: function
+        parameters: {}
+        return: None
+      - name: ToggleBorderlessWindowed
+        type: function
+        parameters: {}
+        return: None
+      - name: MaximizeWindow
+        type: function
+        parameters: {}
+        return: None
+      - name: MinimizeWindow
+        type: function
+        parameters: {}
+        return: None
+      - name: RestoreWindow
+        type: function
+        parameters: {}
+        return: None
+      - name: SetWindowIcon
+        type: function
+        parameters:
+          image: raylib_Image
+        return: None
+      - name: SetWindowIcons
+        type: function
+        parameters:
+          images: ptr
+          count: i32
+        return: None
+      - name: SetWindowTitle
+        type: function
+        parameters:
+          title: cstr
+        return: None
+      - name: SetWindowPosition
+        type: function
+        parameters:
+          x: i32
+          y: i32
+        return: None
+      - name: SetWindowMonitor
+        type: function
+        parameters:
+          monitor: i32
+        return: None
+      - name: SetWindowMinSize
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: None
+      - name: SetWindowMaxSize
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: None
+      - name: SetWindowSize
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: None
+      - name: SetWindowOpacity
+        type: function
+        parameters:
+          opacity: f32
+        return: None
+      - name: SetWindowFocused
+        type: function
+        parameters: {}
+        return: None
+      - name: GetWindowHandle
+        type: function
+        parameters: {}
+        return: ptr
+      - name: GetScreenWidth
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetScreenHeight
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetRenderWidth
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetRenderHeight
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetMonitorCount
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetCurrentMonitor
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetMonitorPosition
+        type: function
+        parameters:
+          monitor: i32
+        return: raylib_Vector2
+      - name: GetMonitorWidth
+        type: function
+        parameters:
+          monitor: i32
+        return: i32
+      - name: GetMonitorHeight
+        type: function
+        parameters:
+          monitor: i32
+        return: i32
+      - name: GetMonitorPhysicalWidth
+        type: function
+        parameters:
+          monitor: i32
+        return: i32
+      - name: GetMonitorPhysicalHeight
+        type: function
+        parameters:
+          monitor: i32
+        return: i32
+      - name: GetMonitorRefreshRate
+        type: function
+        parameters:
+          monitor: i32
+        return: i32
+      - name: GetWindowPosition
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: GetWindowScaleDPI
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: GetMonitorName
+        type: function
+        parameters:
+          monitor: i32
+        return: cstr
+      - name: SetClipboardText
+        type: function
+        parameters:
+          text: cstr
+        return: None
+      - name: GetClipboardText
+        type: function
+        parameters: {}
+        return: cstr
+      - name: GetClipboardImage
+        type: function
+        parameters: {}
+        return: raylib_Image
+      - name: EnableEventWaiting
+        type: function
+        parameters: {}
+        return: None
+      - name: DisableEventWaiting
+        type: function
+        parameters: {}
+        return: None
+      - name: ShowCursor
+        type: function
+        parameters: {}
+        return: None
+      - name: HideCursor
+        type: function
+        parameters: {}
+        return: None
+      - name: IsCursorHidden
+        type: function
+        parameters: {}
+        return: bool
+      - name: EnableCursor
+        type: function
+        parameters: {}
+        return: None
+      - name: DisableCursor
+        type: function
+        parameters: {}
+        return: None
+      - name: IsCursorOnScreen
+        type: function
+        parameters: {}
+        return: bool
+      - name: ClearBackground
+        type: function
+        parameters:
+          color: raylib_Color
+        return: None
+      - name: BeginDrawing
+        type: function
+        parameters: {}
+        return: None
+      - name: EndDrawing
+        type: function
+        parameters: {}
+        return: None
+      - name: BeginMode2D
+        type: function
+        parameters:
+          camera: raylib_Camera2D
+        return: None
+      - name: EndMode2D
+        type: function
+        parameters: {}
+        return: None
+      - name: BeginMode3D
+        type: function
+        parameters:
+          camera: raylib_Camera3D
+        return: None
+      - name: EndMode3D
+        type: function
+        parameters: {}
+        return: None
+      - name: BeginTextureMode
+        type: function
+        parameters:
+          target: raylib_RenderTexture
+        return: None
+      - name: EndTextureMode
+        type: function
+        parameters: {}
+        return: None
+      - name: BeginShaderMode
+        type: function
+        parameters:
+          shader: raylib_Shader
+        return: None
+      - name: EndShaderMode
+        type: function
+        parameters: {}
+        return: None
+      - name: BeginBlendMode
+        type: function
+        parameters:
+          mode: i32
+        return: None
+      - name: EndBlendMode
+        type: function
+        parameters: {}
+        return: None
+      - name: BeginScissorMode
+        type: function
+        parameters:
+          x: i32
+          y: i32
+          width: i32
+          height: i32
+        return: None
+      - name: EndScissorMode
+        type: function
+        parameters: {}
+        return: None
+      - name: EndVrStereoMode
+        type: function
+        parameters: {}
+        return: None
+      - name: LoadShader
+        type: function
+        parameters:
+          vsFileName: cstr
+          fsFileName: cstr
+        return: raylib_Shader
+      - name: LoadShaderFromMemory
+        type: function
+        parameters:
+          vsCode: cstr
+          fsCode: cstr
+        return: raylib_Shader
+      - name: IsShaderValid
+        type: function
+        parameters:
+          shader: raylib_Shader
+        return: bool
+      - name: GetShaderLocation
+        type: function
+        parameters:
+          shader: raylib_Shader
+          uniformName: cstr
+        return: i32
+      - name: GetShaderLocationAttrib
+        type: function
+        parameters:
+          shader: raylib_Shader
+          attribName: cstr
+        return: i32
+      - name: SetShaderValue
+        type: function
+        parameters:
+          shader: raylib_Shader
+          locIndex: i32
+          value: ptr
+          uniformType: i32
+        return: None
+      - name: SetShaderValueV
+        type: function
+        parameters:
+          shader: raylib_Shader
+          locIndex: i32
+          value: ptr
+          uniformType: i32
+          count: i32
+        return: None
+      - name: SetShaderValueMatrix
+        type: function
+        parameters:
+          shader: raylib_Shader
+          locIndex: i32
+          mat: raylib_Matrix
+        return: None
+      - name: SetShaderValueTexture
+        type: function
+        parameters:
+          shader: raylib_Shader
+          locIndex: i32
+          texture: raylib_Texture
+        return: None
+      - name: UnloadShader
+        type: function
+        parameters:
+          shader: raylib_Shader
+        return: None
+      - name: GetScreenToWorldRay
+        type: function
+        parameters:
+          position: raylib_Vector2
+          camera: raylib_Camera3D
+        return: raylib_Ray
+      - name: GetScreenToWorldRayEx
+        type: function
+        parameters:
+          position: raylib_Vector2
+          camera: raylib_Camera3D
+          width: i32
+          height: i32
+        return: raylib_Ray
+      - name: GetWorldToScreen
+        type: function
+        parameters:
+          position: raylib_Vector3
+          camera: raylib_Camera3D
+        return: raylib_Vector2
+      - name: GetWorldToScreenEx
+        type: function
+        parameters:
+          position: raylib_Vector3
+          camera: raylib_Camera3D
+          width: i32
+          height: i32
+        return: raylib_Vector2
+      - name: GetWorldToScreen2D
+        type: function
+        parameters:
+          position: raylib_Vector2
+          camera: raylib_Camera2D
+        return: raylib_Vector2
+      - name: GetScreenToWorld2D
+        type: function
+        parameters:
+          position: raylib_Vector2
+          camera: raylib_Camera2D
+        return: raylib_Vector2
+      - name: GetCameraMatrix
+        type: function
+        parameters:
+          camera: raylib_Camera3D
+        return: raylib_Matrix
+      - name: GetCameraMatrix2D
+        type: function
+        parameters:
+          camera: raylib_Camera2D
+        return: raylib_Matrix
+      - name: SetTargetFPS
+        type: function
+        parameters:
+          fps: i32
+        return: None
+      - name: GetFrameTime
+        type: function
+        parameters: {}
+        return: f32
+      - name: GetTime
+        type: function
+        parameters: {}
+        return: f64
+      - name: GetFPS
+        type: function
+        parameters: {}
+        return: i32
+      - name: SwapScreenBuffer
+        type: function
+        parameters: {}
+        return: None
+      - name: PollInputEvents
+        type: function
+        parameters: {}
+        return: None
+      - name: WaitTime
+        type: function
+        parameters:
+          seconds: f64
+        return: None
+      - name: SetRandomSeed
+        type: function
+        parameters:
+          seed: u32
+        return: None
+      - name: GetRandomValue
+        type: function
+        parameters:
+          min: i32
+          max: i32
+        return: i32
+      - name: LoadRandomSequence
+        type: function
+        parameters:
+          count: u32
+          min: i32
+          max: i32
+        return: ptr
+      - name: UnloadRandomSequence
+        type: function
+        parameters:
+          sequence: ptr
+        return: None
+      - name: TakeScreenshot
+        type: function
+        parameters:
+          fileName: cstr
+        return: None
+      - name: SetConfigFlags
+        type: function
+        parameters:
+          flags: u32
+        return: None
+      - name: OpenURL
+        type: function
+        parameters:
+          url: cstr
+        return: None
+      - name: SetTraceLogLevel
+        type: function
+        parameters:
+          logLevel: i32
+        return: None
+      - name: SetTraceLogCallback
+        type: function
+        parameters:
+          callback: ptr
+        return: None
+      - name: MemAlloc
+        type: function
+        parameters:
+          size: u32
+        return: ptr
+      - name: MemRealloc
+        type: function
+        parameters:
+          ptr: ptr
+          size: u32
+        return: ptr
+      - name: MemFree
+        type: function
+        parameters:
+          ptr: ptr
+        return: None
+      - name: LoadFileData
+        type: function
+        parameters:
+          fileName: cstr
+          dataSize: ptr
+        return: ptr
+      - name: UnloadFileData
+        type: function
+        parameters:
+          data: ptr
+        return: None
+      - name: SaveFileData
+        type: function
+        parameters:
+          fileName: cstr
+          data: ptr
+          dataSize: i32
+        return: bool
+      - name: ExportDataAsCode
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+          fileName: cstr
+        return: bool
+      - name: LoadFileText
+        type: function
+        parameters:
+          fileName: cstr
+        return: ptr
+      - name: UnloadFileText
+        type: function
+        parameters:
+          text: ptr
+        return: None
+      - name: SaveFileText
+        type: function
+        parameters:
+          fileName: cstr
+          text: cstr
+        return: bool
+      - name: SetLoadFileDataCallback
+        type: function
+        parameters:
+          callback: ptr
+        return: None
+      - name: SetSaveFileDataCallback
+        type: function
+        parameters:
+          callback: ptr
+        return: None
+      - name: SetLoadFileTextCallback
+        type: function
+        parameters:
+          callback: ptr
+        return: None
+      - name: SetSaveFileTextCallback
+        type: function
+        parameters:
+          callback: ptr
+        return: None
+      - name: FileRename
+        type: function
+        parameters:
+          fileName: cstr
+          fileRename: cstr
+        return: i32
+      - name: FileRemove
+        type: function
+        parameters:
+          fileName: cstr
+        return: i32
+      - name: FileCopy
+        type: function
+        parameters:
+          srcPath: cstr
+          dstPath: cstr
+        return: i32
+      - name: FileMove
+        type: function
+        parameters:
+          srcPath: cstr
+          dstPath: cstr
+        return: i32
+      - name: FileTextReplace
+        type: function
+        parameters:
+          fileName: cstr
+          search: cstr
+          replacement: cstr
+        return: i32
+      - name: FileTextFindIndex
+        type: function
+        parameters:
+          fileName: cstr
+          search: cstr
+        return: i32
+      - name: FileExists
+        type: function
+        parameters:
+          fileName: cstr
+        return: bool
+      - name: DirectoryExists
+        type: function
+        parameters:
+          dirPath: cstr
+        return: bool
+      - name: IsFileExtension
+        type: function
+        parameters:
+          fileName: cstr
+          ext: cstr
+        return: bool
+      - name: GetFileLength
+        type: function
+        parameters:
+          fileName: cstr
+        return: i32
+      - name: GetFileModTime
+        type: function
+        parameters:
+          fileName: cstr
+        return: i64
+      - name: GetFileExtension
+        type: function
+        parameters:
+          fileName: cstr
+        return: cstr
+      - name: GetFileName
+        type: function
+        parameters:
+          filePath: cstr
+        return: cstr
+      - name: GetFileNameWithoutExt
+        type: function
+        parameters:
+          filePath: cstr
+        return: cstr
+      - name: GetDirectoryPath
+        type: function
+        parameters:
+          filePath: cstr
+        return: cstr
+      - name: GetPrevDirectoryPath
+        type: function
+        parameters:
+          dirPath: cstr
+        return: cstr
+      - name: GetWorkingDirectory
+        type: function
+        parameters: {}
+        return: cstr
+      - name: GetApplicationDirectory
+        type: function
+        parameters: {}
+        return: cstr
+      - name: MakeDirectory
+        type: function
+        parameters:
+          dirPath: cstr
+        return: i32
+      - name: ChangeDirectory
+        type: function
+        parameters:
+          dirPath: cstr
+        return: bool
+      - name: IsPathFile
+        type: function
+        parameters:
+          path: cstr
+        return: bool
+      - name: IsFileNameValid
+        type: function
+        parameters:
+          fileName: cstr
+        return: bool
+      - name: LoadDirectoryFiles
+        type: function
+        parameters:
+          dirPath: cstr
+        return: raylib_FilePathList
+      - name: LoadDirectoryFilesEx
+        type: function
+        parameters:
+          basePath: cstr
+          filter: cstr
+          scanSubdirs: bool
+        return: raylib_FilePathList
+      - name: UnloadDirectoryFiles
+        type: function
+        parameters:
+          files: raylib_FilePathList
+        return: None
+      - name: IsFileDropped
+        type: function
+        parameters: {}
+        return: bool
+      - name: LoadDroppedFiles
+        type: function
+        parameters: {}
+        return: raylib_FilePathList
+      - name: UnloadDroppedFiles
+        type: function
+        parameters:
+          files: raylib_FilePathList
+        return: None
+      - name: GetDirectoryFileCount
+        type: function
+        parameters:
+          dirPath: cstr
+        return: u32
+      - name: GetDirectoryFileCountEx
+        type: function
+        parameters:
+          basePath: cstr
+          filter: cstr
+          scanSubdirs: bool
+        return: u32
+      - name: CompressData
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+          compDataSize: ptr
+        return: ptr
+      - name: DecompressData
+        type: function
+        parameters:
+          compData: ptr
+          compDataSize: i32
+          dataSize: ptr
+        return: ptr
+      - name: EncodeDataBase64
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+          outputSize: ptr
+        return: ptr
+      - name: DecodeDataBase64
+        type: function
+        parameters:
+          text: cstr
+          outputSize: ptr
+        return: ptr
+      - name: ComputeCRC32
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+        return: u32
+      - name: ComputeMD5
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+        return: ptr
+      - name: ComputeSHA1
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+        return: ptr
+      - name: ComputeSHA256
+        type: function
+        parameters:
+          data: ptr
+          dataSize: i32
+        return: ptr
+      - name: LoadAutomationEventList
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_AutomationEventList
+      - name: UnloadAutomationEventList
+        type: function
+        parameters:
+          list: raylib_AutomationEventList
+        return: None
+      - name: ExportAutomationEventList
+        type: function
+        parameters:
+          list: raylib_AutomationEventList
+          fileName: cstr
+        return: bool
+      - name: SetAutomationEventList
+        type: function
+        parameters:
+          list: ptr
+        return: None
+      - name: SetAutomationEventBaseFrame
+        type: function
+        parameters:
+          frame: i32
+        return: None
+      - name: StartAutomationEventRecording
+        type: function
+        parameters: {}
+        return: None
+      - name: StopAutomationEventRecording
+        type: function
+        parameters: {}
+        return: None
+      - name: IsKeyPressed
+        type: function
+        parameters:
+          key: i32
+        return: bool
+      - name: IsKeyPressedRepeat
+        type: function
+        parameters:
+          key: i32
+        return: bool
+      - name: IsKeyDown
+        type: function
+        parameters:
+          key: i32
+        return: bool
+      - name: IsKeyReleased
+        type: function
+        parameters:
+          key: i32
+        return: bool
+      - name: IsKeyUp
+        type: function
+        parameters:
+          key: i32
+        return: bool
+      - name: GetKeyPressed
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetCharPressed
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetKeyName
+        type: function
+        parameters:
+          key: i32
+        return: cstr
+      - name: SetExitKey
+        type: function
+        parameters:
+          key: i32
+        return: None
+      - name: IsGamepadAvailable
+        type: function
+        parameters:
+          gamepad: i32
+        return: bool
+      - name: GetGamepadName
+        type: function
+        parameters:
+          gamepad: i32
+        return: cstr
+      - name: IsGamepadButtonPressed
+        type: function
+        parameters:
+          gamepad: i32
+          button: i32
+        return: bool
+      - name: IsGamepadButtonDown
+        type: function
+        parameters:
+          gamepad: i32
+          button: i32
+        return: bool
+      - name: IsGamepadButtonReleased
+        type: function
+        parameters:
+          gamepad: i32
+          button: i32
+        return: bool
+      - name: IsGamepadButtonUp
+        type: function
+        parameters:
+          gamepad: i32
+          button: i32
+        return: bool
+      - name: GetGamepadButtonPressed
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetGamepadAxisCount
+        type: function
+        parameters:
+          gamepad: i32
+        return: i32
+      - name: GetGamepadAxisMovement
+        type: function
+        parameters:
+          gamepad: i32
+          axis: i32
+        return: f32
+      - name: SetGamepadMappings
+        type: function
+        parameters:
+          mappings: cstr
+        return: i32
+      - name: SetGamepadVibration
+        type: function
+        parameters:
+          gamepad: i32
+          leftMotor: f32
+          rightMotor: f32
+          duration: f32
+        return: None
+      - name: IsMouseButtonPressed
+        type: function
+        parameters:
+          button: i32
+        return: bool
+      - name: IsMouseButtonDown
+        type: function
+        parameters:
+          button: i32
+        return: bool
+      - name: IsMouseButtonReleased
+        type: function
+        parameters:
+          button: i32
+        return: bool
+      - name: IsMouseButtonUp
+        type: function
+        parameters:
+          button: i32
+        return: bool
+      - name: GetMouseX
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetMouseY
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetMousePosition
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: GetMouseDelta
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: SetMousePosition
+        type: function
+        parameters:
+          x: i32
+          y: i32
+        return: None
+      - name: SetMouseOffset
+        type: function
+        parameters:
+          offsetX: i32
+          offsetY: i32
+        return: None
+      - name: SetMouseScale
+        type: function
+        parameters:
+          scaleX: f32
+          scaleY: f32
+        return: None
+      - name: GetMouseWheelMove
+        type: function
+        parameters: {}
+        return: f32
+      - name: GetMouseWheelMoveV
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: SetMouseCursor
+        type: function
+        parameters:
+          cursor: i32
+        return: None
+      - name: GetTouchX
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetTouchY
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetTouchPosition
+        type: function
+        parameters:
+          index: i32
+        return: raylib_Vector2
+      - name: GetTouchPointId
+        type: function
+        parameters:
+          index: i32
+        return: i32
+      - name: GetTouchPointCount
+        type: function
+        parameters: {}
+        return: i32
+      - name: SetGesturesEnabled
+        type: function
+        parameters:
+          flags: u32
+        return: None
+      - name: IsGestureDetected
+        type: function
+        parameters:
+          gesture: u32
+        return: bool
+      - name: GetGestureDetected
+        type: function
+        parameters: {}
+        return: i32
+      - name: GetGestureHoldDuration
+        type: function
+        parameters: {}
+        return: f32
+      - name: GetGestureDragVector
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: GetGestureDragAngle
+        type: function
+        parameters: {}
+        return: f32
+      - name: GetGesturePinchVector
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: GetGesturePinchAngle
+        type: function
+        parameters: {}
+        return: f32
+      - name: UpdateCamera
+        type: function
+        parameters:
+          camera: ptr
+          mode: i32
+        return: None
+      - name: UpdateCameraPro
+        type: function
+        parameters:
+          camera: ptr
+          movement: raylib_Vector3
+          rotation: raylib_Vector3
+          zoom: f32
+        return: None
+      - name: SetShapesTexture
+        type: function
+        parameters:
+          texture: raylib_Texture
+          source: raylib_Rectangle
+        return: None
+      - name: GetShapesTexture
+        type: function
+        parameters: {}
+        return: raylib_Texture
+      - name: GetShapesTextureRectangle
+        type: function
+        parameters: {}
+        return: raylib_Rectangle
+      - name: DrawPixel
+        type: function
+        parameters:
+          posX: i32
+          posY: i32
+          color: raylib_Color
+        return: None
+      - name: DrawPixelV
+        type: function
+        parameters:
+          position: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: DrawLine
+        type: function
+        parameters:
+          startPosX: i32
+          startPosY: i32
+          endPosX: i32
+          endPosY: i32
+          color: raylib_Color
+        return: None
+      - name: DrawLineV
+        type: function
+        parameters:
+          startPos: raylib_Vector2
+          endPos: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: DrawLineEx
+        type: function
+        parameters:
+          startPos: raylib_Vector2
+          endPos: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawLineStrip
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          color: raylib_Color
+        return: None
+      - name: DrawLineBezier
+        type: function
+        parameters:
+          startPos: raylib_Vector2
+          endPos: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawLineDashed
+        type: function
+        parameters:
+          startPos: raylib_Vector2
+          endPos: raylib_Vector2
+          dashSize: i32
+          spaceSize: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCircle
+        type: function
+        parameters:
+          centerX: i32
+          centerY: i32
+          radius: f32
+          color: raylib_Color
+        return: None
+      - name: DrawCircleV
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          color: raylib_Color
+        return: None
+      - name: DrawCircleGradient
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          inner: raylib_Color
+          outer: raylib_Color
+        return: None
+      - name: DrawCircleSector
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          startAngle: f32
+          endAngle: f32
+          segments: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCircleSectorLines
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          startAngle: f32
+          endAngle: f32
+          segments: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCircleLines
+        type: function
+        parameters:
+          centerX: i32
+          centerY: i32
+          radius: f32
+          color: raylib_Color
+        return: None
+      - name: DrawCircleLinesV
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          color: raylib_Color
+        return: None
+      - name: DrawEllipse
+        type: function
+        parameters:
+          centerX: i32
+          centerY: i32
+          radiusH: f32
+          radiusV: f32
+          color: raylib_Color
+        return: None
+      - name: DrawEllipseV
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radiusH: f32
+          radiusV: f32
+          color: raylib_Color
+        return: None
+      - name: DrawEllipseLines
+        type: function
+        parameters:
+          centerX: i32
+          centerY: i32
+          radiusH: f32
+          radiusV: f32
+          color: raylib_Color
+        return: None
+      - name: DrawEllipseLinesV
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radiusH: f32
+          radiusV: f32
+          color: raylib_Color
+        return: None
+      - name: DrawRing
+        type: function
+        parameters:
+          center: raylib_Vector2
+          innerRadius: f32
+          outerRadius: f32
+          startAngle: f32
+          endAngle: f32
+          segments: i32
+          color: raylib_Color
+        return: None
+      - name: DrawRingLines
+        type: function
+        parameters:
+          center: raylib_Vector2
+          innerRadius: f32
+          outerRadius: f32
+          startAngle: f32
+          endAngle: f32
+          segments: i32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangle
+        type: function
+        parameters:
+          posX: i32
+          posY: i32
+          width: i32
+          height: i32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleV
+        type: function
+        parameters:
+          position: raylib_Vector2
+          size: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleRec
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          color: raylib_Color
+        return: None
+      - name: DrawRectanglePro
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          origin: raylib_Vector2
+          rotation: f32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleGradientV
+        type: function
+        parameters:
+          posX: i32
+          posY: i32
+          width: i32
+          height: i32
+          top: raylib_Color
+          bottom: raylib_Color
+        return: None
+      - name: DrawRectangleGradientH
+        type: function
+        parameters:
+          posX: i32
+          posY: i32
+          width: i32
+          height: i32
+          left: raylib_Color
+          right: raylib_Color
+        return: None
+      - name: DrawRectangleGradientEx
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          topLeft: raylib_Color
+          bottomLeft: raylib_Color
+          bottomRight: raylib_Color
+          topRight: raylib_Color
+        return: None
+      - name: DrawRectangleLines
+        type: function
+        parameters:
+          posX: i32
+          posY: i32
+          width: i32
+          height: i32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleLinesEx
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          lineThick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleRounded
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          roundness: f32
+          segments: i32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleRoundedLines
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          roundness: f32
+          segments: i32
+          color: raylib_Color
+        return: None
+      - name: DrawRectangleRoundedLinesEx
+        type: function
+        parameters:
+          rec: raylib_Rectangle
+          roundness: f32
+          segments: i32
+          lineThick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawTriangle
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+          v3: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: DrawTriangleLines
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+          v3: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: DrawTriangleFan
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          color: raylib_Color
+        return: None
+      - name: DrawTriangleStrip
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          color: raylib_Color
+        return: None
+      - name: DrawPoly
+        type: function
+        parameters:
+          center: raylib_Vector2
+          sides: i32
+          radius: f32
+          rotation: f32
+          color: raylib_Color
+        return: None
+      - name: DrawPolyLines
+        type: function
+        parameters:
+          center: raylib_Vector2
+          sides: i32
+          radius: f32
+          rotation: f32
+          color: raylib_Color
+        return: None
+      - name: DrawPolyLinesEx
+        type: function
+        parameters:
+          center: raylib_Vector2
+          sides: i32
+          radius: f32
+          rotation: f32
+          lineThick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineLinear
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineBasis
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineCatmullRom
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineBezierQuadratic
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineBezierCubic
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineSegmentLinear
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineSegmentBasis
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          p3: raylib_Vector2
+          p4: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineSegmentCatmullRom
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          p3: raylib_Vector2
+          p4: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineSegmentBezierQuadratic
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          c2: raylib_Vector2
+          p3: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSplineSegmentBezierCubic
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          c2: raylib_Vector2
+          c3: raylib_Vector2
+          p4: raylib_Vector2
+          thick: f32
+          color: raylib_Color
+        return: None
+      - name: GetSplinePointLinear
+        type: function
+        parameters:
+          startPos: raylib_Vector2
+          endPos: raylib_Vector2
+          t: f32
+        return: raylib_Vector2
+      - name: GetSplinePointBasis
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          p3: raylib_Vector2
+          p4: raylib_Vector2
+          t: f32
+        return: raylib_Vector2
+      - name: GetSplinePointCatmullRom
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          p3: raylib_Vector2
+          p4: raylib_Vector2
+          t: f32
+        return: raylib_Vector2
+      - name: GetSplinePointBezierQuad
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          c2: raylib_Vector2
+          p3: raylib_Vector2
+          t: f32
+        return: raylib_Vector2
+      - name: GetSplinePointBezierCubic
+        type: function
+        parameters:
+          p1: raylib_Vector2
+          c2: raylib_Vector2
+          c3: raylib_Vector2
+          p4: raylib_Vector2
+          t: f32
+        return: raylib_Vector2
+      - name: CheckCollisionRecs
+        type: function
+        parameters:
+          rec1: raylib_Rectangle
+          rec2: raylib_Rectangle
+        return: bool
+      - name: CheckCollisionCircles
+        type: function
+        parameters:
+          center1: raylib_Vector2
+          radius1: f32
+          center2: raylib_Vector2
+          radius2: f32
+        return: bool
+      - name: CheckCollisionCircleRec
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          rec: raylib_Rectangle
+        return: bool
+      - name: CheckCollisionCircleLine
+        type: function
+        parameters:
+          center: raylib_Vector2
+          radius: f32
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+        return: bool
+      - name: CheckCollisionPointRec
+        type: function
+        parameters:
+          point: raylib_Vector2
+          rec: raylib_Rectangle
+        return: bool
+      - name: CheckCollisionPointCircle
+        type: function
+        parameters:
+          point: raylib_Vector2
+          center: raylib_Vector2
+          radius: f32
+        return: bool
+      - name: CheckCollisionPointTriangle
+        type: function
+        parameters:
+          point: raylib_Vector2
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          p3: raylib_Vector2
+        return: bool
+      - name: CheckCollisionPointLine
+        type: function
+        parameters:
+          point: raylib_Vector2
+          p1: raylib_Vector2
+          p2: raylib_Vector2
+          threshold: i32
+        return: bool
+      - name: CheckCollisionPointPoly
+        type: function
+        parameters:
+          point: raylib_Vector2
+          points: ptr
+          pointCount: i32
+        return: bool
+      - name: CheckCollisionLines
+        type: function
+        parameters:
+          startPos1: raylib_Vector2
+          endPos1: raylib_Vector2
+          startPos2: raylib_Vector2
+          endPos2: raylib_Vector2
+          collisionPoint: ptr
+        return: bool
+      - name: GetCollisionRec
+        type: function
+        parameters:
+          rec1: raylib_Rectangle
+          rec2: raylib_Rectangle
+        return: raylib_Rectangle
+      - name: LoadImage
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Image
+      - name: LoadImageRaw
+        type: function
+        parameters:
+          fileName: cstr
+          width: i32
+          height: i32
+          format: i32
+          headerSize: i32
+        return: raylib_Image
+      - name: LoadImageAnim
+        type: function
+        parameters:
+          fileName: cstr
+          frames: ptr
+        return: raylib_Image
+      - name: LoadImageAnimFromMemory
+        type: function
+        parameters:
+          fileType: cstr
+          fileData: ptr
+          dataSize: i32
+          frames: ptr
+        return: raylib_Image
+      - name: LoadImageFromMemory
+        type: function
+        parameters:
+          fileType: cstr
+          fileData: ptr
+          dataSize: i32
+        return: raylib_Image
+      - name: LoadImageFromTexture
+        type: function
+        parameters:
+          texture: raylib_Texture
+        return: raylib_Image
+      - name: LoadImageFromScreen
+        type: function
+        parameters: {}
+        return: raylib_Image
+      - name: IsImageValid
+        type: function
+        parameters:
+          image: raylib_Image
+        return: bool
+      - name: UnloadImage
+        type: function
+        parameters:
+          image: raylib_Image
+        return: None
+      - name: ExportImage
+        type: function
+        parameters:
+          image: raylib_Image
+          fileName: cstr
+        return: bool
+      - name: ExportImageToMemory
+        type: function
+        parameters:
+          image: raylib_Image
+          fileType: cstr
+          fileSize: ptr
+        return: ptr
+      - name: ExportImageAsCode
+        type: function
+        parameters:
+          image: raylib_Image
+          fileName: cstr
+        return: bool
+      - name: GenImageColor
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          color: raylib_Color
+        return: raylib_Image
+      - name: GenImageGradientLinear
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          direction: i32
+          start: raylib_Color
+          end: raylib_Color
+        return: raylib_Image
+      - name: GenImageGradientRadial
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          density: f32
+          inner: raylib_Color
+          outer: raylib_Color
+        return: raylib_Image
+      - name: GenImageGradientSquare
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          density: f32
+          inner: raylib_Color
+          outer: raylib_Color
+        return: raylib_Image
+      - name: GenImageChecked
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          checksX: i32
+          checksY: i32
+          col1: raylib_Color
+          col2: raylib_Color
+        return: raylib_Image
+      - name: GenImageWhiteNoise
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          factor: f32
+        return: raylib_Image
+      - name: GenImagePerlinNoise
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          offsetX: i32
+          offsetY: i32
+          scale: f32
+        return: raylib_Image
+      - name: GenImageCellular
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          tileSize: i32
+        return: raylib_Image
+      - name: GenImageText
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          text: cstr
+        return: raylib_Image
+      - name: ImageCopy
+        type: function
+        parameters:
+          image: raylib_Image
+        return: raylib_Image
+      - name: ImageFromImage
+        type: function
+        parameters:
+          image: raylib_Image
+          rec: raylib_Rectangle
+        return: raylib_Image
+      - name: ImageFromChannel
+        type: function
+        parameters:
+          image: raylib_Image
+          selectedChannel: i32
+        return: raylib_Image
+      - name: ImageText
+        type: function
+        parameters:
+          text: cstr
+          fontSize: i32
+          color: raylib_Color
+        return: raylib_Image
+      - name: ImageTextEx
+        type: function
+        parameters:
+          font: raylib_Font
+          text: cstr
+          fontSize: f32
+          spacing: f32
+          tint: raylib_Color
+        return: raylib_Image
+      - name: ImageFormat
+        type: function
+        parameters:
+          image: ptr
+          newFormat: i32
+        return: None
+      - name: ImageToPOT
+        type: function
+        parameters:
+          image: ptr
+          fill: raylib_Color
+        return: None
+      - name: ImageCrop
+        type: function
+        parameters:
+          image: ptr
+          crop: raylib_Rectangle
+        return: None
+      - name: ImageAlphaCrop
+        type: function
+        parameters:
+          image: ptr
+          threshold: f32
+        return: None
+      - name: ImageAlphaClear
+        type: function
+        parameters:
+          image: ptr
+          color: raylib_Color
+          threshold: f32
+        return: None
+      - name: ImageAlphaMask
+        type: function
+        parameters:
+          image: ptr
+          alphaMask: raylib_Image
+        return: None
+      - name: ImageAlphaPremultiply
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageBlurGaussian
+        type: function
+        parameters:
+          image: ptr
+          blurSize: i32
+        return: None
+      - name: ImageKernelConvolution
+        type: function
+        parameters:
+          image: ptr
+          kernel: ptr
+          kernelSize: i32
+        return: None
+      - name: ImageResize
+        type: function
+        parameters:
+          image: ptr
+          newWidth: i32
+          newHeight: i32
+        return: None
+      - name: ImageResizeNN
+        type: function
+        parameters:
+          image: ptr
+          newWidth: i32
+          newHeight: i32
+        return: None
+      - name: ImageResizeCanvas
+        type: function
+        parameters:
+          image: ptr
+          newWidth: i32
+          newHeight: i32
+          offsetX: i32
+          offsetY: i32
+          fill: raylib_Color
+        return: None
+      - name: ImageMipmaps
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageDither
+        type: function
+        parameters:
+          image: ptr
+          rBpp: i32
+          gBpp: i32
+          bBpp: i32
+          aBpp: i32
+        return: None
+      - name: ImageFlipVertical
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageFlipHorizontal
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageRotate
+        type: function
+        parameters:
+          image: ptr
+          degrees: i32
+        return: None
+      - name: ImageRotateCW
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageRotateCCW
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageColorTint
+        type: function
+        parameters:
+          image: ptr
+          color: raylib_Color
+        return: None
+      - name: ImageColorInvert
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageColorGrayscale
+        type: function
+        parameters:
+          image: ptr
+        return: None
+      - name: ImageColorContrast
+        type: function
+        parameters:
+          image: ptr
+          contrast: f32
+        return: None
+      - name: ImageColorBrightness
+        type: function
+        parameters:
+          image: ptr
+          brightness: i32
+        return: None
+      - name: ImageColorReplace
+        type: function
+        parameters:
+          image: ptr
+          color: raylib_Color
+          replace: raylib_Color
+        return: None
+      - name: LoadImageColors
+        type: function
+        parameters:
+          image: raylib_Image
+        return: ptr
+      - name: LoadImagePalette
+        type: function
+        parameters:
+          image: raylib_Image
+          maxPaletteSize: i32
+          colorCount: ptr
+        return: ptr
+      - name: UnloadImageColors
+        type: function
+        parameters:
+          colors: ptr
+        return: None
+      - name: UnloadImagePalette
+        type: function
+        parameters:
+          colors: ptr
+        return: None
+      - name: GetImageAlphaBorder
+        type: function
+        parameters:
+          image: raylib_Image
+          threshold: f32
+        return: raylib_Rectangle
+      - name: GetImageColor
+        type: function
+        parameters:
+          image: raylib_Image
+          x: i32
+          y: i32
+        return: raylib_Color
+      - name: ImageClearBackground
+        type: function
+        parameters:
+          dst: ptr
+          color: raylib_Color
+        return: None
+      - name: ImageDrawPixel
+        type: function
+        parameters:
+          dst: ptr
+          posX: i32
+          posY: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawPixelV
+        type: function
+        parameters:
+          dst: ptr
+          position: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: ImageDrawLine
+        type: function
+        parameters:
+          dst: ptr
+          startPosX: i32
+          startPosY: i32
+          endPosX: i32
+          endPosY: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawLineV
+        type: function
+        parameters:
+          dst: ptr
+          start: raylib_Vector2
+          end: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: ImageDrawLineEx
+        type: function
+        parameters:
+          dst: ptr
+          start: raylib_Vector2
+          end: raylib_Vector2
+          thick: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawCircle
+        type: function
+        parameters:
+          dst: ptr
+          centerX: i32
+          centerY: i32
+          radius: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawCircleV
+        type: function
+        parameters:
+          dst: ptr
+          center: raylib_Vector2
+          radius: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawCircleLines
+        type: function
+        parameters:
+          dst: ptr
+          centerX: i32
+          centerY: i32
+          radius: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawCircleLinesV
+        type: function
+        parameters:
+          dst: ptr
+          center: raylib_Vector2
+          radius: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawRectangle
+        type: function
+        parameters:
+          dst: ptr
+          posX: i32
+          posY: i32
+          width: i32
+          height: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawRectangleV
+        type: function
+        parameters:
+          dst: ptr
+          position: raylib_Vector2
+          size: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: ImageDrawRectangleRec
+        type: function
+        parameters:
+          dst: ptr
+          rec: raylib_Rectangle
+          color: raylib_Color
+        return: None
+      - name: ImageDrawRectangleLines
+        type: function
+        parameters:
+          dst: ptr
+          rec: raylib_Rectangle
+          thick: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawTriangle
+        type: function
+        parameters:
+          dst: ptr
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+          v3: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: ImageDrawTriangleEx
+        type: function
+        parameters:
+          dst: ptr
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+          v3: raylib_Vector2
+          c1: raylib_Color
+          c2: raylib_Color
+          c3: raylib_Color
+        return: None
+      - name: ImageDrawTriangleLines
+        type: function
+        parameters:
+          dst: ptr
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+          v3: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: ImageDrawTriangleFan
+        type: function
+        parameters:
+          dst: ptr
+          points: ptr
+          pointCount: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawTriangleStrip
+        type: function
+        parameters:
+          dst: ptr
+          points: ptr
+          pointCount: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDraw
+        type: function
+        parameters:
+          dst: ptr
+          src: raylib_Image
+          srcRec: raylib_Rectangle
+          dstRec: raylib_Rectangle
+          tint: raylib_Color
+        return: None
+      - name: ImageDrawText
+        type: function
+        parameters:
+          dst: ptr
+          text: cstr
+          posX: i32
+          posY: i32
+          fontSize: i32
+          color: raylib_Color
+        return: None
+      - name: ImageDrawTextEx
+        type: function
+        parameters:
+          dst: ptr
+          font: raylib_Font
+          text: cstr
+          position: raylib_Vector2
+          fontSize: f32
+          spacing: f32
+          tint: raylib_Color
+        return: None
+      - name: LoadTexture
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Texture
+      - name: LoadTextureFromImage
+        type: function
+        parameters:
+          image: raylib_Image
+        return: raylib_Texture
+      - name: LoadTextureCubemap
+        type: function
+        parameters:
+          image: raylib_Image
+          layout: i32
+        return: raylib_Texture
+      - name: LoadRenderTexture
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: raylib_RenderTexture
+      - name: IsTextureValid
+        type: function
+        parameters:
+          texture: raylib_Texture
+        return: bool
+      - name: UnloadTexture
+        type: function
+        parameters:
+          texture: raylib_Texture
+        return: None
+      - name: IsRenderTextureValid
+        type: function
+        parameters:
+          target: raylib_RenderTexture
+        return: bool
+      - name: UnloadRenderTexture
+        type: function
+        parameters:
+          target: raylib_RenderTexture
+        return: None
+      - name: UpdateTexture
+        type: function
+        parameters:
+          texture: raylib_Texture
+          pixels: ptr
+        return: None
+      - name: UpdateTextureRec
+        type: function
+        parameters:
+          texture: raylib_Texture
+          rec: raylib_Rectangle
+          pixels: ptr
+        return: None
+      - name: GenTextureMipmaps
+        type: function
+        parameters:
+          texture: ptr
+        return: None
+      - name: SetTextureFilter
+        type: function
+        parameters:
+          texture: raylib_Texture
+          filter: i32
+        return: None
+      - name: SetTextureWrap
+        type: function
+        parameters:
+          texture: raylib_Texture
+          wrap: i32
+        return: None
+      - name: DrawTexture
+        type: function
+        parameters:
+          texture: raylib_Texture
+          posX: i32
+          posY: i32
+          tint: raylib_Color
+        return: None
+      - name: DrawTextureV
+        type: function
+        parameters:
+          texture: raylib_Texture
+          position: raylib_Vector2
+          tint: raylib_Color
+        return: None
+      - name: DrawTextureEx
+        type: function
+        parameters:
+          texture: raylib_Texture
+          position: raylib_Vector2
+          rotation: f32
+          scale: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawTextureRec
+        type: function
+        parameters:
+          texture: raylib_Texture
+          source: raylib_Rectangle
+          position: raylib_Vector2
+          tint: raylib_Color
+        return: None
+      - name: DrawTexturePro
+        type: function
+        parameters:
+          texture: raylib_Texture
+          source: raylib_Rectangle
+          dest: raylib_Rectangle
+          origin: raylib_Vector2
+          rotation: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawTextureNPatch
+        type: function
+        parameters:
+          texture: raylib_Texture
+          nPatchInfo: raylib_NPatchInfo
+          dest: raylib_Rectangle
+          origin: raylib_Vector2
+          rotation: f32
+          tint: raylib_Color
+        return: None
+      - name: ColorIsEqual
+        type: function
+        parameters:
+          col1: raylib_Color
+          col2: raylib_Color
+        return: bool
+      - name: Fade
+        type: function
+        parameters:
+          color: raylib_Color
+          alpha: f32
+        return: raylib_Color
+      - name: ColorToInt
+        type: function
+        parameters:
+          color: raylib_Color
+        return: i32
+      - name: ColorNormalize
+        type: function
+        parameters:
+          color: raylib_Color
+        return: raylib_Vector4
+      - name: ColorFromNormalized
+        type: function
+        parameters:
+          normalized: raylib_Vector4
+        return: raylib_Color
+      - name: ColorToHSV
+        type: function
+        parameters:
+          color: raylib_Color
+        return: raylib_Vector3
+      - name: ColorFromHSV
+        type: function
+        parameters:
+          hue: f32
+          saturation: f32
+          value: f32
+        return: raylib_Color
+      - name: ColorTint
+        type: function
+        parameters:
+          color: raylib_Color
+          tint: raylib_Color
+        return: raylib_Color
+      - name: ColorBrightness
+        type: function
+        parameters:
+          color: raylib_Color
+          factor: f32
+        return: raylib_Color
+      - name: ColorContrast
+        type: function
+        parameters:
+          color: raylib_Color
+          contrast: f32
+        return: raylib_Color
+      - name: ColorAlpha
+        type: function
+        parameters:
+          color: raylib_Color
+          alpha: f32
+        return: raylib_Color
+      - name: ColorAlphaBlend
+        type: function
+        parameters:
+          dst: raylib_Color
+          src: raylib_Color
+          tint: raylib_Color
+        return: raylib_Color
+      - name: ColorLerp
+        type: function
+        parameters:
+          color1: raylib_Color
+          color2: raylib_Color
+          factor: f32
+        return: raylib_Color
+      - name: GetColor
+        type: function
+        parameters:
+          hexValue: u32
+        return: raylib_Color
+      - name: GetPixelColor
+        type: function
+        parameters:
+          srcPtr: ptr
+          format: i32
+        return: raylib_Color
+      - name: SetPixelColor
+        type: function
+        parameters:
+          dstPtr: ptr
+          color: raylib_Color
+          format: i32
+        return: None
+      - name: GetPixelDataSize
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          format: i32
+        return: i32
+      - name: GetFontDefault
+        type: function
+        parameters: {}
+        return: raylib_Font
+      - name: LoadFont
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Font
+      - name: LoadFontEx
+        type: function
+        parameters:
+          fileName: cstr
+          fontSize: i32
+          codepoints: ptr
+          codepointCount: i32
+        return: raylib_Font
+      - name: LoadFontFromImage
+        type: function
+        parameters:
+          image: raylib_Image
+          key: raylib_Color
+          firstChar: i32
+        return: raylib_Font
+      - name: LoadFontFromMemory
+        type: function
+        parameters:
+          fileType: cstr
+          fileData: ptr
+          dataSize: i32
+          fontSize: i32
+          codepoints: ptr
+          codepointCount: i32
+        return: raylib_Font
+      - name: IsFontValid
+        type: function
+        parameters:
+          font: raylib_Font
+        return: bool
+      - name: LoadFontData
+        type: function
+        parameters:
+          fileData: ptr
+          dataSize: i32
+          fontSize: i32
+          codepoints: ptr
+          codepointCount: i32
+          type: i32
+          glyphCount: ptr
+        return: ptr
+      - name: GenImageFontAtlas
+        type: function
+        parameters:
+          glyphs: ptr
+          glyphRecs: ptr
+          glyphCount: i32
+          fontSize: i32
+          padding: i32
+          packMethod: i32
+        return: raylib_Image
+      - name: UnloadFontData
+        type: function
+        parameters:
+          glyphs: ptr
+          glyphCount: i32
+        return: None
+      - name: UnloadFont
+        type: function
+        parameters:
+          font: raylib_Font
+        return: None
+      - name: ExportFontAsCode
+        type: function
+        parameters:
+          font: raylib_Font
+          fileName: cstr
+        return: bool
+      - name: DrawFPS
+        type: function
+        parameters:
+          posX: i32
+          posY: i32
+        return: None
+      - name: DrawText
+        type: function
+        parameters:
+          text: cstr
+          posX: i32
+          posY: i32
+          fontSize: i32
+          color: raylib_Color
+        return: None
+      - name: DrawTextEx
+        type: function
+        parameters:
+          font: raylib_Font
+          text: cstr
+          position: raylib_Vector2
+          fontSize: f32
+          spacing: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawTextPro
+        type: function
+        parameters:
+          font: raylib_Font
+          text: cstr
+          position: raylib_Vector2
+          origin: raylib_Vector2
+          rotation: f32
+          fontSize: f32
+          spacing: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawTextCodepoint
+        type: function
+        parameters:
+          font: raylib_Font
+          codepoint: i32
+          position: raylib_Vector2
+          fontSize: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawTextCodepoints
+        type: function
+        parameters:
+          font: raylib_Font
+          codepoints: ptr
+          codepointCount: i32
+          position: raylib_Vector2
+          fontSize: f32
+          spacing: f32
+          tint: raylib_Color
+        return: None
+      - name: SetTextLineSpacing
+        type: function
+        parameters:
+          spacing: i32
+        return: None
+      - name: MeasureText
+        type: function
+        parameters:
+          text: cstr
+          fontSize: i32
+        return: i32
+      - name: MeasureTextEx
+        type: function
+        parameters:
+          font: raylib_Font
+          text: cstr
+          fontSize: f32
+          spacing: f32
+        return: raylib_Vector2
+      - name: MeasureTextCodepoints
+        type: function
+        parameters:
+          font: raylib_Font
+          codepoints: ptr
+          length: i32
+          fontSize: f32
+          spacing: f32
+        return: raylib_Vector2
+      - name: GetGlyphIndex
+        type: function
+        parameters:
+          font: raylib_Font
+          codepoint: i32
+        return: i32
+      - name: GetGlyphInfo
+        type: function
+        parameters:
+          font: raylib_Font
+          codepoint: i32
+        return: raylib_GlyphInfo
+      - name: GetGlyphAtlasRec
+        type: function
+        parameters:
+          font: raylib_Font
+          codepoint: i32
+        return: raylib_Rectangle
+      - name: LoadUTF8
+        type: function
+        parameters:
+          codepoints: ptr
+          length: i32
+        return: ptr
+      - name: UnloadUTF8
+        type: function
+        parameters:
+          text: ptr
+        return: None
+      - name: LoadCodepoints
+        type: function
+        parameters:
+          text: cstr
+          count: ptr
+        return: ptr
+      - name: UnloadCodepoints
+        type: function
+        parameters:
+          codepoints: ptr
+        return: None
+      - name: GetCodepointCount
+        type: function
+        parameters:
+          text: cstr
+        return: i32
+      - name: GetCodepoint
+        type: function
+        parameters:
+          text: cstr
+          codepointSize: ptr
+        return: i32
+      - name: GetCodepointNext
+        type: function
+        parameters:
+          text: cstr
+          codepointSize: ptr
+        return: i32
+      - name: GetCodepointPrevious
+        type: function
+        parameters:
+          text: cstr
+          codepointSize: ptr
+        return: i32
+      - name: CodepointToUTF8
+        type: function
+        parameters:
+          codepoint: i32
+          utf8Size: ptr
+        return: cstr
+      - name: LoadTextLines
+        type: function
+        parameters:
+          text: cstr
+          count: ptr
+        return: ptr
+      - name: UnloadTextLines
+        type: function
+        parameters:
+          text: ptr
+          lineCount: i32
+        return: None
+      - name: TextCopy
+        type: function
+        parameters:
+          dst: ptr
+          src: cstr
+        return: i32
+      - name: TextIsEqual
+        type: function
+        parameters:
+          text1: cstr
+          text2: cstr
+        return: bool
+      - name: TextLength
+        type: function
+        parameters:
+          text: cstr
+        return: u32
+      - name: TextSubtext
+        type: function
+        parameters:
+          text: cstr
+          position: i32
+          length: i32
+        return: cstr
+      - name: TextRemoveSpaces
+        type: function
+        parameters:
+          text: cstr
+        return: cstr
+      - name: GetTextBetween
+        type: function
+        parameters:
+          text: cstr
+          begin: cstr
+          end: cstr
+        return: ptr
+      - name: TextReplace
+        type: function
+        parameters:
+          text: cstr
+          search: cstr
+          replacement: cstr
+        return: ptr
+      - name: TextReplaceAlloc
+        type: function
+        parameters:
+          text: cstr
+          search: cstr
+          replacement: cstr
+        return: ptr
+      - name: TextReplaceBetween
+        type: function
+        parameters:
+          text: cstr
+          begin: cstr
+          end: cstr
+          replacement: cstr
+        return: ptr
+      - name: TextReplaceBetweenAlloc
+        type: function
+        parameters:
+          text: cstr
+          begin: cstr
+          end: cstr
+          replacement: cstr
+        return: ptr
+      - name: TextInsert
+        type: function
+        parameters:
+          text: cstr
+          insert: cstr
+          position: i32
+        return: ptr
+      - name: TextInsertAlloc
+        type: function
+        parameters:
+          text: cstr
+          insert: cstr
+          position: i32
+        return: ptr
+      - name: TextJoin
+        type: function
+        parameters:
+          textList: ptr
+          count: i32
+          delimiter: cstr
+        return: ptr
+      - name: TextSplit
+        type: function
+        parameters:
+          text: cstr
+          delimiter: i8
+          count: ptr
+        return: ptr
+      - name: TextAppend
+        type: function
+        parameters:
+          text: ptr
+          append: cstr
+          position: ptr
+        return: None
+      - name: TextFindIndex
+        type: function
+        parameters:
+          text: cstr
+          search: cstr
+        return: i32
+      - name: TextToUpper
+        type: function
+        parameters:
+          text: cstr
+        return: ptr
+      - name: TextToLower
+        type: function
+        parameters:
+          text: cstr
+        return: ptr
+      - name: TextToPascal
+        type: function
+        parameters:
+          text: cstr
+        return: ptr
+      - name: TextToSnake
+        type: function
+        parameters:
+          text: cstr
+        return: ptr
+      - name: TextToCamel
+        type: function
+        parameters:
+          text: cstr
+        return: ptr
+      - name: TextToInteger
+        type: function
+        parameters:
+          text: cstr
+        return: i32
+      - name: TextToFloat
+        type: function
+        parameters:
+          text: cstr
+        return: f32
+      - name: DrawLine3D
+        type: function
+        parameters:
+          startPos: raylib_Vector3
+          endPos: raylib_Vector3
+          color: raylib_Color
+        return: None
+      - name: DrawPoint3D
+        type: function
+        parameters:
+          position: raylib_Vector3
+          color: raylib_Color
+        return: None
+      - name: DrawCircle3D
+        type: function
+        parameters:
+          center: raylib_Vector3
+          radius: f32
+          rotationAxis: raylib_Vector3
+          rotationAngle: f32
+          color: raylib_Color
+        return: None
+      - name: DrawTriangle3D
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+          v3: raylib_Vector3
+          color: raylib_Color
+        return: None
+      - name: DrawTriangleStrip3D
+        type: function
+        parameters:
+          points: ptr
+          pointCount: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCube
+        type: function
+        parameters:
+          position: raylib_Vector3
+          width: f32
+          height: f32
+          length: f32
+          color: raylib_Color
+        return: None
+      - name: DrawCubeV
+        type: function
+        parameters:
+          position: raylib_Vector3
+          size: raylib_Vector3
+          color: raylib_Color
+        return: None
+      - name: DrawCubeWires
+        type: function
+        parameters:
+          position: raylib_Vector3
+          width: f32
+          height: f32
+          length: f32
+          color: raylib_Color
+        return: None
+      - name: DrawCubeWiresV
+        type: function
+        parameters:
+          position: raylib_Vector3
+          size: raylib_Vector3
+          color: raylib_Color
+        return: None
+      - name: DrawSphere
+        type: function
+        parameters:
+          centerPos: raylib_Vector3
+          radius: f32
+          color: raylib_Color
+        return: None
+      - name: DrawSphereEx
+        type: function
+        parameters:
+          centerPos: raylib_Vector3
+          radius: f32
+          rings: i32
+          slices: i32
+          color: raylib_Color
+        return: None
+      - name: DrawSphereWires
+        type: function
+        parameters:
+          centerPos: raylib_Vector3
+          radius: f32
+          rings: i32
+          slices: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCylinder
+        type: function
+        parameters:
+          position: raylib_Vector3
+          radiusTop: f32
+          radiusBottom: f32
+          height: f32
+          slices: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCylinderEx
+        type: function
+        parameters:
+          startPos: raylib_Vector3
+          endPos: raylib_Vector3
+          startRadius: f32
+          endRadius: f32
+          sides: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCylinderWires
+        type: function
+        parameters:
+          position: raylib_Vector3
+          radiusTop: f32
+          radiusBottom: f32
+          height: f32
+          slices: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCylinderWiresEx
+        type: function
+        parameters:
+          startPos: raylib_Vector3
+          endPos: raylib_Vector3
+          startRadius: f32
+          endRadius: f32
+          sides: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCapsule
+        type: function
+        parameters:
+          startPos: raylib_Vector3
+          endPos: raylib_Vector3
+          radius: f32
+          slices: i32
+          rings: i32
+          color: raylib_Color
+        return: None
+      - name: DrawCapsuleWires
+        type: function
+        parameters:
+          startPos: raylib_Vector3
+          endPos: raylib_Vector3
+          radius: f32
+          slices: i32
+          rings: i32
+          color: raylib_Color
+        return: None
+      - name: DrawPlane
+        type: function
+        parameters:
+          centerPos: raylib_Vector3
+          size: raylib_Vector2
+          color: raylib_Color
+        return: None
+      - name: DrawRay
+        type: function
+        parameters:
+          ray: raylib_Ray
+          color: raylib_Color
+        return: None
+      - name: DrawGrid
+        type: function
+        parameters:
+          slices: i32
+          spacing: f32
+        return: None
+      - name: LoadModel
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Model
+      - name: LoadModelFromMesh
+        type: function
+        parameters:
+          mesh: raylib_Mesh
+        return: raylib_Model
+      - name: IsModelValid
+        type: function
+        parameters:
+          model: raylib_Model
+        return: bool
+      - name: UnloadModel
+        type: function
+        parameters:
+          model: raylib_Model
+        return: None
+      - name: GetModelBoundingBox
+        type: function
+        parameters:
+          model: raylib_Model
+        return: raylib_BoundingBox
+      - name: DrawModel
+        type: function
+        parameters:
+          model: raylib_Model
+          position: raylib_Vector3
+          scale: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawModelEx
+        type: function
+        parameters:
+          model: raylib_Model
+          position: raylib_Vector3
+          rotationAxis: raylib_Vector3
+          rotationAngle: f32
+          scale: raylib_Vector3
+          tint: raylib_Color
+        return: None
+      - name: DrawModelWires
+        type: function
+        parameters:
+          model: raylib_Model
+          position: raylib_Vector3
+          scale: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawModelWiresEx
+        type: function
+        parameters:
+          model: raylib_Model
+          position: raylib_Vector3
+          rotationAxis: raylib_Vector3
+          rotationAngle: f32
+          scale: raylib_Vector3
+          tint: raylib_Color
+        return: None
+      - name: DrawBoundingBox
+        type: function
+        parameters:
+          box: raylib_BoundingBox
+          color: raylib_Color
+        return: None
+      - name: DrawBillboard
+        type: function
+        parameters:
+          camera: raylib_Camera3D
+          texture: raylib_Texture
+          position: raylib_Vector3
+          scale: f32
+          tint: raylib_Color
+        return: None
+      - name: DrawBillboardRec
+        type: function
+        parameters:
+          camera: raylib_Camera3D
+          texture: raylib_Texture
+          source: raylib_Rectangle
+          position: raylib_Vector3
+          size: raylib_Vector2
+          tint: raylib_Color
+        return: None
+      - name: DrawBillboardPro
+        type: function
+        parameters:
+          camera: raylib_Camera3D
+          texture: raylib_Texture
+          source: raylib_Rectangle
+          position: raylib_Vector3
+          up: raylib_Vector3
+          size: raylib_Vector2
+          origin: raylib_Vector2
+          rotation: f32
+          tint: raylib_Color
+        return: None
+      - name: UploadMesh
+        type: function
+        parameters:
+          mesh: ptr
+          dynamic: bool
+        return: None
+      - name: UpdateMeshBuffer
+        type: function
+        parameters:
+          mesh: raylib_Mesh
+          index: i32
+          data: ptr
+          dataSize: i32
+          offset: i32
+        return: None
+      - name: UnloadMesh
+        type: function
+        parameters:
+          mesh: raylib_Mesh
+        return: None
+      - name: GetMeshBoundingBox
+        type: function
+        parameters:
+          mesh: raylib_Mesh
+        return: raylib_BoundingBox
+      - name: GenMeshTangents
+        type: function
+        parameters:
+          mesh: ptr
+        return: None
+      - name: ExportMesh
+        type: function
+        parameters:
+          mesh: raylib_Mesh
+          fileName: cstr
+        return: bool
+      - name: ExportMeshAsCode
+        type: function
+        parameters:
+          mesh: raylib_Mesh
+          fileName: cstr
+        return: bool
+      - name: GenMeshPoly
+        type: function
+        parameters:
+          sides: i32
+          radius: f32
+        return: raylib_Mesh
+      - name: GenMeshPlane
+        type: function
+        parameters:
+          width: f32
+          length: f32
+          resX: i32
+          resZ: i32
+        return: raylib_Mesh
+      - name: GenMeshCube
+        type: function
+        parameters:
+          width: f32
+          height: f32
+          length: f32
+        return: raylib_Mesh
+      - name: GenMeshSphere
+        type: function
+        parameters:
+          radius: f32
+          rings: i32
+          slices: i32
+        return: raylib_Mesh
+      - name: GenMeshHemiSphere
+        type: function
+        parameters:
+          radius: f32
+          rings: i32
+          slices: i32
+        return: raylib_Mesh
+      - name: GenMeshCylinder
+        type: function
+        parameters:
+          radius: f32
+          height: f32
+          slices: i32
+        return: raylib_Mesh
+      - name: GenMeshCone
+        type: function
+        parameters:
+          radius: f32
+          height: f32
+          slices: i32
+        return: raylib_Mesh
+      - name: GenMeshTorus
+        type: function
+        parameters:
+          radius: f32
+          size: f32
+          radSeg: i32
+          sides: i32
+        return: raylib_Mesh
+      - name: GenMeshKnot
+        type: function
+        parameters:
+          radius: f32
+          size: f32
+          radSeg: i32
+          sides: i32
+        return: raylib_Mesh
+      - name: GenMeshHeightmap
+        type: function
+        parameters:
+          heightmap: raylib_Image
+          size: raylib_Vector3
+        return: raylib_Mesh
+      - name: GenMeshCubicmap
+        type: function
+        parameters:
+          cubicmap: raylib_Image
+          cubeSize: raylib_Vector3
+        return: raylib_Mesh
+      - name: LoadMaterials
+        type: function
+        parameters:
+          fileName: cstr
+          materialCount: ptr
+        return: ptr
+      - name: SetMaterialTexture
+        type: function
+        parameters:
+          material: ptr
+          mapType: i32
+          texture: raylib_Texture
+        return: None
+      - name: SetModelMeshMaterial
+        type: function
+        parameters:
+          model: ptr
+          meshId: i32
+          materialId: i32
+        return: None
+      - name: LoadModelAnimations
+        type: function
+        parameters:
+          fileName: cstr
+          animCount: ptr
+        return: ptr
+      - name: UnloadModelAnimations
+        type: function
+        parameters:
+          animations: ptr
+          animCount: i32
+        return: None
+      - name: CheckCollisionSpheres
+        type: function
+        parameters:
+          center1: raylib_Vector3
+          radius1: f32
+          center2: raylib_Vector3
+          radius2: f32
+        return: bool
+      - name: CheckCollisionBoxes
+        type: function
+        parameters:
+          box1: raylib_BoundingBox
+          box2: raylib_BoundingBox
+        return: bool
+      - name: CheckCollisionBoxSphere
+        type: function
+        parameters:
+          box: raylib_BoundingBox
+          center: raylib_Vector3
+          radius: f32
+        return: bool
+      - name: GetRayCollisionSphere
+        type: function
+        parameters:
+          ray: raylib_Ray
+          center: raylib_Vector3
+          radius: f32
+        return: raylib_RayCollision
+      - name: GetRayCollisionBox
+        type: function
+        parameters:
+          ray: raylib_Ray
+          box: raylib_BoundingBox
+        return: raylib_RayCollision
+      - name: GetRayCollisionMesh
+        type: function
+        parameters:
+          ray: raylib_Ray
+          mesh: raylib_Mesh
+          transform: raylib_Matrix
+        return: raylib_RayCollision
+      - name: GetRayCollisionTriangle
+        type: function
+        parameters:
+          ray: raylib_Ray
+          p1: raylib_Vector3
+          p2: raylib_Vector3
+          p3: raylib_Vector3
+        return: raylib_RayCollision
+      - name: GetRayCollisionQuad
+        type: function
+        parameters:
+          ray: raylib_Ray
+          p1: raylib_Vector3
+          p2: raylib_Vector3
+          p3: raylib_Vector3
+          p4: raylib_Vector3
+        return: raylib_RayCollision
+      - name: InitAudioDevice
+        type: function
+        parameters: {}
+        return: None
+      - name: CloseAudioDevice
+        type: function
+        parameters: {}
+        return: None
+      - name: IsAudioDeviceReady
+        type: function
+        parameters: {}
+        return: bool
+      - name: SetMasterVolume
+        type: function
+        parameters:
+          volume: f32
+        return: None
+      - name: GetMasterVolume
+        type: function
+        parameters: {}
+        return: f32
+      - name: LoadWave
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Wave
+      - name: LoadWaveFromMemory
+        type: function
+        parameters:
+          fileType: cstr
+          fileData: ptr
+          dataSize: i32
+        return: raylib_Wave
+      - name: IsWaveValid
+        type: function
+        parameters:
+          wave: raylib_Wave
+        return: bool
+      - name: LoadSound
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Sound
+      - name: LoadSoundFromWave
+        type: function
+        parameters:
+          wave: raylib_Wave
+        return: raylib_Sound
+      - name: LoadSoundAlias
+        type: function
+        parameters:
+          source: raylib_Sound
+        return: raylib_Sound
+      - name: IsSoundValid
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: bool
+      - name: UpdateSound
+        type: function
+        parameters:
+          sound: raylib_Sound
+          data: ptr
+          sampleCount: i32
+        return: None
+      - name: UnloadWave
+        type: function
+        parameters:
+          wave: raylib_Wave
+        return: None
+      - name: UnloadSound
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: None
+      - name: UnloadSoundAlias
+        type: function
+        parameters:
+          alias: raylib_Sound
+        return: None
+      - name: ExportWave
+        type: function
+        parameters:
+          wave: raylib_Wave
+          fileName: cstr
+        return: bool
+      - name: ExportWaveAsCode
+        type: function
+        parameters:
+          wave: raylib_Wave
+          fileName: cstr
+        return: bool
+      - name: PlaySound
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: None
+      - name: StopSound
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: None
+      - name: PauseSound
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: None
+      - name: ResumeSound
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: None
+      - name: IsSoundPlaying
+        type: function
+        parameters:
+          sound: raylib_Sound
+        return: bool
+      - name: SetSoundVolume
+        type: function
+        parameters:
+          sound: raylib_Sound
+          volume: f32
+        return: None
+      - name: SetSoundPitch
+        type: function
+        parameters:
+          sound: raylib_Sound
+          pitch: f32
+        return: None
+      - name: SetSoundPan
+        type: function
+        parameters:
+          sound: raylib_Sound
+          pan: f32
+        return: None
+      - name: WaveCopy
+        type: function
+        parameters:
+          wave: raylib_Wave
+        return: raylib_Wave
+      - name: WaveCrop
+        type: function
+        parameters:
+          wave: ptr
+          initFrame: i32
+          finalFrame: i32
+        return: None
+      - name: WaveFormat
+        type: function
+        parameters:
+          wave: ptr
+          sampleRate: i32
+          sampleSize: i32
+          channels: i32
+        return: None
+      - name: LoadWaveSamples
+        type: function
+        parameters:
+          wave: raylib_Wave
+        return: ptr
+      - name: UnloadWaveSamples
+        type: function
+        parameters:
+          samples: ptr
+        return: None
+      - name: LoadMusicStream
+        type: function
+        parameters:
+          fileName: cstr
+        return: raylib_Music
+      - name: LoadMusicStreamFromMemory
+        type: function
+        parameters:
+          fileType: cstr
+          data: ptr
+          dataSize: i32
+        return: raylib_Music
+      - name: IsMusicValid
+        type: function
+        parameters:
+          music: raylib_Music
+        return: bool
+      - name: UnloadMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+        return: None
+      - name: PlayMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+        return: None
+      - name: IsMusicStreamPlaying
+        type: function
+        parameters:
+          music: raylib_Music
+        return: bool
+      - name: UpdateMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+        return: None
+      - name: StopMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+        return: None
+      - name: PauseMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+        return: None
+      - name: ResumeMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+        return: None
+      - name: SeekMusicStream
+        type: function
+        parameters:
+          music: raylib_Music
+          position: f32
+        return: None
+      - name: SetMusicVolume
+        type: function
+        parameters:
+          music: raylib_Music
+          volume: f32
+        return: None
+      - name: SetMusicPitch
+        type: function
+        parameters:
+          music: raylib_Music
+          pitch: f32
+        return: None
+      - name: SetMusicPan
+        type: function
+        parameters:
+          music: raylib_Music
+          pan: f32
+        return: None
+      - name: GetMusicTimeLength
+        type: function
+        parameters:
+          music: raylib_Music
+        return: f32
+      - name: GetMusicTimePlayed
+        type: function
+        parameters:
+          music: raylib_Music
+        return: f32
+      - name: LoadAudioStream
+        type: function
+        parameters:
+          sampleRate: u32
+          sampleSize: u32
+          channels: u32
+        return: raylib_AudioStream
+      - name: IsAudioStreamValid
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: bool
+      - name: UnloadAudioStream
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: None
+      - name: UpdateAudioStream
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          data: ptr
+          frameCount: i32
+        return: None
+      - name: IsAudioStreamProcessed
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: bool
+      - name: PlayAudioStream
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: None
+      - name: PauseAudioStream
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: None
+      - name: ResumeAudioStream
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: None
+      - name: IsAudioStreamPlaying
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: bool
+      - name: StopAudioStream
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+        return: None
+      - name: SetAudioStreamVolume
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          volume: f32
+        return: None
+      - name: SetAudioStreamPitch
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          pitch: f32
+        return: None
+      - name: SetAudioStreamPan
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          pan: f32
+        return: None
+      - name: SetAudioStreamBufferSizeDefault
+        type: function
+        parameters:
+          size: i32
+        return: None
+      - name: SetAudioStreamCallback
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          callback: ptr
+        return: None
+      - name: AttachAudioStreamProcessor
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          processor: ptr
+        return: None
+      - name: DetachAudioStreamProcessor
+        type: function
+        parameters:
+          stream: raylib_AudioStream
+          processor: ptr
+        return: None
+      - name: AttachAudioMixedProcessor
+        type: function
+        parameters:
+          processor: ptr
+        return: None
+      - name: DetachAudioMixedProcessor
+        type: function
+        parameters:
+          processor: ptr
+        return: None
+  - module: raymath
+    description: Generated from raymath.h
+    declarations:
+      - name: Clamp
+        type: function
+        parameters:
+          value: f32
+          min: f32
+          max: f32
+        return: f32
+      - name: Lerp
+        type: function
+        parameters:
+          start: f32
+          end: f32
+          amount: f32
+        return: f32
+      - name: Normalize
+        type: function
+        parameters:
+          value: f32
+          start: f32
+          end: f32
+        return: f32
+      - name: Remap
+        type: function
+        parameters:
+          value: f32
+          inputStart: f32
+          inputEnd: f32
+          outputStart: f32
+          outputEnd: f32
+        return: f32
+      - name: Wrap
+        type: function
+        parameters:
+          value: f32
+          min: f32
+          max: f32
+        return: f32
+      - name: FloatEquals
+        type: function
+        parameters:
+          x: f32
+          y: f32
+        return: i32
+      - name: Vector2Zero
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: Vector2One
+        type: function
+        parameters: {}
+        return: raylib_Vector2
+      - name: Vector2Add
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2AddValue
+        type: function
+        parameters:
+          v: raylib_Vector2
+          add: f32
+        return: raylib_Vector2
+      - name: Vector2Subtract
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2SubtractValue
+        type: function
+        parameters:
+          v: raylib_Vector2
+          sub: f32
+        return: raylib_Vector2
+      - name: Vector2Length
+        type: function
+        parameters:
+          v: raylib_Vector2
+        return: f32
+      - name: Vector2LengthSqr
+        type: function
+        parameters:
+          v: raylib_Vector2
+        return: f32
+      - name: Vector2DotProduct
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: f32
+      - name: Vector2CrossProduct
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: f32
+      - name: Vector2Distance
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: f32
+      - name: Vector2DistanceSqr
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: f32
+      - name: Vector2Angle
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: f32
+      - name: Vector2LineAngle
+        type: function
+        parameters:
+          start: raylib_Vector2
+          end: raylib_Vector2
+        return: f32
+      - name: Vector2Scale
+        type: function
+        parameters:
+          v: raylib_Vector2
+          scale: f32
+        return: raylib_Vector2
+      - name: Vector2Multiply
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Negate
+        type: function
+        parameters:
+          v: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Divide
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Normalize
+        type: function
+        parameters:
+          v: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Transform
+        type: function
+        parameters:
+          v: raylib_Vector2
+          mat: raylib_Matrix
+        return: raylib_Vector2
+      - name: Vector2Lerp
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+          amount: f32
+        return: raylib_Vector2
+      - name: Vector2Reflect
+        type: function
+        parameters:
+          v: raylib_Vector2
+          normal: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Min
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Max
+        type: function
+        parameters:
+          v1: raylib_Vector2
+          v2: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Rotate
+        type: function
+        parameters:
+          v: raylib_Vector2
+          angle: f32
+        return: raylib_Vector2
+      - name: Vector2MoveTowards
+        type: function
+        parameters:
+          v: raylib_Vector2
+          target: raylib_Vector2
+          maxDistance: f32
+        return: raylib_Vector2
+      - name: Vector2Invert
+        type: function
+        parameters:
+          v: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2Clamp
+        type: function
+        parameters:
+          v: raylib_Vector2
+          min: raylib_Vector2
+          max: raylib_Vector2
+        return: raylib_Vector2
+      - name: Vector2ClampValue
+        type: function
+        parameters:
+          v: raylib_Vector2
+          min: f32
+          max: f32
+        return: raylib_Vector2
+      - name: Vector2Equals
+        type: function
+        parameters:
+          p: raylib_Vector2
+          q: raylib_Vector2
+        return: i32
+      - name: Vector2Refract
+        type: function
+        parameters:
+          v: raylib_Vector2
+          n: raylib_Vector2
+          r: f32
+        return: raylib_Vector2
+      - name: Vector3Zero
+        type: function
+        parameters: {}
+        return: raylib_Vector3
+      - name: Vector3One
+        type: function
+        parameters: {}
+        return: raylib_Vector3
+      - name: Vector3Add
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3AddValue
+        type: function
+        parameters:
+          v: raylib_Vector3
+          add: f32
+        return: raylib_Vector3
+      - name: Vector3Subtract
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3SubtractValue
+        type: function
+        parameters:
+          v: raylib_Vector3
+          sub: f32
+        return: raylib_Vector3
+      - name: Vector3Scale
+        type: function
+        parameters:
+          v: raylib_Vector3
+          scalar: f32
+        return: raylib_Vector3
+      - name: Vector3Multiply
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3CrossProduct
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Perpendicular
+        type: function
+        parameters:
+          v: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Length
+        type: function
+        parameters:
+          v: raylib_Vector3
+        return: f32
+      - name: Vector3LengthSqr
+        type: function
+        parameters:
+          v: raylib_Vector3
+        return: f32
+      - name: Vector3DotProduct
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: f32
+      - name: Vector3Distance
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: f32
+      - name: Vector3DistanceSqr
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: f32
+      - name: Vector3Angle
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: f32
+      - name: Vector3Negate
+        type: function
+        parameters:
+          v: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Divide
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Normalize
+        type: function
+        parameters:
+          v: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Project
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Reject
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3OrthoNormalize
+        type: function
+        parameters:
+          v1: ptr
+          v2: ptr
+        return: None
+      - name: Vector3Transform
+        type: function
+        parameters:
+          v: raylib_Vector3
+          mat: raylib_Matrix
+        return: raylib_Vector3
+      - name: Vector3RotateByQuaternion
+        type: function
+        parameters:
+          v: raylib_Vector3
+          q: raylib_Vector4
+        return: raylib_Vector3
+      - name: Vector3RotateByAxisAngle
+        type: function
+        parameters:
+          v: raylib_Vector3
+          axis: raylib_Vector3
+          angle: f32
+        return: raylib_Vector3
+      - name: Vector3MoveTowards
+        type: function
+        parameters:
+          v: raylib_Vector3
+          target: raylib_Vector3
+          maxDistance: f32
+        return: raylib_Vector3
+      - name: Vector3Lerp
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+          amount: f32
+        return: raylib_Vector3
+      - name: Vector3CubicHermite
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          tangent1: raylib_Vector3
+          v2: raylib_Vector3
+          tangent2: raylib_Vector3
+          amount: f32
+        return: raylib_Vector3
+      - name: Vector3Reflect
+        type: function
+        parameters:
+          v: raylib_Vector3
+          normal: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Min
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Max
+        type: function
+        parameters:
+          v1: raylib_Vector3
+          v2: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Barycenter
+        type: function
+        parameters:
+          p: raylib_Vector3
+          a: raylib_Vector3
+          b: raylib_Vector3
+          c: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Unproject
+        type: function
+        parameters:
+          source: raylib_Vector3
+          projection: raylib_Matrix
+          view: raylib_Matrix
+        return: raylib_Vector3
+      - name: Vector3Invert
+        type: function
+        parameters:
+          v: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3Clamp
+        type: function
+        parameters:
+          v: raylib_Vector3
+          min: raylib_Vector3
+          max: raylib_Vector3
+        return: raylib_Vector3
+      - name: Vector3ClampValue
+        type: function
+        parameters:
+          v: raylib_Vector3
+          min: f32
+          max: f32
+        return: raylib_Vector3
+      - name: Vector3Equals
+        type: function
+        parameters:
+          p: raylib_Vector3
+          q: raylib_Vector3
+        return: i32
+      - name: Vector3Refract
+        type: function
+        parameters:
+          v: raylib_Vector3
+          n: raylib_Vector3
+          r: f32
+        return: raylib_Vector3
+      - name: Vector4Zero
+        type: function
+        parameters: {}
+        return: raylib_Vector4
+      - name: Vector4One
+        type: function
+        parameters: {}
+        return: raylib_Vector4
+      - name: Vector4Add
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4AddValue
+        type: function
+        parameters:
+          v: raylib_Vector4
+          add: f32
+        return: raylib_Vector4
+      - name: Vector4Subtract
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4SubtractValue
+        type: function
+        parameters:
+          v: raylib_Vector4
+          add: f32
+        return: raylib_Vector4
+      - name: Vector4Length
+        type: function
+        parameters:
+          v: raylib_Vector4
+        return: f32
+      - name: Vector4LengthSqr
+        type: function
+        parameters:
+          v: raylib_Vector4
+        return: f32
+      - name: Vector4DotProduct
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: f32
+      - name: Vector4Distance
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: f32
+      - name: Vector4DistanceSqr
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: f32
+      - name: Vector4Scale
+        type: function
+        parameters:
+          v: raylib_Vector4
+          scale: f32
+        return: raylib_Vector4
+      - name: Vector4Multiply
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Negate
+        type: function
+        parameters:
+          v: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Divide
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Normalize
+        type: function
+        parameters:
+          v: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Min
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Max
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Lerp
+        type: function
+        parameters:
+          v1: raylib_Vector4
+          v2: raylib_Vector4
+          amount: f32
+        return: raylib_Vector4
+      - name: Vector4MoveTowards
+        type: function
+        parameters:
+          v: raylib_Vector4
+          target: raylib_Vector4
+          maxDistance: f32
+        return: raylib_Vector4
+      - name: Vector4Invert
+        type: function
+        parameters:
+          v: raylib_Vector4
+        return: raylib_Vector4
+      - name: Vector4Equals
+        type: function
+        parameters:
+          p: raylib_Vector4
+          q: raylib_Vector4
+        return: i32
+      - name: MatrixDeterminant
+        type: function
+        parameters:
+          mat: raylib_Matrix
+        return: f32
+      - name: MatrixTrace
+        type: function
+        parameters:
+          mat: raylib_Matrix
+        return: f32
+      - name: MatrixTranspose
+        type: function
+        parameters:
+          mat: raylib_Matrix
+        return: raylib_Matrix
+      - name: MatrixInvert
+        type: function
+        parameters:
+          mat: raylib_Matrix
+        return: raylib_Matrix
+      - name: MatrixIdentity
+        type: function
+        parameters: {}
+        return: raylib_Matrix
+      - name: MatrixAdd
+        type: function
+        parameters:
+          left: raylib_Matrix
+          right: raylib_Matrix
+        return: raylib_Matrix
+      - name: MatrixSubtract
+        type: function
+        parameters:
+          left: raylib_Matrix
+          right: raylib_Matrix
+        return: raylib_Matrix
+      - name: MatrixMultiply
+        type: function
+        parameters:
+          left: raylib_Matrix
+          right: raylib_Matrix
+        return: raylib_Matrix
+      - name: MatrixMultiplyValue
+        type: function
+        parameters:
+          left: raylib_Matrix
+          value: f32
+        return: raylib_Matrix
+      - name: MatrixTranslate
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: raylib_Matrix
+      - name: MatrixRotate
+        type: function
+        parameters:
+          axis: raylib_Vector3
+          angle: f32
+        return: raylib_Matrix
+      - name: MatrixRotateX
+        type: function
+        parameters:
+          angle: f32
+        return: raylib_Matrix
+      - name: MatrixRotateY
+        type: function
+        parameters:
+          angle: f32
+        return: raylib_Matrix
+      - name: MatrixRotateZ
+        type: function
+        parameters:
+          angle: f32
+        return: raylib_Matrix
+      - name: MatrixRotateXYZ
+        type: function
+        parameters:
+          angle: raylib_Vector3
+        return: raylib_Matrix
+      - name: MatrixRotateZYX
+        type: function
+        parameters:
+          angle: raylib_Vector3
+        return: raylib_Matrix
+      - name: MatrixScale
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: raylib_Matrix
+      - name: MatrixFrustum
+        type: function
+        parameters:
+          left: f64
+          right: f64
+          bottom: f64
+          top: f64
+          nearPlane: f64
+          farPlane: f64
+        return: raylib_Matrix
+      - name: MatrixPerspective
+        type: function
+        parameters:
+          fovY: f64
+          aspect: f64
+          nearPlane: f64
+          farPlane: f64
+        return: raylib_Matrix
+      - name: MatrixOrtho
+        type: function
+        parameters:
+          left: f64
+          right: f64
+          bottom: f64
+          top: f64
+          nearPlane: f64
+          farPlane: f64
+        return: raylib_Matrix
+      - name: MatrixLookAt
+        type: function
+        parameters:
+          eye: raylib_Vector3
+          target: raylib_Vector3
+          up: raylib_Vector3
+        return: raylib_Matrix
+      - name: QuaternionAdd
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+        return: raylib_Vector4
+      - name: QuaternionAddValue
+        type: function
+        parameters:
+          q: raylib_Vector4
+          add: f32
+        return: raylib_Vector4
+      - name: QuaternionSubtract
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+        return: raylib_Vector4
+      - name: QuaternionSubtractValue
+        type: function
+        parameters:
+          q: raylib_Vector4
+          sub: f32
+        return: raylib_Vector4
+      - name: QuaternionIdentity
+        type: function
+        parameters: {}
+        return: raylib_Vector4
+      - name: QuaternionLength
+        type: function
+        parameters:
+          q: raylib_Vector4
+        return: f32
+      - name: QuaternionNormalize
+        type: function
+        parameters:
+          q: raylib_Vector4
+        return: raylib_Vector4
+      - name: QuaternionInvert
+        type: function
+        parameters:
+          q: raylib_Vector4
+        return: raylib_Vector4
+      - name: QuaternionMultiply
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+        return: raylib_Vector4
+      - name: QuaternionScale
+        type: function
+        parameters:
+          q: raylib_Vector4
+          mul: f32
+        return: raylib_Vector4
+      - name: QuaternionDivide
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+        return: raylib_Vector4
+      - name: QuaternionLerp
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+          amount: f32
+        return: raylib_Vector4
+      - name: QuaternionNlerp
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+          amount: f32
+        return: raylib_Vector4
+      - name: QuaternionSlerp
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          q2: raylib_Vector4
+          amount: f32
+        return: raylib_Vector4
+      - name: QuaternionCubicHermiteSpline
+        type: function
+        parameters:
+          q1: raylib_Vector4
+          outTangent1: raylib_Vector4
+          q2: raylib_Vector4
+          inTangent2: raylib_Vector4
+          t: f32
+        return: raylib_Vector4
+      - name: QuaternionFromVector3ToVector3
+        type: function
+        parameters:
+          from_0: raylib_Vector3
+          to: raylib_Vector3
+        return: raylib_Vector4
+      - name: QuaternionFromMatrix
+        type: function
+        parameters:
+          mat: raylib_Matrix
+        return: raylib_Vector4
+      - name: QuaternionToMatrix
+        type: function
+        parameters:
+          q: raylib_Vector4
+        return: raylib_Matrix
+      - name: QuaternionFromAxisAngle
+        type: function
+        parameters:
+          axis: raylib_Vector3
+          angle: f32
+        return: raylib_Vector4
+      - name: QuaternionToAxisAngle
+        type: function
+        parameters:
+          q: raylib_Vector4
+          outAxis: ptr
+          outAngle: ptr
+        return: None
+      - name: QuaternionFromEuler
+        type: function
+        parameters:
+          pitch: f32
+          yaw: f32
+          roll: f32
+        return: raylib_Vector4
+      - name: QuaternionToEuler
+        type: function
+        parameters:
+          q: raylib_Vector4
+        return: raylib_Vector3
+      - name: QuaternionTransform
+        type: function
+        parameters:
+          q: raylib_Vector4
+          mat: raylib_Matrix
+        return: raylib_Vector4
+      - name: QuaternionEquals
+        type: function
+        parameters:
+          p: raylib_Vector4
+          q: raylib_Vector4
+        return: i32
+      - name: MatrixCompose
+        type: function
+        parameters:
+          translation: raylib_Vector3
+          rotation: raylib_Vector4
+          scale: raylib_Vector3
+        return: raylib_Matrix
+      - name: MatrixDecompose
+        type: function
+        parameters:
+          mat: raylib_Matrix
+          translation: ptr
+          rotation: ptr
+          scale: ptr
+        return: None
+  - module: rcamera
+    description: Generated from rcamera.h
+    declarations:
+      - name: GetCameraForward
+        type: function
+        parameters:
+          camera: ptr
+        return: raylib_Vector3
+      - name: GetCameraUp
+        type: function
+        parameters:
+          camera: ptr
+        return: raylib_Vector3
+      - name: GetCameraRight
+        type: function
+        parameters:
+          camera: ptr
+        return: raylib_Vector3
+      - name: CameraMoveForward
+        type: function
+        parameters:
+          camera: ptr
+          distance: f32
+          moveInWorldPlane: bool
+        return: None
+      - name: CameraMoveUp
+        type: function
+        parameters:
+          camera: ptr
+          distance: f32
+        return: None
+      - name: CameraMoveRight
+        type: function
+        parameters:
+          camera: ptr
+          distance: f32
+          moveInWorldPlane: bool
+        return: None
+      - name: CameraMoveToTarget
+        type: function
+        parameters:
+          camera: ptr
+          delta: f32
+        return: None
+      - name: CameraYaw
+        type: function
+        parameters:
+          camera: ptr
+          angle: f32
+          rotateAroundTarget: bool
+        return: None
+      - name: CameraPitch
+        type: function
+        parameters:
+          camera: ptr
+          angle: f32
+          lockView: bool
+          rotateAroundTarget: bool
+          rotateUp: bool
+        return: None
+      - name: CameraRoll
+        type: function
+        parameters:
+          camera: ptr
+          angle: f32
+        return: None
+      - name: GetCameraViewMatrix
+        type: function
+        parameters:
+          camera: ptr
+        return: raylib_Matrix
+      - name: GetCameraProjectionMatrix
+        type: function
+        parameters:
+          camera: ptr
+          aspect: f32
+        return: raylib_Matrix
+  - module: rlgl
+    description: Generated from rlgl.h
+    declarations:
+      - name: rlDrawCall
+        type: struct
+        fields:
+          mode: i32
+          vertexCount: i32
+          vertexAlignment: i32
+          textureId: u32
+      - name: rlRenderBatch
+        type: struct
+        fields:
+          bufferCount: i32
+          currentBuffer: i32
+          vertexBuffer: ptr
+          draws: ptr
+          drawCounter: i32
+          currentDepth: f32
+      - name: rlMatrixMode
+        type: function
+        parameters:
+          mode: i32
+        return: None
+      - name: rlPushMatrix
+        type: function
+        parameters: {}
+        return: None
+      - name: rlPopMatrix
+        type: function
+        parameters: {}
+        return: None
+      - name: rlLoadIdentity
+        type: function
+        parameters: {}
+        return: None
+      - name: rlTranslatef
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: None
+      - name: rlRotatef
+        type: function
+        parameters:
+          angle: f32
+          x: f32
+          y: f32
+          z: f32
+        return: None
+      - name: rlScalef
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: None
+      - name: rlMultMatrixf
+        type: function
+        parameters:
+          matf: ptr
+        return: None
+      - name: rlFrustum
+        type: function
+        parameters:
+          left: f64
+          right: f64
+          bottom: f64
+          top: f64
+          znear: f64
+          zfar: f64
+        return: None
+      - name: rlOrtho
+        type: function
+        parameters:
+          left: f64
+          right: f64
+          bottom: f64
+          top: f64
+          znear: f64
+          zfar: f64
+        return: None
+      - name: rlViewport
+        type: function
+        parameters:
+          x: i32
+          y: i32
+          width: i32
+          height: i32
+        return: None
+      - name: rlSetClipPlanes
+        type: function
+        parameters:
+          nearPlane: f64
+          farPlane: f64
+        return: None
+      - name: rlGetCullDistanceNear
+        type: function
+        parameters: {}
+        return: f64
+      - name: rlGetCullDistanceFar
+        type: function
+        parameters: {}
+        return: f64
+      - name: rlBegin
+        type: function
+        parameters:
+          mode: i32
+        return: None
+      - name: rlEnd
+        type: function
+        parameters: {}
+        return: None
+      - name: rlVertex2i
+        type: function
+        parameters:
+          x: i32
+          y: i32
+        return: None
+      - name: rlVertex2f
+        type: function
+        parameters:
+          x: f32
+          y: f32
+        return: None
+      - name: rlVertex3f
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: None
+      - name: rlTexCoord2f
+        type: function
+        parameters:
+          x: f32
+          y: f32
+        return: None
+      - name: rlNormal3f
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: None
+      - name: rlColor4ub
+        type: function
+        parameters:
+          r: u8
+          g: u8
+          b: u8
+          a: u8
+        return: None
+      - name: rlColor3f
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+        return: None
+      - name: rlColor4f
+        type: function
+        parameters:
+          x: f32
+          y: f32
+          z: f32
+          w: f32
+        return: None
+      - name: rlEnableVertexArray
+        type: function
+        parameters:
+          vaoId: u32
+        return: bool
+      - name: rlDisableVertexArray
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableVertexBuffer
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlDisableVertexBuffer
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableVertexBufferElement
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlDisableVertexBufferElement
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableVertexAttribute
+        type: function
+        parameters:
+          index: u32
+        return: None
+      - name: rlDisableVertexAttribute
+        type: function
+        parameters:
+          index: u32
+        return: None
+      - name: rlEnableStatePointer
+        type: function
+        parameters:
+          vertexAttribType: i32
+          buffer: ptr
+        return: None
+      - name: rlDisableStatePointer
+        type: function
+        parameters:
+          vertexAttribType: i32
+        return: None
+      - name: rlActiveTextureSlot
+        type: function
+        parameters:
+          slot: i32
+        return: None
+      - name: rlEnableTexture
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlDisableTexture
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableTextureCubemap
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlDisableTextureCubemap
+        type: function
+        parameters: {}
+        return: None
+      - name: rlTextureParameters
+        type: function
+        parameters:
+          id: u32
+          param: i32
+          value: i32
+        return: None
+      - name: rlCubemapParameters
+        type: function
+        parameters:
+          id: u32
+          param: i32
+          value: i32
+        return: None
+      - name: rlEnableShader
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlDisableShader
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableFramebuffer
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlDisableFramebuffer
+        type: function
+        parameters: {}
+        return: None
+      - name: rlGetActiveFramebuffer
+        type: function
+        parameters: {}
+        return: u32
+      - name: rlActiveDrawBuffers
+        type: function
+        parameters:
+          count: i32
+        return: None
+      - name: rlBlitFramebuffer
+        type: function
+        parameters:
+          srcX: i32
+          srcY: i32
+          srcWidth: i32
+          srcHeight: i32
+          dstX: i32
+          dstY: i32
+          dstWidth: i32
+          dstHeight: i32
+          bufferMask: i32
+        return: None
+      - name: rlBindFramebuffer
+        type: function
+        parameters:
+          target: u32
+          framebuffer: u32
+        return: None
+      - name: rlEnableColorBlend
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableColorBlend
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableDepthTest
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableDepthTest
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableDepthMask
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableDepthMask
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableBackfaceCulling
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableBackfaceCulling
+        type: function
+        parameters: {}
+        return: None
+      - name: rlColorMask
+        type: function
+        parameters:
+          r: bool
+          g: bool
+          b: bool
+          a: bool
+        return: None
+      - name: rlSetCullFace
+        type: function
+        parameters:
+          mode: i32
+        return: None
+      - name: rlEnableScissorTest
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableScissorTest
+        type: function
+        parameters: {}
+        return: None
+      - name: rlScissor
+        type: function
+        parameters:
+          x: i32
+          y: i32
+          width: i32
+          height: i32
+        return: None
+      - name: rlEnablePointMode
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisablePointMode
+        type: function
+        parameters: {}
+        return: None
+      - name: rlSetPointSize
+        type: function
+        parameters:
+          size: f32
+        return: None
+      - name: rlGetPointSize
+        type: function
+        parameters: {}
+        return: f32
+      - name: rlEnableWireMode
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableWireMode
+        type: function
+        parameters: {}
+        return: None
+      - name: rlSetLineWidth
+        type: function
+        parameters:
+          width: f32
+        return: None
+      - name: rlGetLineWidth
+        type: function
+        parameters: {}
+        return: f32
+      - name: rlEnableSmoothLines
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableSmoothLines
+        type: function
+        parameters: {}
+        return: None
+      - name: rlEnableStereoRender
+        type: function
+        parameters: {}
+        return: None
+      - name: rlDisableStereoRender
+        type: function
+        parameters: {}
+        return: None
+      - name: rlIsStereoRenderEnabled
+        type: function
+        parameters: {}
+        return: bool
+      - name: rlClearColor
+        type: function
+        parameters:
+          r: u8
+          g: u8
+          b: u8
+          a: u8
+        return: None
+      - name: rlClearScreenBuffers
+        type: function
+        parameters: {}
+        return: None
+      - name: rlCheckErrors
+        type: function
+        parameters: {}
+        return: None
+      - name: rlSetBlendMode
+        type: function
+        parameters:
+          mode: i32
+        return: None
+      - name: rlSetBlendFactors
+        type: function
+        parameters:
+          glSrcFactor: i32
+          glDstFactor: i32
+          glEquation: i32
+        return: None
+      - name: rlSetBlendFactorsSeparate
+        type: function
+        parameters:
+          glSrcRGB: i32
+          glDstRGB: i32
+          glSrcAlpha: i32
+          glDstAlpha: i32
+          glEqRGB: i32
+          glEqAlpha: i32
+        return: None
+      - name: rlglInit
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: None
+      - name: rlglClose
+        type: function
+        parameters: {}
+        return: None
+      - name: rlLoadExtensions
+        type: function
+        parameters:
+          loader: ptr
+        return: None
+      - name: rlGetProcAddress
+        type: function
+        parameters:
+          procName: cstr
+        return: ptr
+      - name: rlGetVersion
+        type: function
+        parameters: {}
+        return: i32
+      - name: rlSetFramebufferWidth
+        type: function
+        parameters:
+          width: i32
+        return: None
+      - name: rlGetFramebufferWidth
+        type: function
+        parameters: {}
+        return: i32
+      - name: rlSetFramebufferHeight
+        type: function
+        parameters:
+          height: i32
+        return: None
+      - name: rlGetFramebufferHeight
+        type: function
+        parameters: {}
+        return: i32
+      - name: rlGetTextureIdDefault
+        type: function
+        parameters: {}
+        return: u32
+      - name: rlGetShaderIdDefault
+        type: function
+        parameters: {}
+        return: u32
+      - name: rlGetShaderLocsDefault
+        type: function
+        parameters: {}
+        return: ptr
+      - name: rlLoadRenderBatch
+        type: function
+        parameters:
+          numBuffers: i32
+          bufferElements: i32
+        return: rlgl_rlRenderBatch
+      - name: rlUnloadRenderBatch
+        type: function
+        parameters:
+          batch: rlgl_rlRenderBatch
+        return: None
+      - name: rlDrawRenderBatch
+        type: function
+        parameters:
+          batch: ptr
+        return: None
+      - name: rlSetRenderBatchActive
+        type: function
+        parameters:
+          batch: ptr
+        return: None
+      - name: rlDrawRenderBatchActive
+        type: function
+        parameters: {}
+        return: None
+      - name: rlCheckRenderBatchLimit
+        type: function
+        parameters:
+          vCount: i32
+        return: bool
+      - name: rlSetTexture
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlLoadVertexArray
+        type: function
+        parameters: {}
+        return: u32
+      - name: rlLoadVertexBuffer
+        type: function
+        parameters:
+          buffer: ptr
+          size: i32
+          dynamic: bool
+        return: u32
+      - name: rlLoadVertexBufferElement
+        type: function
+        parameters:
+          buffer: ptr
+          size: i32
+          dynamic: bool
+        return: u32
+      - name: rlUpdateVertexBuffer
+        type: function
+        parameters:
+          bufferId: u32
+          data: ptr
+          dataSize: i32
+          offset: i32
+        return: None
+      - name: rlUpdateVertexBufferElements
+        type: function
+        parameters:
+          id: u32
+          data: ptr
+          dataSize: i32
+          offset: i32
+        return: None
+      - name: rlUnloadVertexArray
+        type: function
+        parameters:
+          vaoId: u32
+        return: None
+      - name: rlUnloadVertexBuffer
+        type: function
+        parameters:
+          vboId: u32
+        return: None
+      - name: rlSetVertexAttribute
+        type: function
+        parameters:
+          index: u32
+          compSize: i32
+          type: i32
+          normalized: bool
+          stride: i32
+          offset: i32
+        return: None
+      - name: rlSetVertexAttributeDivisor
+        type: function
+        parameters:
+          index: u32
+          divisor: i32
+        return: None
+      - name: rlSetVertexAttributeDefault
+        type: function
+        parameters:
+          locIndex: i32
+          value: ptr
+          attribType: i32
+          count: i32
+        return: None
+      - name: rlDrawVertexArray
+        type: function
+        parameters:
+          offset: i32
+          count: i32
+        return: None
+      - name: rlDrawVertexArrayElements
+        type: function
+        parameters:
+          offset: i32
+          count: i32
+          buffer: ptr
+        return: None
+      - name: rlDrawVertexArrayInstanced
+        type: function
+        parameters:
+          offset: i32
+          count: i32
+          instances: i32
+        return: None
+      - name: rlDrawVertexArrayElementsInstanced
+        type: function
+        parameters:
+          offset: i32
+          count: i32
+          buffer: ptr
+          instances: i32
+        return: None
+      - name: rlLoadTexture
+        type: function
+        parameters:
+          data: ptr
+          width: i32
+          height: i32
+          format: i32
+          mipmapCount: i32
+        return: u32
+      - name: rlLoadTextureDepth
+        type: function
+        parameters:
+          width: i32
+          height: i32
+          useRenderBuffer: bool
+        return: u32
+      - name: rlLoadTextureCubemap
+        type: function
+        parameters:
+          data: ptr
+          size: i32
+          format: i32
+          mipmapCount: i32
+        return: u32
+      - name: rlUpdateTexture
+        type: function
+        parameters:
+          id: u32
+          offsetX: i32
+          offsetY: i32
+          width: i32
+          height: i32
+          format: i32
+          data: ptr
+        return: None
+      - name: rlGetGlTextureFormats
+        type: function
+        parameters:
+          format: i32
+          glInternalFormat: ptr
+          glFormat: ptr
+          glType: ptr
+        return: None
+      - name: rlGetPixelFormatName
+        type: function
+        parameters:
+          format: u32
+        return: cstr
+      - name: rlUnloadTexture
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlGenTextureMipmaps
+        type: function
+        parameters:
+          id: u32
+          width: i32
+          height: i32
+          format: i32
+          mipmaps: ptr
+        return: None
+      - name: rlReadTexturePixels
+        type: function
+        parameters:
+          id: u32
+          width: i32
+          height: i32
+          format: i32
+        return: ptr
+      - name: rlReadScreenPixels
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: ptr
+      - name: rlLoadFramebuffer
+        type: function
+        parameters: {}
+        return: u32
+      - name: rlFramebufferAttach
+        type: function
+        parameters:
+          id: u32
+          texId: u32
+          attachType: i32
+          texType: i32
+          mipLevel: i32
+        return: None
+      - name: rlFramebufferComplete
+        type: function
+        parameters:
+          id: u32
+        return: bool
+      - name: rlUnloadFramebuffer
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlCopyFramebuffer
+        type: function
+        parameters:
+          x: i32
+          y: i32
+          width: i32
+          height: i32
+          format: i32
+          pixels: ptr
+        return: None
+      - name: rlResizeFramebuffer
+        type: function
+        parameters:
+          width: i32
+          height: i32
+        return: None
+      - name: rlLoadShader
+        type: function
+        parameters:
+          code: cstr
+          type: i32
+        return: u32
+      - name: rlLoadShaderProgram
+        type: function
+        parameters:
+          vsCode: cstr
+          fsCode: cstr
+        return: u32
+      - name: rlLoadShaderProgramEx
+        type: function
+        parameters:
+          vsId: u32
+          fsId: u32
+        return: u32
+      - name: rlLoadShaderProgramCompute
+        type: function
+        parameters:
+          csId: u32
+        return: u32
+      - name: rlUnloadShader
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlUnloadShaderProgram
+        type: function
+        parameters:
+          id: u32
+        return: None
+      - name: rlGetLocationUniform
+        type: function
+        parameters:
+          id: u32
+          uniformName: cstr
+        return: i32
+      - name: rlGetLocationAttrib
+        type: function
+        parameters:
+          id: u32
+          attribName: cstr
+        return: i32
+      - name: rlSetUniform
+        type: function
+        parameters:
+          locIndex: i32
+          value: ptr
+          uniformType: i32
+          count: i32
+        return: None
+      - name: rlSetUniformMatrix
+        type: function
+        parameters:
+          locIndex: i32
+          mat: raylib_Matrix
+        return: None
+      - name: rlSetUniformMatrices
+        type: function
+        parameters:
+          locIndex: i32
+          mat: ptr
+          count: i32
+        return: None
+      - name: rlSetUniformSampler
+        type: function
+        parameters:
+          locIndex: i32
+          textureId: u32
+        return: None
+      - name: rlSetShader
+        type: function
+        parameters:
+          id: u32
+          locs: ptr
+        return: None
+      - name: rlComputeShaderDispatch
+        type: function
+        parameters:
+          groupX: u32
+          groupY: u32
+          groupZ: u32
+        return: None
+      - name: rlLoadShaderBuffer
+        type: function
+        parameters:
+          size: u32
+          data: ptr
+          usageHint: i32
+        return: u32
+      - name: rlUnloadShaderBuffer
+        type: function
+        parameters:
+          ssboId: u32
+        return: None
+      - name: rlUpdateShaderBuffer
+        type: function
+        parameters:
+          id: u32
+          data: ptr
+          dataSize: u32
+          offset: u32
+        return: None
+      - name: rlBindShaderBuffer
+        type: function
+        parameters:
+          id: u32
+          index: u32
+        return: None
+      - name: rlReadShaderBuffer
+        type: function
+        parameters:
+          id: u32
+          dest: ptr
+          count: u32
+          offset: u32
+        return: None
+      - name: rlCopyShaderBuffer
+        type: function
+        parameters:
+          destId: u32
+          srcId: u32
+          destOffset: u32
+          srcOffset: u32
+          count: u32
+        return: None
+      - name: rlGetShaderBufferSize
+        type: function
+        parameters:
+          id: u32
+        return: u32
+      - name: rlBindImageTexture
+        type: function
+        parameters:
+          id: u32
+          index: u32
+          format: i32
+          readonly: bool
+        return: None
+      - name: rlGetMatrixModelview
+        type: function
+        parameters: {}
+        return: raylib_Matrix
+      - name: rlGetMatrixProjection
+        type: function
+        parameters: {}
+        return: raylib_Matrix
+      - name: rlGetMatrixTransform
+        type: function
+        parameters: {}
+        return: raylib_Matrix
+      - name: rlGetMatrixProjectionStereo
+        type: function
+        parameters:
+          eye: i32
+        return: raylib_Matrix
+      - name: rlGetMatrixViewOffsetStereo
+        type: function
+        parameters:
+          eye: i32
+        return: raylib_Matrix
+      - name: rlSetMatrixProjection
+        type: function
+        parameters:
+          proj: raylib_Matrix
+        return: None
+      - name: rlSetMatrixModelview
+        type: function
+        parameters:
+          view: raylib_Matrix
+        return: None
+      - name: rlSetMatrixProjectionStereo
+        type: function
+        parameters:
+          right: raylib_Matrix
+          left: raylib_Matrix
+        return: None
+      - name: rlSetMatrixViewOffsetStereo
+        type: function
+        parameters:
+          right: raylib_Matrix
+          left: raylib_Matrix
+        return: None
+      - name: rlLoadDrawCube
+        type: function
+        parameters: {}
+        return: None
+      - name: rlLoadDrawQuad
+        type: function
+        parameters: {}
+        return: None

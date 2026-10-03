@@ -33,6 +33,7 @@ from mlir_python.lang import (
 from bifrost import std
 from bifrost.configs import Config
 from bifrost.configs.schema import Declaration, _Extern, _Function
+from bifrost.list_methods import ListMethods
 from bifrost.naming import to_snake_case
 from bifrost.owned import Drops
 
@@ -128,6 +129,8 @@ class Project:
         self.changing: set[str] = set()
         # The functions freeing and copying lists, and the records and objects holding them.
         self.drops = Drops(self.program)
+        # A list's own functions (xs.map(f), g.sort()), generated per element type.
+        self.list_methods = ListMethods(self.drops)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
         self._runtime_externs: dict[str, Function[..., Any]] = {}
         self._init_declarations()

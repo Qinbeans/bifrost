@@ -1,0 +1,139 @@
+# Builds the Bifrost packages in extras/ (each folder whose config.yaml says
+# `package.build: library`): their C libraries, with CMake, then
+# `bfc package`, once per Linux target (or once, as `any`, for a package with
+# no C libraries of its own).
+#
+# Releasing a package is bumping `package.version` in its config.yaml: when a
+# push to main has a version with no `<name>-v<version>` tag yet, its archives
+# are published as release `<name>-v<version>` (creating the tag) and the
+# package index is updated. Pull requests build every package, releasing none.
+name: Packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "extras/**"
+      - "src/bifrost/packages.py"
+      - "tools/package_index.py"
+      - ".github/workflows/packages.yml"
+      - ".github/workflows/package-index.yml"
+  pull_request:
+    paths:
+      - "extras/**"
+      - "src/bifrost/packages.py"
+      - "tools/package_index.py"
+      - ".github/workflows/packages.yml"
+      - ".github/workflows/package-index.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run on main: it may be publishing a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    name: Find new versions
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.plan.outputs.builds }}
+      releases: ${{ steps.plan.outputs.releases }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - id: plan
+        run: |
+          every=
+          release=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            every=--all
+            release=false
+          fi
+          plan=$(uv run --no-project --with pyyaml python tools/package_index.py plan $every)
+          echo "$plan" | python3 -m json.tool
+          echo "builds=$(echo "$plan" | jq -c .builds)" >> "$GITHUB_OUTPUT"
+          echo "releases=$(echo "$plan" | jq -c .releases)" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }} ${{ matrix.version }} (${{ matrix.native && matrix.arch || 'any' }})
+    needs: plan
+    if: needs.plan.outputs.builds != '[]'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+
+      # What the packages' C libraries build with: h2o (http_server) needs
+      # OpenSSL and zlib; raylib, X11 and OpenGL.
+      - name: Install build tools and libraries
+        if: matrix.native
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build \
+            libssl-dev zlib1g-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+
+      - name: Build the C libraries
+        if: matrix.native
+        run: |
+          cmake -S "${{ matrix.folder }}" -B "${{ matrix.folder }}/build" -G Ninja
+          cmake --build "${{ matrix.folder }}/build"
+
+      - name: Package
+        run: uv run --frozen bfc package --config "${{ matrix.folder }}/config.yaml" --output dist
+
+      - name: Check the archive's name
+        run: |
+          ls -l dist
+          triple=any
+          if [ "${{ matrix.native }}" = true ]; then triple="${{ matrix.arch }}-unknown-linux-gnu"; fi
+          test -f "dist/${{ matrix.name }}-${{ matrix.version }}-$triple.bifpkg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bifpkg-${{ matrix.name }}-${{ matrix.arch }}
+          path: dist/*.bifpkg
+
+  release:
+    name: Release ${{ matrix.tag }}
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true' && needs.plan.outputs.releases != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.releases) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bifpkg-${{ matrix.name }}-*
+          merge-multiple: true
+          path: dist
+      # Creates the tag at this commit when it does not exist yet.
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ matrix.tag }}
+          name: ${{ matrix.name }} ${{ matrix.version }}
+          target_commitish: ${{ github.sha }}
+          body: "Bifrost package `${{ matrix.name }}` ${{ matrix.version }}: one `.bifpkg` per target. Use it with `packages: {${{ matrix.name }}: ${{ matrix.version }}}` and `index: https://qinbeans.github.io/bifrost/packages/`."
+          # The compiler's releases (`v*`) stay the latest, not a package's.
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: dist/*.bifpkg
+
+  index:
+    name: Publish the package index
+    needs: release
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/package-index.yml

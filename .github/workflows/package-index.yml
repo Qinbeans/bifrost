@@ -1,0 +1,53 @@
+# Publishes the index of the Bifrost packages released here (the .bifpkg files
+# on this repository's releases) to GitHub Pages, at
+#   https://qinbeans.github.io/bifrost/packages/
+# which a project names in its config.yaml:
+#   index: https://qinbeans.github.io/bifrost/packages/
+#   packages:
+#     http_server: 0.1.0
+# Requires Settings -> Pages -> Source: "GitHub Actions".
+name: Package index
+
+on:
+  # Runs after packages.yml publishes a release, and whenever a release is
+  # changed by hand.
+  workflow_call:
+  release:
+    types: [published, edited, deleted]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}packages/
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+
+      - name: List every release's packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/packages
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" \
+            | uv run --no-project --with pyyaml python tools/package_index.py index > site/packages/index.html
+          cat site/packages/index.html
+          printf '<!DOCTYPE html>\n<meta http-equiv="refresh" content="0; url=packages/">\n<a href="packages/">Bifrost packages</a>\n' > site/index.html
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5

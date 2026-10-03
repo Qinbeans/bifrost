@@ -19,12 +19,13 @@ from mlir_python.codegen import OptLevel
 from mlir_python.lang import CompileError
 from tree_sitter import Language, Node, Parser
 
-from bifrost import std
+from bifrost import list_methods, std
 from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.configs.schema import Declaration, _Extern
 from bifrost.lowering import RECORD, BifrostError, display_types, lower_file
 from bifrost.naming import extern_name, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
 from bifrost.owned import is_list
+from bifrost.packages import PackageError
 from bifrost.project import Project
 from bifrost.std import fmt, json, mem, tasks
 from bifrost.syntax import syntax_errors
@@ -190,6 +191,9 @@ def _descendants(node: Node, *kinds: str, own: bool = False) -> list[Node]:
     return found
 
 
+# The comment that accepts a lambda's captured local being a copy (see `Document.captures`).
+_IGNORE_COPY = "// ignore: copy"
+
 # Where a name is declared or only named, rather than read: `let x`, `x: i32`,
 # `let g <- ...`, `g -> x`, `f(width: ...)`. (Calling `f(...)` reads `f`: it
 # may be a function value.)
@@ -204,8 +208,13 @@ _NOT_USES = {
 
 
 def _uses(function: Node) -> list[Node]:
-    """Return the names ``function``'s body reads: plain names and the roots of dotted names."""
-    found = []
+    """Return the names ``function``'s body reads: plain names, the roots of dotted names, and its lambdas' captures."""
+    found = [
+        entry
+        for lambda_ in _descendants(function, "local_function_definition", own=True)
+        if lambda_ is not function and _named(lambda_) and _named(lambda_)[0].type == "local_dependency_list"
+        for entry in _named(_named(lambda_)[0])
+    ]
     for node in _descendants(function, "identifier", "child_annotation", own=True):
         if node.type == "child_annotation":
             root = _named(node)[0]
@@ -256,6 +265,7 @@ class Document:
     text: str
     config_path: Path | None = None
     config: Config | None = None
+    package_error: str | None = None  # why the packages config.yaml lists cannot be used, if they cannot
     _lines: list[bytes] = field(init=False, repr=False)
     # The `=> Record` functions whose returns are being read (a record holding a call of itself stops there).
     _resolving: set[int] = field(init=False, repr=False)
@@ -309,15 +319,22 @@ class Document:
 
     def load_config(self) -> Config:
         """Load (once) the project configuration, or a default one outside a project."""
-        if self.config is None:
-            self.config = ConfigBuilder(self.config_path).build() if self.config_path else default_config()
+        if self.config is None and self.config_path is None:
+            self.config = default_config()
+        elif self.config is None:
+            assert self.config_path is not None
+            try:
+                self.config = ConfigBuilder(self.config_path).build()
+            except PackageError as error:  # still usable without its packages; reported with the errors
+                self.package_error = str(error)
+                self.config = ConfigBuilder(self.config_path, resolve=False).build()
         return self.config
 
     # -- diagnostics ------------------------------------------------------------------
 
     def diagnostics(self) -> list[Diagnostic]:
         """Report syntax errors, or else lowering and type errors; and naming warnings."""
-        return [*self._program_errors(), *self.naming(), *self.unused()]
+        return [*self._program_errors(), *self.naming(), *self.unused(), *self.captures()]
 
     def naming(self) -> list[Diagnostic]:
         """Warn about names that break the conventions: snake_case, and PascalCase objects."""
@@ -341,6 +358,35 @@ class Document:
             else:
                 continue
             found.append(Diagnostic(self.range(identifier), message, Severity.WARNING))
+        return found
+
+    def captures(self) -> list[Diagnostic]:
+        """Warn that a lambda's captured local is a copy, unless ``// ignore: copy`` accepts it.
+
+        The comment goes on the capture's line or the line above it.
+        """
+        found = []
+        lines = self.text.splitlines()
+        for function in _descendants(self.root, "local_function_definition"):
+            listed = (
+                _named(function)[0]
+                if _named(function) and _named(function)[0].type == "local_dependency_list"
+                else None
+            )
+            outer = function.parent
+            for entry in _named(listed) if listed is not None and outer is not None else []:
+                name = _text(entry)
+                if "." in name or self._local(name, outer) is None:
+                    continue  # a function it calls, not a captured local
+                row = entry.start_point[0]
+                accepted = [lines[row] if row < len(lines) else "", lines[row - 1] if row > 0 else ""]
+                if any(_IGNORE_COPY in line for line in accepted):
+                    continue
+                message = (
+                    f"{name} is captured as a copy: the lambda keeps the value {name} has here, and does not see "
+                    f"later changes to it. Add `{_IGNORE_COPY}` to this line or the one above to accept that"
+                )
+                found.append(Diagnostic(self.range(entry), message, Severity.WARNING))
         return found
 
     def unused(self) -> list[Diagnostic]:
@@ -383,6 +429,8 @@ class Document:
             config = self.load_config()
         except Exception as error:  # noqa: BLE001 - any invalid config is reported, not raised
             return [*found, Diagnostic(((0, 0), (0, 0)), f"cannot load {self.config_path}: {error}")], inferred
+        if self.package_error is not None:
+            found.append(Diagnostic(((0, 0), (0, 0)), self.package_error))
         try:
             project = Project(config)
             unit = lower_file(project, self.path, self.source, root=self.project_root)
@@ -474,7 +522,10 @@ class Document:
         return node
 
     def _local(self, name: str, node: Node) -> Node | None:
-        """Return the parameter or ``let`` that binds ``name`` where ``node`` is."""
+        """Return the parameter or ``let`` that binds ``name`` where ``node`` is.
+
+        In a lambda that captures ``name``, it is the binding it copies, around the lambda.
+        """
         function = self._enclosing_function(node)
         if function is None:
             return None
@@ -488,7 +539,19 @@ class Document:
             identifier = _name_of(current)
             if identifier is not None and _text(identifier) == name:
                 return current
+        if self._captures(function, name) and function.parent is not None:
+            return self._local(name, function.parent)
         return None
+
+    @staticmethod
+    def _captures(function: Node, name: str) -> bool:
+        """Whether a lambda's dependency list names ``name`` (a local it captures, if one is around it)."""
+        listed = _named(function)[0] if _named(function) else None
+        return (
+            listed is not None
+            and listed.type == "local_dependency_list"
+            and any(_text(entry) == name for entry in _named(listed))
+        )
 
     def _describe_local(self, local: Node) -> str:
         """``let guard: Guard[Context] <- ctx``: a local's binding, with its type when it is known."""
@@ -632,6 +695,9 @@ class Document:
         """Return the type of an expression, for the simple cases: calls, construction, names."""
         if value.type == "local_function_definition":
             return self._signature(value)  # a lambda
+        if value.type == "literal" and _named(value)[0].type == "string":
+            owned = self._written_type(value, where) == "mem.Unique[str]"
+            return "mem.Unique[str]" if owned else None  # `"Hi {name}"`: a new string
         if value.type == "identifier":
             return self._type_of_name(_text(value), where)
         if value.type == "function_call":
@@ -714,7 +780,8 @@ class Document:
 
     def _result_of(self, function: Node) -> str | None:
         """Return a function's result type as written, or, for ``Record``, the record it returns."""
-        written = self._signature(function).rpartition(" => ")[2] or None
+        parts = [p for p in _named(function) if p.type not in {"dependency_list", "local_dependency_list"}]
+        written = " ".join(_text(parts[1]).split()) if parts[1:] and parts[0].type == "parameter_list" else None
         if written != RECORD:
             return written
         shown = self._record_text(self._returned_entries(function))
@@ -1011,7 +1078,7 @@ class Document:
         except Exception:  # noqa: BLE001 - reported by diagnostics
             return None
         extern = next((e for e in config.externs if e.module == module), None)
-        return (extern, self.config_path) if extern is not None else None
+        return (extern, config.declared_in.get(module, self.config_path)) if extern is not None else None
 
     def _declaration(self, module: str, member: str) -> Declaration | None:
         found = self._extern(module)
@@ -1073,7 +1140,7 @@ class Document:
         name = _text(node)
         local = self._local(name, node)
         if local is not None or (name == "super" and self._receiver(node) is not None):
-            return _code(self._describe_local(local)) if local is not None else self._hover_super(node)
+            return self._hover_local(name, node, local) if local is not None else self._hover_super(node)
         binding = self.bindings().get(name)
         if binding is None:
             return None
@@ -1081,6 +1148,13 @@ class Document:
         if value.type in {"function_definition", "struct_assignment"}:
             return _documented(self._describe_binding(assignment), _doc(value))
         return _documented(_text(assignment), self._module_doc(value))
+
+    def _hover_local(self, name: str, node: Node, local: Node) -> str:
+        """Describe a local; in a lambda that captures it, say that it is a copy."""
+        function = self._enclosing_function(node)
+        copied = function is not None and self._captures(function, name) and self._enclosing_function(local) != function
+        note = "\n// captured: a copy, made where the lambda is" if copied else ""
+        return _code(self._describe_local(local) + note)
 
     def _hover_super(self, node: Node) -> str:
         """Describe ``super``: the object a method is called on, lent to it when it changes it."""
@@ -1158,6 +1232,21 @@ class Document:
             return None
         return _text(path[0]), [_text(p) for p in path[1:]]
 
+    def _called_path(self, node: Node) -> tuple[str, list[str]] | None:
+        """For ``value.a.f(x)`` with the cursor on ``f``, return ``value`` and the names up to it: ``["a", "f"]``."""
+        identifier = node.parent if node.parent is not None and node.parent.type == "identifier" else node
+        call = identifier.parent
+        if call is None or call.type != "user_function_call" or call.child_by_field_name("function") != identifier:
+            return None
+        part = call.parent
+        owner = part.parent if part is not None else None
+        if owner is None or owner.type != "child_annotation" or part not in _named(owner)[1:]:
+            return None
+        before = _named(owner)[: _named(owner).index(part)]
+        if any(p.type != "simple_identifier" for p in before):
+            return None
+        return _text(before[0]), [*(_text(p) for p in before[1:]), _text(identifier)]
+
     def _hover_record_result(self, node: Node) -> str | None:
         """Describe ``Record`` where a function's result is written: the record it returns."""
         written = node.parent if node.parent is not None and node.parent.type == "identifier" else node
@@ -1191,8 +1280,15 @@ class Document:
         return self._hover_record_field(node) or "" if self._field_path(node) is not None else None
 
     def _hover_record_field(self, node: Node) -> str | None:
-        """Describe ``found.user`` or ``found.user.id``: a field of a record (or object) a local holds."""
-        path = self._field_path(node)
+        """Describe ``found.user`` or ``found.user.id``: a field of a record (or object) a local holds.
+
+        Or ``xs.map``: a list's method.
+        """
+        path = self._field_path(node) or self._called_path(node)
+        listed = self._list_owner(path[0], path[1][:-1], node) if path is not None else None
+        if path is not None and listed is not None and path[1][-1] in list_methods.METHODS:
+            signature, summary = list_methods.describe(path[1][-1], listed[:-2])
+            return _code(f"let {path[1][-1]} = {signature}\n// {summary}")
         kind = self._path_type(path[0], path[1], node) if path is not None else None
         if path is None or kind is None:
             return None
@@ -1242,8 +1338,7 @@ class Document:
             value = _named(value)[0]
         match value.type:
             case "string" | "boolean" | "number":
-                number = value.type == "number" and _named(value)[0].type == "float"
-                return "f64" if number else {"string": "str", "boolean": "bool", "number": "i64"}[value.type]
+                return _literal_type(value)
             case "record" | "await_expression":
                 return self._record_text(self._entries(value, where))
             case "list":
@@ -1369,6 +1464,14 @@ class Document:
         """Where ``import("a.b:module")`` finds ``a/b.bif``: the project's ``src/``, or its folder."""
         return source_root(self.config_path.parent) if self.config_path else self.path.parent
 
+    def _source_roots(self) -> list[Path]:
+        """Where ``import("a.b:module")`` looks: the project's sources, then its packages'."""
+        try:
+            sources = self.load_config().sources
+        except Exception:  # noqa: BLE001 - an invalid config is reported by diagnostics
+            sources = []
+        return [self.project_root, *sources]
+
     def _open(self, path: Path) -> "Document | None":
         try:
             text = path.read_text()
@@ -1380,13 +1483,17 @@ class Document:
         """Find ``file:module``'s ``module`` node, and the document it is in."""
         file_part, _, name = spec.partition(":")
         dots = len(file_part) - len(file_part.lstrip("."))
-        base = self.project_root if dots == 0 else self.path.parent
+        base = self.path.parent
         for _ in range(max(dots - 1, 0)):
             base = base.parent
         names = file_part[dots:].split(".")
         if not all(names):
             return None
-        other = self._open(base.joinpath(*names[:-1], names[-1] + ".bif"))
+        bases = [base] if dots else self._source_roots()
+        other = next(
+            (found for root in bases if (found := self._open(root.joinpath(*names[:-1], names[-1] + ".bif")))),
+            None,
+        )
         if other is None:
             return None
         module = next(
@@ -1444,8 +1551,8 @@ class Document:
     def _file_modules(self) -> list[tuple[str, str]]:
         """Return every exported module under the project root, as (``utils.text:greeting``, description)."""
         found = []
-        root = self.project_root
-        for path in sorted(root.rglob("*.bif")):
+        roots = self._source_roots()
+        for root, path in ((base, path) for base in roots for path in sorted(base.rglob("*.bif"))):
             relative = path.relative_to(root)
             if any(part.startswith(".") or part in _SKIPPED_FOLDERS for part in relative.parts[:-1]):
                 continue
@@ -1513,9 +1620,23 @@ class Document:
             )
         return found
 
+    def _list_owner(self, name: str, fields: list[str], where: Node) -> str | None:
+        """Return the type ``name.fields`` reaches if it is a list (``i64[]``), else ``None``."""
+        written = self._path_type(name, fields, where) if fields else self.type_of(name, where)
+        return written if written is not None and written.endswith("[]") else None
+
     def _record_completions(self, owner: str, where: Node) -> list[Completion]:
-        """Offer the fields of the record (or object) ``owner`` reaches, after ``results.`` or ``found.user.``."""
+        """Offer the fields of the record (or object) ``owner`` reaches, after ``results.`` or ``found.user.``.
+
+        Or a list's methods, after ``xs.``.
+        """
         name, *fields = owner.split(".")
+        listed = self._list_owner(name, fields, where)
+        if listed is not None:
+            return [
+                Completion(method, "method", f"{method} = {list_methods.describe(method, listed[:-2])[0]}")
+                for method in sorted(list_methods.METHODS)
+            ]
         local = self._local(name, where)
         if local is None:
             return []
@@ -1714,6 +1835,15 @@ def _top_level(text: str) -> list[str]:
             start = index + 1
     parts.append(text[start:].strip())
     return [part for part in parts if part]
+
+
+def _literal_type(value: Node) -> str:
+    """Write a string, boolean or number literal's type: ``"Hi {name}"`` (a new string) is a ``mem.Unique[str]``."""
+    if value.type == "string":
+        return "mem.Unique[str]" if any(part.type == "interpolation" for part in _named(value)) else "str"
+    if value.type == "number":
+        return "f64" if _named(value)[0].type == "float" else "i64"
+    return "bool"
 
 
 def _field_type(kind: Any, path: list[str]) -> Any:  # noqa: ANN401 - a compiler type

@@ -63,7 +63,26 @@ let main = [apply, double] () => null {
 }
 ```
 
-Naming a function without calling it counts as depending on it, so `main` lists `double`; calling a function value (`f(x)` in `apply`) needs no entry, because its type already says what it is. A lambda has its own dependency list, and cannot use the locals of the function around it yet (pass them as parameters). Function values are C function pointers, so C libraries can call back into Bifrost.
+Naming a function without calling it counts as depending on it, so `main` lists `double`; calling a function value (`f(x)` in `apply`) needs no entry, because its type already says what it is.
+
+A lambda has its own dependency list, which also names the locals it captures. It captures a copy, made where the lambda is written: later changes to the local are not seen. An owned value (a list, an owned string) moves in, so copy it first (`let mine = #[...xs]`) if it stays in use. A function value can be returned, stored in an object or a list, and passed on; it owns what it captured, which its owner frees:
+
+```bifrost
+let adder = [] (n: i64) => (i64) => i64 {
+    return [n] (x: i64) => i64 x + n     // captures a copy of n
+}
+
+let main = [adder, io.printf] () => null {
+    let add3 = adder(3)
+    let scale = 10
+    let times = [scale] (x: i64) => i64 x * scale
+    io.printf("%d %d\n", add3(4), times(2))   // 7 20
+}
+```
+
+The language server warns at each capture that it is a copy; `// ignore: copy` on that line (or the one above) accepts it.
+
+A function value is the function and what it captured, so C cannot call one. A C function that takes a callback takes a function by name, or a lambda that captures nothing: either is a plain C function pointer, so C libraries can call back into Bifrost.
 
 ### Objects
 
@@ -111,7 +130,7 @@ A copy cannot call one, since no one would see the change: a parameter (take it 
 
 ### Owners, guards and shared values
 
-`std:mem` holds the containers that say how a value is held. A `mem.Unique[T]` local is the one owner of its value; a `mem.Weak[T]` parameter is that value lent to a call. Either is reached only through a guard, a lock that exists only at compile time.
+`std:mem` holds the containers that say how a value is held. A `mem.Unique[T]` local is the one owner of its value; a `mem.Weak[T]` parameter is that value lent to a call. Either is reached only through a guard, a lock that exists only at compile time. A plain `let` is owned by its function alone too, and is lent to a `mem.Weak` parameter the same way (as is a part of what a guard holds, like `g[i]`); `mem.Unique` also makes every use of it go through a guard.
 
 ```bifrost
 let mem = import("std:mem")
@@ -203,6 +222,17 @@ stdio.printf("%v\n", team)                          // core (2 members), from Te
 stdio.printf("%s\n", xs)                            // error: xs is a list, which %s cannot print; print it with %v
 ```
 
+A string with values in braces interpolates them: `"Hello, {name}!"` is a new owned string, as `fmt.format` makes, with no import or dependency entry. Each `{value}` prints as `%v` does, and `{value:spec}` with a printf conversion (`{price:.2f}`), checked at compile time. In a printf pattern, interpolated values go where the pattern reads them. `{{` and `}}` are braces in the text:
+
+```bifrost
+let greet = [stdio.puts] (name: str, items: i64[]) => null {
+    stdio.puts("Hello, {name}! You have {len(items)} items: {items}")   // freed after the statement
+}
+
+let line = "total: {price * 2.0:.2f} {{EUR}}"   // owned by line: total: 5.00 {EUR}
+stdio.printf("{name} is %d\n", age)             // ada is 36
+```
+
 ### Records and JSON
 
 A record is a value with named fields, written where it is used: `#{id: 7, name: "user 7", admin: false}`. Its field types come from its values, and records with the same fields have the same type. `std:json` turns records and objects into JSON text:
@@ -270,6 +300,22 @@ g[1] = #[30, 40, 50]             // the old row is freed
 g -> grid
 ```
 
+A list has its own functions, called on it like methods (built in, like `len`: no import, no dependency entry):
+
+```bifrost
+let xs = #[5, 3, 9, 1]
+xs.contains(9)                                   // true (numbers, bools and strings)
+xs.index_of(1)                                   // 3, or -1 when absent
+let big = xs.filter([] (x: i64) => bool x > 4)   // #[5, 9]: a new list
+let doubled = big.map([] (x: i64) => i64 x * 2)  // #[10, 18]
+let ordered = xs.sorted()                        // #[1, 3, 5, 9] (also xs.reversed())
+let g <- xs
+g.sort()                                         // in place, through a guard (also g.reverse())
+g -> xs
+```
+
+`map`, `filter`, `sorted` and `reversed` make new lists, of copies, which their owner frees; `sort` and `reverse` change the list in place, so they go through a guard, like item writes. Sorting orders numbers and strings, in O(n log n) and no extra memory.
+
 `xs[a...b]` is a new list of the items from `a` up to `b` (`xs[1...]`, `xs[...-1]`: either left out is the end), with Python's rules: negative counts from the end, and bounds past either end stop there. `users[0].name` reads on from an item.
 
 A list or record can own the strings it holds: its type says `mem.Unique[str]` (`mem.Unique[str][]`, `#{name: mem.Unique[str]}`, or an object's field), and it frees them with itself. A string from `fmt.format` moves in; a literal cannot (it is not the list's to free), so the compiler asks for an owned copy, `fmt.format("%s", "text")`. A value holding lists can also live in a `mem.Shared` or `mem.Atomic`, whose last owner frees it; a guard on one can grow its lists in place, which is how the HTTP example keeps notes across requests:
@@ -309,7 +355,7 @@ A list has one owner, like an owned string: the `let` holding it, freed at the e
 
 ### HTTP servers
 
-`examples/http` is a JSON API on [h2o](https://github.com/h2o/h2o), serving HTTP/1.1, HTTP/2 and, with a certificate, HTTP/3. Its `http` library is the project's own: a small C wrapper (`c/http.c`) built with CMake and declared in its `config.yaml`, as any C library is. Routes take handlers, fasthttp style, since functions are values:
+`examples/http` is a JSON API on [h2o](https://github.com/h2o/h2o), serving HTTP/1.1, HTTP/2 and, with a certificate, HTTP/3. Its `http` library is a package, [`extras/http-server`](./extras/http-server): a small C wrapper (`c/http.c`) built with CMake and declared in the package's `config.yaml`, and a Bifrost module of ready-made handlers. Routes take handlers, fasthttp style, since functions are values:
 
 ```bifrost
 let http = import("http")
@@ -378,7 +424,7 @@ A C library that runs an event loop lets the runtime use it: it calls `bifrost_a
 
 ### C libraries and standard modules
 
-`import("raylib")` brings in a module declared in `config.yaml`. Its functions take Bifrost names: `InitWindow` is `rl.init_window`, and structs keep PascalCase (`rl.Color`). The C symbols are unchanged.
+`import("raylib")` brings in a module declared in `config.yaml`, the project's or a package's (raylib's is [`extras/raylib`](./extras/raylib)). Its functions take Bifrost names: `InitWindow` is `rl.init_window`, and structs keep PascalCase (`rl.Color`). The C symbols are unchanged.
 
 `import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, and `import("std:fmt")` formatting.
 
@@ -428,6 +474,7 @@ let draw = [rl.begin_drawing, rl.end_drawing] (ctx: mem.Weak[Context]) => null {
 | `bfc init my_api` | Create a project: `config.yaml`, `.gitignore`, `README.md`, `src/my_api/main.bif` |
 | `bfc build` (or `bfc build file.bif -c config.yaml -o out`) | Compile the project's entry (or a given file) to a native executable in `build/` |
 | `bfc fmt main.bif` (`--check` to only report) | Format source files; only ever changes whitespace |
+| `bfc package` (`-o folder`) | Package a library (`package.build: library`) for others to use, as a `.bifpkg` in `dist/` (see [Packages](#packages)) |
 | `bfc lsp` | Run the language server (diagnostics, formatting, outline, hover, go-to-definition, completion) |
 | `bfc config traverse -c config.yaml -i path/to/include/` | Generate extern declarations in `config.yaml` from C/C++ headers |
 
@@ -469,6 +516,38 @@ Library paths are relative to `config.yaml`. A parameter that takes a C callback
 
 Writing `externs` by hand is rarely needed: `bfc config traverse` reads the headers with libclang and generates them, one module per header. It reports each declaration it skips and why (variadic functions, structs with array members, C++ functions without `extern "C"`, ...).
 
+## Packages
+
+A package is a project other projects use: its Bifrost modules, and the C libraries they bind with their declarations. Its `config.yaml` says so, and has no `entry` (a library has no `main`):
+
+```yaml
+package:
+  name: greeting
+  version: 0.2.0
+  build: library      # the default is `executable`: `bfc build` compiles package.entry
+```
+
+`bfc build` refuses a library, and `bfc package` anything else. `bfc package` makes it a `.bifpkg` file in `dist/`, a gzipped tarball named like a Python wheel:
+
+```
+http_server-0.1.0-x86_64-unknown-linux-gnu.bifpkg    # its sources, config.yaml, and lib/*.a built for that target
+greeting-0.2.0-any.bifpkg                            # Bifrost only: any target
+```
+
+Bifrost code ships as source, compiled with the project that uses it (the compiler needs its signatures, ownership and what pauses); C code ships compiled, for one target. A project lists its packages in `config.yaml`:
+
+```yaml
+index: https://qinbeans.github.io/bifrost/packages/   # a page of links to .bifpkg files, or a folder
+packages:
+  http_server: 0.1.0                                  # from the index: this target's, or else `any`
+  greeting:
+    path: ../greeting                                 # a project folder (while developing), or a .bifpkg file
+```
+
+`bfc build` fetches what it needs (into `~/.cache/bifrost/packages`) and unpacks it into `build/pkg/<name>/`. A package's externs and libraries join the project's, and its modules import like the project's own: `import("http_server.handlers:handlers")` looks in the project's `src/`, then in each package's. The editor uses packages already unpacked, and says when one needs `bfc build` first.
+
+The packages in `extras/` (each with `build: library`) are published to that index, `https://qinbeans.github.io/bifrost/packages/`, for x86_64 and aarch64 Linux. Releasing one is bumping `package.version` in its `config.yaml`: on the push to `main`, CI (`.github/workflows/packages.yml`) builds its C libraries with CMake on each target, runs `bfc package`, and publishes the archives as release `<name>-v<version>`; the index (`tools/package_index.py`) links every release's `.bifpkg` with its SHA-256, which `bfc build` checks before using a download.
+
 ## Architecture
 
 ```
@@ -485,7 +564,9 @@ bifrost/
 │   ├── naming.py          # snake_case / PascalCase checks and conversions
 │   ├── formatter/         # The formatter
 │   └── server/            # The language server (pygls) and its analysis
-├── examples/              # hello_raylib.bif, its config.yaml, and a CMake file that builds raylib
+├── examples/              # http, raylib and async apps, and simple
+├── extras/                # packages (http-server, raylib) and the VS Code extension
+├── tools/                 # package_index.py: which packages CI builds, and their index page
 └── tests/
 ```
 
@@ -526,7 +607,7 @@ A project uses the source layout:
 my_api/
 ├── .gitignore
 ├── README.md
-├── config.yaml          # package (name, version, description, entry), flags, libraries, externs
+├── config.yaml          # package (name, version, description, entry, build), flags, libraries, externs
 └── src/
     └── my_api/
         └── main.bif     # the entry point; other files here import as my_api.<file>
@@ -541,11 +622,11 @@ bfc version 1.0.0 --dry-run    # show the change without writing it
 bfc version --short            # 0.1.0
 ```
 
-The raylib example needs raylib built first:
+The raylib example uses the raylib package, whose C library is built first:
 
 ```bash
+(cd extras/raylib && cmake -S . -B build && cmake --build build)   # builds extras/raylib/build/lib/libraylib.a
 cd examples/raylib
-cmake -S . -B build && cmake --build build   # builds build/lib/libraylib.a
 bfc build
 ./build/hello_raylib
 ```
@@ -569,12 +650,10 @@ uv run ruff format     # format
 
 ## Roadmap
 
-- **Closures**: lambdas that capture the locals around them
 - **More of `std:mem`**: owned values other than strings (lists, buffers), and objects that hold a `mem.Shared` or `mem.Atomic`
-- **String interpolation**: `"Hello, {name}!"`, compiled to a checked `fmt.format`
 - **Opaque C types** in extern declarations, such as `FILE`
 - **Trailing commas**
-- **More of lists**: a list's own functions (sorting, searching)
+- **More of packages**: `bfc add`, and packages for macOS and Windows
 - **Quick fixes** in the language server, such as adding a missing dependency
 
 ## Project Goals

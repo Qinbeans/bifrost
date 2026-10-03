@@ -363,6 +363,69 @@ def test_items_change_through_a_guard(tmp_path: Path) -> None:
     assert allocations - frees == 1
 
 
+METHODS = r"""
+let io = import("std:stdio")
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+
+let User = struct { let name: mem.Unique[str], let age: i64 }
+
+let main = [io.printf, fmt.format] () => null {
+    let xs = #[5, 3, 9, 1, 7]
+    io.printf("%v %v %d %d\n", xs.contains(9), xs.contains(4), xs.index_of(1), xs.index_of(4))
+    let limit = 4
+    let big = xs.filter([limit] (x: i64) => bool x > limit)
+    let doubled = big.map([] (x: i64) => i64 x * 3)
+    io.printf("%v %v %v %v\n", big, doubled, xs.sorted(), xs.reversed())
+    let g <- xs
+    g.sort()
+    g -> xs
+    io.printf("%v\n", xs)
+
+    let names: mem.Unique[str][] = #[fmt.format("cy"), fmt.format("ada"), fmt.format("bob")]
+    let ordered = names.sorted()
+    let n <- names
+    n.reverse()
+    n -> names
+    io.printf("%v %v %v %d\n", ordered, names, names.contains("ada"), names.index_of("cy"))
+
+    let users = #[User(name: fmt.format("ada"), age: 36), User(name: fmt.format("bob"), age: 12)]
+    let adults = users.filter([] (u: User) => bool u.age >= 18)
+    io.printf("%d %s %v\n", len(adults), adults[0].name, users.map([] (u: User) => i64 u.age))
+
+    let many: i64[] = #[]
+    let seed = 12345
+    forall i in #[0...1000] {
+        let seed = (seed * 1103515245 + 12345) % 2147483648
+        let many = #[...many, seed % 1000]
+    }
+    let sorted = many.sorted()
+    let ordered_ok = true
+    forall i in #[1...1000] {
+        if sorted[i - 1] > sorted[i] {
+            let ordered_ok = false
+        }
+    }
+    io.printf("%v %d\n", ordered_ok, len(sorted))
+}
+"""
+
+
+def test_list_methods(tmp_path: Path) -> None:
+    # A list's own functions: new lists (filter, map, sorted, reversed: copies, freed by their owners),
+    # searches, and sort/reverse in place through a guard (a heapsort: 1000 items come out in order).
+    lines, allocations, frees = _counted(tmp_path, METHODS)
+    assert lines == [
+        "true false 3 -1",
+        "[5, 9, 7] [15, 27, 21] [1, 3, 5, 7, 9] [7, 1, 9, 3, 5]",
+        "[1, 3, 5, 7, 9]",
+        '["ada", "bob", "cy"] ["bob", "ada", "cy"] true 2',
+        "1 ada [36, 12]",
+        "true 1000",
+    ]
+    assert allocations - frees == 1
+
+
 HEAD = (
     'let io = import("std:stdio")\nlet mem = import("std:mem")\nlet fmt = import("std:fmt")\n'
     "let Team = struct { let members: i64[] }\nlet User = struct { let name: mem.Unique[str] }\n"
@@ -457,6 +520,41 @@ HEAD = (
             "let f = [io.printf] () => null {\n    let rows = #[#[1], #[2]]\n    let first = rows[0]\n"
             '    let g <- rows\n    g[0] = #[9]\n    g -> rows\n    io.printf("%v", first)\n}',
             "rows is read by first (line 9) until the end of its block, so it cannot be changed here",
+        ),
+        (
+            "let f = [] () => null {\n    let xs = #[3, 1]\n    xs.sort()\n}",
+            "sort changes xs in place, so call it through a guard (`let g <- xs`, then g.sort()), "
+            "or make a new list: xs.sorted()",
+        ),
+        (
+            "let f = [] (xs: i64[]) => null {\n    let g <- xs\n    g.sort()\n    g -> xs\n}",
+            "sort changes its object, but xs is a parameter, which this function may not change",
+        ),
+        (
+            "let f = [] () => null {\n    let grid = #[#[3, 1]]\n    forall row in grid {\n        let g <- row\n"
+            "        g.reverse()\n        g -> row\n    }\n}",
+            "reverse changes its object, but row is a view of grid (a copy of an item)",
+        ),
+        (
+            "let f = [] () => null {\n    let rs = #[#{a: 1}]\n    let b = rs.contains(#{a: 1})\n}",
+            "contains compares numbers, bools and strings, not record",
+        ),
+        (
+            "let f = [] () => null {\n    let bs = #[true]\n    let s = bs.sorted()\n}",
+            "sorted orders numbers and strings",
+        ),
+        (
+            "let f = [] () => null {\n    let xs = #[1]\n    let ys = xs.map([] (x: f64) => f64 x)\n}",
+            "map's function takes one item, an i64",
+        ),
+        (
+            "let f = [] () => null {\n    let xs = #[1]\n    let ys = xs.filter([] (x: i64) => i64 x)\n}",
+            "filter's function says whether to keep an item: it returns bool",
+        ),
+        ("let f = [] () => null {\n    let xs = #[1]\n    let b = xs.contains()\n}", "contains takes one argument"),
+        (
+            "let f = [] () => null {\n    let xs = #[1]\n    let b = xs.size()\n}",
+            "i64[] has no method size; a list's are contains, filter, index_of, map, reverse, reversed, sort, sorted",
         ),
     ],
 )

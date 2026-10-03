@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Literal
 
 from mlir_python.codegen import Library, OptLevel
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class _Flags(BaseModel):
@@ -19,6 +19,16 @@ class _Package(BaseModel):
     # `async` lets `main` be async (`let main = [...] async () => ...`): it runs on the event
     # loop, and the program ends when it is done. `sync` (the default) does not.
     type: Literal["sync", "async"] = "sync"
+    # What the project is: an `executable` (`bfc build` compiles its entry; the default), or a
+    # `library`: a package other projects use, which `bfc package` makes a .bifpkg of.
+    build: Literal["executable", "library"] = "executable"
+
+    @model_validator(mode="after")
+    def _library_has_no_entry(self) -> "_Package":
+        if self.build == "library" and self.entry is not None:
+            msg = "a library has no entry (package.build is library); remove package.entry, or build an executable"
+            raise ValueError(msg)
+        return self
 
 
 class _Struct(BaseModel):
@@ -63,12 +73,30 @@ def source_root(project: Path) -> Path:
     return source if source.is_dir() else project
 
 
+class _PackageSource(BaseModel):
+    """Where a package comes from, other than the index: a ``.bifpkg`` file or a project folder."""
+
+    path: str
+    # The version it must have, if any.
+    version: str | None = None
+
+
 class Config(BaseModel):
     path: Path = Path("build")
     package: _Package
     flags: _Flags
     libraries: list[Library] = []
     externs: list[_Extern] = []
+    # Where packages listed by version are found: a folder, or a URL serving a page of links to
+    # .bifpkg files (relative to config.yaml).
+    index: str | None = None
+    # The packages this project uses: name -> version (from the index), or {path: ...}.
+    packages: dict[str, str | _PackageSource] = {}
+    # Where `import("a.b:module")` also looks, after the project's own sources: its packages'.
+    # Filled in when the packages are resolved (see `bifrost.packages`), never written.
+    sources: list[Path] = Field(default_factory=list, exclude=True)
+    # The config.yaml declaring each extern module that a package brings (others are this one's).
+    declared_in: dict[str, Path] = Field(default_factory=dict, exclude=True)
 
     @field_validator("libraries", mode="before")
     @classmethod

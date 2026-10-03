@@ -113,6 +113,7 @@ let main = [io.printf, tick] () => null {
     counter.bump(2)
     counter.twice()
     let n = counter.add("ada")
+    tick(counter)
     io.printf("%d %d %d\n", counter.hits, n, counter.size())
 
     let unique: mem.Unique[Counter] = Counter(hits: 0, names: #[])
@@ -126,6 +127,7 @@ let main = [io.printf, tick] () => null {
     let g <- counters
     g[1].bump(100)
     g[0].add("bob")
+    tick(g[0])
     g -> counters
     io.printf("%d %d %d\n", counters[0].hits, counters[1].hits, counters[0].size())
 
@@ -141,7 +143,8 @@ let main = [io.printf, tick] () => null {
 
 def test_methods_that_change_their_object(tmp_path: Path) -> None:
     # A method that locks super is lent its object: a local, a list's item through a guard,
-    # a mem.Weak (passed on) or a mem.Shared (locked for the call) sees the change.
+    # a mem.Weak (passed on) or a mem.Shared (locked for the call) sees the change. A plain
+    # local, or an item through a guard, is lent to a mem.Weak parameter (`tick`) the same way.
     executable = _lower(tmp_path, CHANGING).build()
     (tmp_path / "count.c").write_text(COUNTER)
     counter = tmp_path / "count.so"
@@ -149,7 +152,7 @@ def test_methods_that_change_their_object(tmp_path: Path) -> None:
     result = subprocess.run(  # noqa: S603
         [executable], capture_output=True, text=True, check=True, env={"LD_PRELOAD": str(counter)}
     )
-    assert result.stdout.splitlines() == ["4 1 1", "11", "1 105 1", "7 1"]
+    assert result.stdout.splitlines() == ["14 1 1", "11", "11 105 1", "7 1"]
     allocations, frees = map(int, result.stderr.split())
     assert allocations - frees == 1
 
@@ -219,7 +222,7 @@ _C = (
         ),
         (
             f"{_C}let f = [] (c: C) => null {{\n    c.bump()\n}}",
-            "bump changes its object, but c is a copy given to this function, so its caller would not see the change",
+            "bump changes its object, but c is a parameter, which this function may not change",
         ),
         (
             f"{_C}let f = [] () => null {{\n    let cs = #[C(hits: 1)]\n    forall c in cs {{\n        c.bump()\n"

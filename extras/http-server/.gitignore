@@ -1,0 +1,6 @@
+# Bifrost build output, and the packages `bfc package` makes
+build/
+dist/
+
+# Left by h2o's CMake check for dtrace, in the directory cmake runs from
+.tmp.dprobes.h

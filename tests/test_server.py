@@ -699,3 +699,26 @@ def test_a_method_that_changes_its_object_is_lent_it(tmp_path: Path) -> None:
     assert [hint.label for hint in document.inlay_hints()] == [": mem.WeakGuard[Counter]"]
     row, column = _position(CHANGING, ".hits + by")
     assert [c.label for c in document.completions((row, column + 1))] == ["hits", "size", "bump"]
+
+
+LIST_METHODS = """\
+let main = [] () => null {
+    let xs = #[5, 3, 9]
+    let big = xs.filter([] (x: i64) => bool x > 4)
+}
+"""
+
+
+def test_list_methods_in_the_editor(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    document = Document.open(tmp_path / "main.bif", LIST_METHODS)
+    row, column = _position(LIST_METHODS, "filter")
+    completions = {c.label: c.detail for c in document.completions((row, column))}
+    assert completions["map"] == "map = (f: (x: i64) => U) => U[]"
+    assert completions["sort"] == "sort = () => null"
+    assert document.hover((row, column + 1)) == (
+        "```bifrost\nlet filter = (f: (x: i64) => bool) => i64[]\n// a new list of copies of the items f keeps\n```"
+    )
+    assert ": i64[]" in [hint.label for hint in document.inlay_hints()]
