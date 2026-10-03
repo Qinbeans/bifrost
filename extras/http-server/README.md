@@ -11,7 +11,7 @@ It gives a project:
 # a project's config.yaml
 packages:
   http_server:
-    path: ../http-server      # this folder; or `http_server: 0.1.0`, from the index (see the main README)
+    path: ../http-server      # this folder; or `http_server: 0.1.1`, from the published index (see the main README)
 ```
 
 ```bifrost
@@ -31,5 +31,5 @@ h2o needs OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt inst
 
 ```bash
 cmake -B build -G Ninja && cmake --build build                         # h2o, fetched at a pinned commit, and c/http.c
-bfc package                                                            # dist/http_server-0.1.0-<target>.bifpkg
+bfc package                                                            # dist/http_server-0.1.1-<target>.bifpkg
 ```

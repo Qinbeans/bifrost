@@ -81,12 +81,13 @@ def test_a_package_by_path(tmp_path: Path) -> None:
 
 def test_a_package_from_an_index(tmp_path: Path) -> None:
     # `bfc package` makes greeting-0.2.0-any.bifpkg (no C libraries: any target); the app finds it
-    # by version in an index folder and unpacks it into build/pkg/greeting.
+    # by version in an index folder it names, and unpacks it into build/pkg/greeting.
     archive = packages.build(_project(tmp_path / "greeting", "greeting"), tmp_path / "index")
     assert archive.name == "greeting-0.2.0-any.bifpkg"
     with tarfile.open(archive) as tar:
         assert sorted(tar.getnames()) == ["config.yaml", "src/greeting/text.bif"]
-    app = _project(tmp_path / "app", "app", "index: ../index\npackages:\n  greeting: 0.2.0\n", source=APP)
+    extra = "index:\n  local: ../index\npackages:\n  greeting:\n    index: local\n    version: 0.2.0\n"
+    app = _project(tmp_path / "app", "app", extra, source=APP)
     assert _run(app) == "Hello, ada!\n"
     assert (app / "build" / "pkg" / "greeting" / "src" / "greeting" / "text.bif").is_file()
 
@@ -149,7 +150,7 @@ def test_a_package_from_a_url_index(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         asset = {"name": archive.name, "browser_download_url": f"{url}download/{archive.name}"}
         releases = [{"draft": False, "assets": [asset | {"digest": f"sha256:{digest}"}]}]
         (tmp_path / "site" / "index.html").write_text(index.render(index.archive_links(releases)))
-        app = _project(tmp_path / "app", "app", f"index: {url}\npackages:\n  greeting: 0.2.0\n", source=APP)
+        app = _project(tmp_path / "app", "app", f"index:\n  default: {url}\npackages:\n  greeting: 0.2.0\n", source=APP)
         if not tampered:
             assert _run(app) == "Hello, ada!\n"
             return
@@ -162,10 +163,16 @@ def test_a_package_from_a_url_index(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     ("extra", "message"),
     [
         (
-            "packages:\n  greeting: 0.2.0\n",
-            "package greeting 0.2.0 is listed by version, but config.yaml names no index",
+            "packages:\n  greeting:\n    index: mine\n    version: 0.2.0\n",
+            "package greeting comes from index mine, which config.yaml's index: does not name",
         ),
-        ("index: ../index\npackages:\n  greeting: 9.9.9\n", "package greeting 9.9.9 is not in"),
+        ("index:\n  default: ../index\npackages:\n  greeting: 9.9.9\n", "package greeting 9.9.9 is not in"),
+        (
+            "index:\n  mine: ../index\npackages:\n  greeting:\n    index: mine\n",
+            "a package from index mine needs its version:",
+        ),
+        ("packages:\n  greeting:\n    version: 0.2.0\n", "give one of path: and index:"),
+        ("index: ../index\n", "index: names its indexes"),
         ("packages:\n  greeting:\n    path: ../greeting\n    version: 1.0.0\n", "package greeting is version 0.2.0"),
         ("packages:\n  other:\n    path: ../greeting\n", "package other is named greeting in its config.yaml"),
         ("packages:\n  greeting:\n    path: ../nowhere\n", "neither a project folder nor a .bifpkg file"),
@@ -175,7 +182,7 @@ def test_errors(tmp_path: Path, extra: str, message: str) -> None:
     _project(tmp_path / "greeting", "greeting")
     (tmp_path / "index").mkdir()
     app = _project(tmp_path / "app", "app", extra, source=APP)
-    with pytest.raises(PackageError, match=re.escape(message)):
+    with pytest.raises((PackageError, ValueError), match=re.escape(message)):
         ConfigBuilder(app / "config.yaml", install=True).build()
 
 
@@ -201,10 +208,98 @@ def test_a_library_builds_no_executable(tmp_path: Path) -> None:
     assert "is a library (package.build: library), which builds no executable" in " ".join(result.output.split())
 
 
+def _add(app: Path, *arguments: str) -> str:
+    """Run ``bfc add`` in ``app``; return its output, on one line."""
+    result = CliRunner().invoke(cli, ["add", *arguments, "--config", str(app / "config.yaml")])
+    output = " ".join(result.output.split())
+    assert result.exit_code == 0, output
+    return output
+
+
+def test_add_from_an_index(tmp_path: Path) -> None:
+    # The newest version for this target (by number: 0.10.0 after 0.9.0), installed as `bfc build` would.
+    greeting = _project(tmp_path / "greeting", "greeting")
+    for version in ("0.9.0", "0.10.0"):
+        config = greeting / "config.yaml"
+        config.write_text(re.sub(r"version: \S+", f"version: {version}", config.read_text()))
+        packages.build(greeting, tmp_path / "index")
+    app = _project(tmp_path / "app", "app", source=APP)
+    before = (app / "config.yaml").read_text()
+    assert "added greeting 0.10.0 from index local" in _add(app, "greeting", "--index", "local=../index")
+    assert (app / "config.yaml").read_text() == before + (
+        "\nindex:\n  local: ../index\n\npackages:\n  greeting:\n    index: local\n    version: 0.10.0\n"
+    )
+    assert (app / "build" / "pkg" / "greeting" / "src" / "greeting" / "text.bif").is_file()
+    assert _run(app, install=False) == "Hello, ada!\n"
+
+    _add(app, "greeting@0.9.0", "--index", "local")
+    assert (app / "config.yaml").read_text().endswith("packages:\n  greeting:\n    index: local\n    version: 0.9.0\n")
+    result = CliRunner().invoke(
+        cli, ["add", "greeting@1.0.0", "--index", "local", "--config", str(app / "config.yaml")]
+    )
+    assert result.exit_code == 1
+    assert "package greeting 1.0.0 is not in ../index (it has 0.9.0, 0.10.0)" in " ".join(result.output.split())
+    assert (app / "config.yaml").read_text().endswith("packages:\n  greeting:\n    index: local\n    version: 0.9.0\n")
+
+
+def test_add_keeps_the_rest_of_the_config(tmp_path: Path) -> None:
+    # Only the entry's lines change: comments, other entries and keys stay as they were.
+    _project(tmp_path / "greeting", "greeting")
+    _project(tmp_path / "other", "other")
+    app = _project(tmp_path / "app", "app", source=APP)
+    config = app / "config.yaml"
+    head = config.read_text()
+    config.write_text(
+        head + "# What it uses:\npackages:\n    other:\n        path: ../other   # mine\n\n# The end\nlibraries: [m]\n"
+    )
+    assert "added greeting from ../greeting" in _add(app, "--path", "../greeting")
+    assert config.read_text() == head + (
+        "# What it uses:\npackages:\n    other:\n        path: ../other   # mine\n"
+        "    greeting:\n        path: ../greeting\n\n# The end\nlibraries: [m]\n"
+    )
+    _add(app, "other", "--path", "../greeting/../other")  # replaces its entry
+    assert config.read_text() == head + (
+        "# What it uses:\npackages:\n    other:\n        path: ../greeting/../other\n"
+        "    greeting:\n        path: ../greeting\n\n# The end\nlibraries: [m]\n"
+    )
+    assert _run(app) == "Hello, ada!\n"
+
+
+def test_add_uses_the_published_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without --index, `bfc add` uses the published index, which config.yaml need not name.
+    packages.build(_project(tmp_path / "greeting", "greeting"), tmp_path / "index")
+    monkeypatch.setattr(packages, "DEFAULT_INDEX", str(tmp_path / "index"))
+    app = _project(tmp_path / "app", "app", "packages: {}\n", source=APP)
+    _add(app, "greeting")
+    assert (app / "config.yaml").read_text().endswith("\npackages:\n  greeting: 0.2.0\n")
+    assert "index" not in (app / "config.yaml").read_text()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["nothing", "--index", "local=../index"], "package nothing is not in ../index for"),
+        (["greeting", "--index", "mine"], "config.yaml names no index mine; add it with --index mine=URL"),
+        (["--path", "../nowhere"], "nowhere is neither a project folder nor a .bifpkg file"),
+        (["other", "--path", "../greeting"], "../greeting is package greeting, not other"),
+        (["--path", "../app"], "package app builds an executable, not a library"),
+    ],
+)
+def test_add_errors(tmp_path: Path, arguments: list[str], message: str) -> None:
+    _project(tmp_path / "greeting", "greeting")
+    (tmp_path / "index").mkdir()
+    app = _project(tmp_path / "app", "app", source=APP)
+    before = (app / "config.yaml").read_text()
+    result = CliRunner().invoke(cli, ["add", *arguments, "--config", str(app / "config.yaml")])
+    assert result.exit_code == 1
+    assert message in " ".join(result.output.split())
+    assert (app / "config.yaml").read_text() == before
+
+
 def test_the_editor_does_not_install(tmp_path: Path) -> None:
     # Unpacking is `bfc build`'s; until then the editor says so, and still checks the rest.
     packages.build(_project(tmp_path / "greeting", "greeting"), tmp_path / "index")
-    app = _project(tmp_path / "app", "app", "index: ../index\npackages:\n  greeting: 0.2.0\n", source=APP)
+    app = _project(tmp_path / "app", "app", "index:\n  default: ../index\npackages:\n  greeting: 0.2.0\n", source=APP)
     with pytest.raises(
         PackageError, match=re.escape("not installed; run `bfc build` to unpack greeting-0.2.0-any.bifpkg")
     ):

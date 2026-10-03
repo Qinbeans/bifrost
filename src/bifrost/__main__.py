@@ -10,6 +10,7 @@ from typer import Typer
 
 from bifrost import packages, scaffold, versioning
 from bifrost.configs import Config, ConfigBuilder, source_root
+from bifrost.configs.schema import DEFAULT_INDEX
 from bifrost.formatter import FormatError, format_source
 from bifrost.lowering import BifrostError, lower_file
 from bifrost.packages import PackageError
@@ -104,6 +105,45 @@ def package(
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     print(f"[bold green]✔ SUCCESS[/bold green]: packaged {archive}")
+
+
+@cli.command()
+def add(
+    package: Annotated[
+        str | None, typer.Argument(help="name, or name@version; default: the newest in the index for this target.")
+    ] = None,
+    path: Annotated[
+        str | None, typer.Option("--path", help="A project folder or .bifpkg, relative to config.yaml.")
+    ] = None,
+    index: Annotated[
+        str | None,
+        typer.Option(
+            "--index",
+            help=f"An index config.yaml names (NAME), or one to add (NAME=URL or folder); default: {DEFAULT_INDEX}.",
+        ),
+    ] = None,
+    config: Annotated[Path, typer.Option("--config", "-c", help="Project configuration.")] = Path("config.yaml"),
+) -> None:
+    """Add a package to the project's config.yaml, and install it."""
+    if not config.is_file():
+        print(
+            f"[bold red]✘ ERROR[/bold red]: no {escape(str(config))}; create a project with `bfc init <name>`",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+    name, _, version = (package or "").partition("@")
+    try:
+        added, source = packages.add(config, name or None, version=version or None, path=path, index=index)
+    except PackageError as error:
+        print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
+        raise typer.Exit(1) from None
+    if isinstance(source, str):
+        where = f"{added} {source}"
+    elif source.path is not None:
+        where = f"{added} from {source.path}"
+    else:
+        where = f"{added} {source.version} from index {source.index}"
+    print(f"[bold green]✔ SUCCESS[/bold green]: added {escape(where)} to {escape(str(config))}")
 
 
 @cli.command()

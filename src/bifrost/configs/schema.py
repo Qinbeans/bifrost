@@ -73,12 +73,30 @@ def source_root(project: Path) -> Path:
     return source if source.is_dir() else project
 
 
-class _PackageSource(BaseModel):
-    """Where a package comes from, other than the index: a ``.bifpkg`` file or a project folder."""
+# Where a package listed only by version comes from, unless config.yaml names an index `default`:
+# the packages in extras/, published by CI.
+DEFAULT_INDEX = "https://qinbeans.github.io/bifrost/packages/"
 
-    path: str
-    # The version it must have, if any.
+
+class _PackageSource(BaseModel):
+    """Where a package comes from, when not the default index: a named index, a ``.bifpkg`` or a project folder."""
+
+    # A `.bifpkg` file or a project folder, relative to config.yaml.
+    path: str | None = None
+    # One of the indexes config.yaml names (`index:`).
+    index: str | None = None
+    # The version it must have: required from an index.
     version: str | None = None
+
+    @model_validator(mode="after")
+    def _one_source(self) -> "_PackageSource":
+        if (self.path is None) == (self.index is None):
+            msg = "a package comes from a path or an index: give one of path: and index:"
+            raise ValueError(msg)
+        if self.index is not None and self.version is None:
+            msg = f"a package from index {self.index} needs its version:"
+            raise ValueError(msg)
+        return self
 
 
 class Config(BaseModel):
@@ -87,16 +105,26 @@ class Config(BaseModel):
     flags: _Flags
     libraries: list[Library] = []
     externs: list[_Extern] = []
-    # Where packages listed by version are found: a folder, or a URL serving a page of links to
-    # .bifpkg files (relative to config.yaml).
-    index: str | None = None
-    # The packages this project uses: name -> version (from the index), or {path: ...}.
+    # The indexes packages come from, by name: a folder (relative to config.yaml), or a URL serving
+    # a page of links to .bifpkg files. A package listed only by version comes from `default`, or
+    # else DEFAULT_INDEX.
+    index: dict[str, str] = {}
+    # The packages this project uses: name -> version (from the default index), {index: name,
+    # version: ...}, or {path: ...}.
     packages: dict[str, str | _PackageSource] = {}
     # Where `import("a.b:module")` also looks, after the project's own sources: its packages'.
     # Filled in when the packages are resolved (see `bifrost.packages`), never written.
     sources: list[Path] = Field(default_factory=list, exclude=True)
     # The config.yaml declaring each extern module that a package brings (others are this one's).
     declared_in: dict[str, Path] = Field(default_factory=dict, exclude=True)
+
+    @field_validator("index", mode="before")
+    @classmethod
+    def _named_indexes(cls, index: object) -> object:
+        if isinstance(index, str):
+            msg = "index: names its indexes (index: {extras: https://...}); a package picks one with `index: extras`"
+            raise ValueError(msg)
+        return index
 
     @field_validator("libraries", mode="before")
     @classmethod

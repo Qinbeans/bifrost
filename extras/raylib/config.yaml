@@ -1,6 +1,6 @@
 package:
   name: raylib
-  version: 0.1.0
+  version: 0.1.1
   build: library
   description: raylib 6.0 for Bifrost, a library for games and graphics (https://www.raylib.com)
 

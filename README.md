@@ -474,6 +474,7 @@ let draw = [rl.begin_drawing, rl.end_drawing] (ctx: mem.Weak[Context]) => null {
 | `bfc init my_api` | Create a project: `config.yaml`, `.gitignore`, `README.md`, `src/my_api/main.bif` |
 | `bfc build` (or `bfc build file.bif -c config.yaml -o out`) | Compile the project's entry (or a given file) to a native executable in `build/` |
 | `bfc fmt main.bif` (`--check` to only report) | Format source files; only ever changes whitespace |
+| `bfc add name[@version]` (`--index NAME[=URL]`, `--path folder`) | Add a package to `config.yaml` and install it (see [Packages](#packages)) |
 | `bfc package` (`-o folder`) | Package a library (`package.build: library`) for others to use, as a `.bifpkg` in `dist/` (see [Packages](#packages)) |
 | `bfc lsp` | Run the language server (diagnostics, formatting, outline, hover, go-to-definition, completion) |
 | `bfc config traverse -c config.yaml -i path/to/include/` | Generate extern declarations in `config.yaml` from C/C++ headers |
@@ -537,16 +538,23 @@ greeting-0.2.0-any.bifpkg                            # Bifrost only: any target
 Bifrost code ships as source, compiled with the project that uses it (the compiler needs its signatures, ownership and what pauses); C code ships compiled, for one target. A project lists its packages in `config.yaml`:
 
 ```yaml
-index: https://qinbeans.github.io/bifrost/packages/   # a page of links to .bifpkg files, or a folder
 packages:
-  http_server: 0.1.0                                  # from the index: this target's, or else `any`
+  raylib: 0.1.1                  # from the default index: this target's build, or else `any`
+  http_server:
+    index: extras                # from an index named below
+    version: 0.1.1
   greeting:
-    path: ../greeting                                 # a project folder (while developing), or a .bifpkg file
+    path: ../greeting            # a project folder (while developing), or a .bifpkg file
+
+index:                           # indexes by name: pages of links to .bifpkg files, or folders
+  extras: https://qinbeans.github.io/bifrost/packages/
 ```
+
+A package given only a version comes from the index named `default`, or else from `https://qinbeans.github.io/bifrost/packages/`. `bfc add` writes these entries and installs the package: `bfc add raylib` (the newest version), `bfc add raylib@0.1.1`, `bfc add http_server --index extras` (an index `config.yaml` names; `--index extras=URL` adds it), or `bfc add --path ../greeting`. It changes only the entry's lines, and leaves `config.yaml` as it was if the package cannot be installed.
 
 `bfc build` fetches what it needs (into `~/.cache/bifrost/packages`) and unpacks it into `build/pkg/<name>/`. A package's externs and libraries join the project's, and its modules import like the project's own: `import("http_server.handlers:handlers")` looks in the project's `src/`, then in each package's. The editor uses packages already unpacked, and says when one needs `bfc build` first.
 
-The packages in `extras/` (each with `build: library`) are published to that index, `https://qinbeans.github.io/bifrost/packages/`, for x86_64 and aarch64 Linux. Releasing one is bumping `package.version` in its `config.yaml`: on the push to `main`, CI (`.github/workflows/packages.yml`) builds its C libraries with CMake on each target, runs `bfc package`, and publishes the archives as release `<name>-v<version>`; the index (`tools/package_index.py`) links every release's `.bifpkg` with its SHA-256, which `bfc build` checks before using a download.
+The packages in `extras/` (each with `build: library`) are published to the default index for x86_64 and aarch64 Linux. Releasing one is bumping `package.version` in its `config.yaml`: on the push to `main`, CI (`.github/workflows/packages.yml`) builds its C libraries with CMake on each target, runs `bfc package`, and publishes the archives as release `<name>-v<version>`; the index (`tools/package_index.py`) links every release's `.bifpkg` with its SHA-256, which `bfc build` checks before using a download.
 
 ## Architecture
 

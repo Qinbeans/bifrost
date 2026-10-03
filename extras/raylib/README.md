@@ -8,7 +8,7 @@ It gives a project the `raylib` module, declared in `config.yaml` (generated fro
 # a project's config.yaml
 packages:
   raylib:
-    path: ../raylib      # this folder; or `raylib: 0.1.0`, from the index (see the main README)
+    path: ../raylib      # this folder; or `raylib: 0.1.1`, from the published index (see the main README)
 ```
 
 ```bifrost
@@ -31,5 +31,5 @@ raylib needs CMake, a C compiler, and on Linux the X11 (or Wayland) and OpenGL d
 
 ```bash
 cmake -S . -B build && cmake --build build   # raylib 6.0, fetched by CMake
-bfc package                                  # dist/raylib-0.1.0-<target>.bifpkg
+bfc package                                  # dist/raylib-0.1.1-<target>.bifpkg
 ```

@@ -14,13 +14,21 @@ ownership and what pauses; C code ships compiled.
 
 A project lists the packages it uses in its ``config.yaml``::
 
-    index: https://example.org/bifrost/    # or a folder
+    index:
+      mine: https://example.org/bifrost/   # named indexes: URLs, or folders
     packages:
-      http_server: 0.1.0                   # from the index: this target's, else `any`
+      http_server: 0.1.0                   # from the default index: this target's, else `any`
+      tools:
+        index: mine                        # from a named index
+        version: 0.3.0
       greeting:
         path: ../greeting                  # a project folder (while developing), or a .bifpkg
 
-Packages from an index or a ``.bifpkg`` are unpacked into ``build/pkg/<name>/``.
+A package listed only by version comes from the index named ``default``, or else
+``DEFAULT_INDEX``, where the packages in ``extras/`` are published.
+
+``bfc add`` writes these entries (see ``add``). Packages from an index or a
+``.bifpkg`` are unpacked into ``build/pkg/<name>/``.
 Their externs and libraries join the project's, and ``import("a.b:module")``
 looks in their sources after the project's own.
 """
@@ -32,6 +40,7 @@ import shutil
 import tarfile
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -39,7 +48,7 @@ from typing import Any
 
 import yaml
 
-from bifrost.configs.schema import Config, _PackageSource, source_root
+from bifrost.configs.schema import DEFAULT_INDEX, Config, _PackageSource, source_root
 
 ARCHIVE = ".bifpkg"
 ANY = "any"  # the target of a package with no C libraries
@@ -164,14 +173,17 @@ class _Resolver:
         self.install = install
         self.found: dict[str, Package] = {}  # in the order C libraries link: a package before what it uses
 
-    def resolve(self, name: str, source: str | _PackageSource, folder: Path, index: str | None) -> None:
-        """Find package ``name`` as ``source`` says (relative to ``folder``, whose config names ``index``)."""
+    def resolve(self, name: str, source: str | _PackageSource, folder: Path, indexes: dict[str, str]) -> None:
+        """Find package ``name`` as ``source`` says (relative to ``folder``, whose config names ``indexes``)."""
         if name in self.found:
             return
-        if isinstance(source, str):
-            root = self.unpack(_from_index(name, source, folder, index, install=self.install), name)
-            wanted = source
+        if isinstance(source, str) or source.index is not None:
+            wanted = source if isinstance(source, str) else source.version
+            assert wanted is not None  # an index source has its version (see _PackageSource)
+            index = index_location(name, source, indexes)
+            root = self.unpack(_from_index(name, wanted, folder, index, install=self.install), name)
         else:
+            assert source.path is not None
             path = (folder / source.path).resolve()
             if path.is_dir():
                 root = path  # a project folder: used as it is
@@ -209,10 +221,22 @@ class _Resolver:
         return target
 
 
-def _from_index(name: str, version: str, folder: Path, index: str | None, *, install: bool) -> Path:
+def index_location(name: str, source: str | _PackageSource, indexes: dict[str, str]) -> str:
+    """Return where the index package ``name`` comes from is: ``default``'s (or ``DEFAULT_INDEX``), or the one it names.
+
+    Raises:
+        PackageError: If it names an index config.yaml does not.
+
+    """
+    if isinstance(source, str) or source.index is None:
+        return indexes.get("default", DEFAULT_INDEX)
+    if source.index not in indexes:
+        raise PackageError(f"package {name} comes from index {source.index}, which config.yaml's index: does not name")
+    return indexes[source.index]
+
+
+def _from_index(name: str, version: str, folder: Path, index: str, *, install: bool) -> Path:
     """Find ``name`` at ``version`` in the index (this target's, else ``any``); return the local archive."""
-    if index is None:
-        raise PackageError(f"package {name} {version} is listed by version, but config.yaml names no index")
     wanted = [archive_name(name, version, triple) for triple in (host_triple(), ANY)]
     if not re.match(r"^[a-z]+://", index):
         directory = (folder / index).resolve()
@@ -256,6 +280,221 @@ def _download(url: str, target: Path) -> Path:
     return target
 
 
+# -- adding ------------------------------------------------------------------------------
+
+
+def versions(name: str, index: str, folder: Path) -> list[str]:
+    """Return the versions of ``name`` in ``index`` (relative to ``folder``) for this target or ``any``, oldest first.
+
+    Raises:
+        PackageError: If the index cannot be read.
+
+    """
+    if re.match(r"^[a-z]+://", index):
+        try:
+            files = list(_links(index))
+        except OSError as error:
+            raise PackageError(f"cannot read the index {index}: {error}") from None
+    else:
+        directory = (folder / index).resolve()
+        if not directory.is_dir():
+            raise PackageError(f"the index {directory} is not a folder")
+        files = [path.name for path in directory.iterdir()]
+    found = set()
+    for file in files:
+        for triple in (host_triple(), ANY):
+            suffix = f"-{triple}{ARCHIVE}"
+            if file.startswith(f"{name}-") and file.endswith(suffix):
+                found.add(file.removeprefix(f"{name}-").removesuffix(suffix))
+    return sorted(found, key=_version_key)
+
+
+def _version_key(version: str) -> tuple[tuple[int, int | str], ...]:
+    """Order versions by their numbers: ``0.10.0`` after ``0.9.0``."""
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in re.split(r"[.+-]", version))
+
+
+def package_name(path: Path) -> str:
+    """Return the ``package.name`` of the project folder or ``.bifpkg`` at ``path``.
+
+    Raises:
+        PackageError: If ``path`` is neither, or names no package.
+
+    """
+    if path.is_dir():
+        text = (path / "config.yaml").read_text() if (path / "config.yaml").is_file() else None
+    elif path.is_file():
+        try:
+            with tarfile.open(path, "r:gz") as tar:
+                member = tar.extractfile("config.yaml")
+                text = member.read().decode() if member is not None else None
+        except (tarfile.TarError, KeyError):
+            text = None
+    else:
+        raise PackageError(f"{path} is neither a project folder nor a {ARCHIVE} file")
+    name = ((yaml.safe_load(text or "") or {}).get("package") or {}).get("name") if text is not None else None
+    if not name:
+        raise PackageError(f"{path} has no config.yaml naming package.name")
+    return str(name)
+
+
+def add(
+    config_path: Path,
+    name: str | None,
+    *,
+    version: str | None = None,
+    path: str | None = None,
+    index: str | None = None,
+) -> tuple[str, str | _PackageSource]:
+    """Add a package to the project's ``config.yaml``, and install it as ``bfc build`` would.
+
+    From ``path`` (a project folder or ``.bifpkg``, relative to config.yaml; its name is read from
+    it when ``name`` is None), or else from an index at ``version`` (default: the newest there for
+    this target): the default index, or ``index``, one config.yaml names (``NAME``), or one to add
+    to it (``NAME=URL``, or a folder). Only the lines of the entry (and of the index) change; if
+    the package cannot be installed, config.yaml is left as it was. Return the name and what was
+    written.
+
+    Raises:
+        PackageError: If the package cannot be found or installed.
+
+    """
+    folder = config_path.parent
+    original = config_path.read_text()
+    indexes: dict[str, str] = (yaml.safe_load(original) or {}).get("index") or {}
+    if not isinstance(indexes, dict):
+        indexes = {}  # the old `index: url`: the config's own check reports it
+    text = original
+    source: str | _PackageSource
+    if path is not None:
+        found = package_name((folder / path).resolve())
+        if name is not None and name != found:
+            raise PackageError(f"{path} is package {found}, not {name}")
+        name, source = found, _PackageSource(path=path, version=version)
+    elif name is None:
+        raise PackageError("give a package name, or --path")
+    else:
+        if index is not None:
+            text = _choose_index(text, index, indexes)
+        source = _newest(name, version, index.partition("=")[0] if index is not None else None, indexes, folder)
+    config_path.write_text(_set_entry(text, "packages", name, lambda indent: _entry(name, source, indent)))
+    from bifrost.configs import ConfigBuilder  # noqa: PLC0415 - it resolves packages in turn
+
+    try:
+        ConfigBuilder(config_path, install=True).build()
+    except (PackageError, ValueError) as error:  # ValueError: pydantic's, for a config that does not validate
+        config_path.write_text(original)
+        raise PackageError(str(error)) from None
+    return name, source
+
+
+def _choose_index(text: str, index: str, indexes: dict[str, str]) -> str:
+    """Use ``index``: one config.yaml names (``NAME``), or one to add (``NAME=URL``); return the new ``text``.
+
+    Raises:
+        PackageError: If config.yaml names no index ``NAME``.
+
+    """
+    chosen, _, location = index.partition("=")
+    if location:
+        indexes[chosen] = location
+        return _set_entry(text, "index", chosen, lambda indent: [f"{indent}{chosen}: {_scalar(location)}"])
+    if chosen not in indexes:
+        raise PackageError(f"config.yaml names no index {chosen}; add it with --index {chosen}=URL")
+    return text
+
+
+def _newest(
+    name: str, version: str | None, chosen: str | None, indexes: dict[str, str], folder: Path
+) -> str | _PackageSource:
+    """Return the entry of ``name`` from index ``chosen`` (or the default) at ``version``, or else its newest.
+
+    Raises:
+        PackageError: If the index does not have it.
+
+    """
+    named = chosen is not None and chosen != "default"
+    where = index_location(name, _PackageSource(index=chosen, version="") if named else "", indexes)
+    available = versions(name, where, folder)
+    if not available:
+        raise PackageError(f"package {name} is not in {where} for {host_triple()} or {ANY}")
+    if version is not None and version not in available:
+        raise PackageError(f"package {name} {version} is not in {where} (it has {', '.join(available)})")
+    newest = version or available[-1]
+    return _PackageSource(index=chosen, version=newest) if named else newest
+
+
+def _scalar(value: str) -> str:
+    """Write ``value`` as YAML reads it back as that string: ``0.1`` is quoted, ``0.1.0`` is not."""
+    return yaml.safe_dump(value, default_flow_style=True).removesuffix("\n").removesuffix("\n...")
+
+
+def _entry(name: str, source: str | _PackageSource, indent: str) -> list[str]:
+    if isinstance(source, str):
+        return [f"{indent}{name}: {_scalar(source)}"]
+    lines = [f"{indent}{name}:"]
+    lines += [f"{indent * 2}{key}: {_scalar(value)}" for key, value in source.model_dump(exclude_none=True).items()]
+    return lines
+
+
+def _top_level(lines: list[str], key: str) -> int | None:
+    """Return the line of top-level ``key:``, if any."""
+    pattern = re.compile(rf"^{re.escape(key)}:(\s|$)")
+    return next((number for number, line in enumerate(lines) if pattern.match(line)), None)
+
+
+def _block_end(lines: list[str], start: int) -> int:
+    """Return the line after the block under ``lines[start]``, before the blank lines and comments ending it."""
+    end = start + 1
+    for number in range(start + 1, len(lines)):
+        line = lines[number]
+        if line.strip() and not line.startswith((" ", "\t")):
+            break
+        if line.strip() and not line.lstrip().startswith("#"):
+            end = number + 1
+    return end
+
+
+def _set_entry(text: str, key: str, name: str, entry: Callable[[str], list[str]]) -> str:
+    """Set ``<key>.<name>`` in config.yaml's ``text`` to the lines ``entry(indent)``, changing no other line.
+
+    Raises:
+        PackageError: If ``key:`` is written in flow style (``{a: 1}``).
+
+    """
+    lines = text.splitlines()
+    start = _top_level(lines, key)
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [f"{key}:", *entry("  ")]
+        return "\n".join(lines) + "\n"
+    rest = lines[start].split(":", 1)[1].split("#")[0].strip()
+    if rest == "{}":
+        lines[start] = f"{key}:"
+    elif rest:
+        raise PackageError(f"{key}: in config.yaml is written on one line; write it as a block to add to it")
+    end = _block_end(lines, start)
+    entries = [
+        number
+        for number in range(start + 1, end)
+        if lines[number].strip() and not lines[number].lstrip().startswith("#")
+    ]
+    indent = " " * (len(lines[entries[0]]) - len(lines[entries[0]].lstrip())) if entries else "  "
+    pattern = re.compile(rf"^{re.escape(indent)}{re.escape(name)}:(\s|$)")
+    existing = next((number for number in entries if pattern.match(lines[number])), None)
+    if existing is None:
+        lines[end:end] = entry(indent)
+    else:
+        after = existing + 1
+        while after < end and (not lines[after].strip() or lines[after].startswith(indent + " ")):
+            after += 1
+        while after > existing + 1 and not lines[after - 1].strip():  # keep blank lines after the entry
+            after -= 1
+        lines[existing:after] = entry(indent)
+    return "\n".join(lines) + "\n"
+
+
 def _cache() -> Path:
     """Where packages fetched from an index are kept: ``~/.cache/bifrost/packages``."""
     return Path.home() / ".cache" / "bifrost" / "packages"
@@ -283,4 +522,18 @@ def _links(index: str) -> dict[str, str]:
     return parser.found
 
 
-__all__ = ["ANY", "ARCHIVE", "Package", "PackageError", "archive_name", "build", "host_triple", "resolve"]
+__all__ = [
+    "ANY",
+    "ARCHIVE",
+    "DEFAULT_INDEX",
+    "Package",
+    "PackageError",
+    "add",
+    "archive_name",
+    "build",
+    "host_triple",
+    "index_location",
+    "package_name",
+    "resolve",
+    "versions",
+]

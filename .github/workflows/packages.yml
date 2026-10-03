@@ -123,7 +123,7 @@ jobs:
           tag_name: ${{ matrix.tag }}
           name: ${{ matrix.name }} ${{ matrix.version }}
           target_commitish: ${{ github.sha }}
-          body: "Bifrost package `${{ matrix.name }}` ${{ matrix.version }}: one `.bifpkg` per target. Use it with `packages: {${{ matrix.name }}: ${{ matrix.version }}}` and `index: https://qinbeans.github.io/bifrost/packages/`."
+          body: "Bifrost package `${{ matrix.name }}` ${{ matrix.version }}: one `.bifpkg` per target. Add it with `bfc add ${{ matrix.name }}@${{ matrix.version }}`, or `packages: {${{ matrix.name }}: ${{ matrix.version }}}` in config.yaml."
           # The compiler's releases (`v*`) stay the latest, not a package's.
           make_latest: false
           fail_on_unmatched_files: true

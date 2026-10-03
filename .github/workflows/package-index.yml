@@ -1,10 +1,10 @@
 # Publishes the index of the Bifrost packages released here (the .bifpkg files
 # on this repository's releases) to GitHub Pages, at
 #   https://qinbeans.github.io/bifrost/packages/
-# which a project names in its config.yaml:
-#   index: https://qinbeans.github.io/bifrost/packages/
+# Bifrost's default index: a project's config.yaml lists a package from it by
+# version (`bfc add http_server` writes it):
 #   packages:
-#     http_server: 0.1.0
+#     http_server: 0.1.1
 # Requires Settings -> Pages -> Source: "GitHub Actions".
 name: Package index
 

@@ -8,7 +8,12 @@ flags:
   optimization: 2
   linker: clang
 
-# The HTTP server: extras/http-server, a package (its C library is built there first; see its README).
+# The HTTP server: the http_server package (extras/http-server), from the published index.
+# To work on the package itself, use it by path instead: `path: ../../extras/http-server`.
 packages:
   http_server:
-    path: ../../extras/http-server
+    index: bifrost_extras
+    version: 0.1.1
+
+index:
+  bifrost_extras: https://qinbeans.github.io/bifrost/packages/

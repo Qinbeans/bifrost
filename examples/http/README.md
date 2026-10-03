@@ -28,15 +28,14 @@ return http.run_with(app, 8080, shared)
 
 Handlers respond with records, `http.json(ctx, 200, #{sum: a + b})`: `http.json`'s body is declared `json` in `config.yaml`, so the compiler encodes the record at the call.
 
-`http` is not part of Bifrost: it comes from the [`http_server`](../../extras/http-server) package, which this project's `config.yaml` uses by path. The package's `c/http.c` wraps h2o, and its `config.yaml` declares it for Bifrost (the `http` extern module) and links it; its `http_server.handlers` module has ready-made handlers, like `/health`'s.
+`http` is not part of Bifrost: it comes from the [`http_server`](../../extras/http-server) package, which this project's `config.yaml` takes from the published package index (`bfc build` fetches it). The package's `c/http.c` wraps h2o, and its `config.yaml` declares it for Bifrost (the `http` extern module) and links it; its `http_server.handlers` module has ready-made handlers, like `/health`'s.
 
 ## Build and run
 
-h2o needs OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt install libssl-dev zlib1g-dev`), CMake and a C compiler.
+The package's h2o links OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt install libssl-dev zlib1g-dev`).
 
 ```bash
-(cd ../../extras/http-server && cmake -B build -G Ninja && cmake --build build)   # once
-bfc build
+bfc build                    # fetches http_server (h2o built for this target) into build/pkg/
 ./build/http                 # http://localhost:8080 ($PORT to change it)
 ```
 

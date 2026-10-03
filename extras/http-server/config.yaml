@@ -1,6 +1,6 @@
 package:
   name: http_server
-  version: 0.1.0
+  version: 0.1.1
   build: library
   description: A fasthttp-style HTTP server for Bifrost, on h2o (HTTP/1.1, HTTP/2, HTTP/3)
 

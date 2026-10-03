@@ -115,8 +115,8 @@ def render(links: list[tuple[str, str]]) -> str:
 <head><meta charset="utf-8"><title>Bifrost packages</title></head>
 <body>
 <h1>Bifrost packages</h1>
-<p>Use them from a project's <code>config.yaml</code>: <code>index: {{this page's URL}}</code>,
-then <code>packages: {{name: version}}</code>.</p>
+<p>Bifrost's default index: <code>bfc add name</code>, or <code>packages: {{name: version}}</code>
+in a project's <code>config.yaml</code>.</p>
 {sections}
 </body>
 </html>
