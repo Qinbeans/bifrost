@@ -62,7 +62,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.4" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "tree-sitter", specifier = ">=0.24.0" },
-    { name = "tree-sitter-bifrost", specifier = ">=0.1.22", index = "https://qinbeans.github.io/mlir-python/" },
+    { name = "tree-sitter-bifrost", specifier = ">=0.1.24", index = "https://qinbeans.github.io/mlir-python/" },
     { name = "typer", specifier = ">=0.15.1" },
 ]
 provides-extras = ["dev"]
@@ -385,17 +385,17 @@ wheels = [
 
 [[package]]
 name = "tree-sitter-bifrost"
-version = "0.1.22"
+version = "0.1.24"
 source = { registry = "https://qinbeans.github.io/mlir-python/" }
 wheels = [
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:b88f04016e9d43542a00c8f05b978e5bc9de93356b3b1256d1cafa43201a06f5" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp313-cp313-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:7eec4305f17c3fb0f2fb42ea768e296ff9b1d1080e7e638eaddd1e5c9ebd1d78" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:b69feb08fc1067a4296c004c7aa0b96d03fdf4dc0a0774ed618c28171830e988" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp313-cp313-win_amd64.whl", hash = "sha256:ee5e56f8c9953735b9ec04cbbb821d5a378ee334ee2f967aa371eabf2dbf24c9" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:d4ea0b3681474a4e32a144424ccadbb182a17c04040c147ba817909ef6e7d8b1" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp314-cp314-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:73a087eb19b10128c66a1e2d187bfbd28ddb9ea6aa494c5324c4096c84b51767" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:34040e65e6845cde51646898376781b253674f883a0466f73c16b1d9b3df8fb4" },
-    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.22/tree_sitter_bifrost-0.1.22-cp314-cp314-win_amd64.whl", hash = "sha256:9c25a59b14a0387adf3a80446a5bc681a78959dcd40c980fb146e89a8cc860ce" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6abaadd95a7816d940c5a0c256f8d633a4bce41a6b147e3da675a7be1b9f7652" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp313-cp313-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:1953f18c42168122620bff77a259bc333f03c1673130c29ceb5c996f4f58f752" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3b588706164ba0bc8bb870dc902db5ed1418e726c0c98bc4ff28f8c5a69bb8d3" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp313-cp313-win_amd64.whl", hash = "sha256:9be1d5a9f0920bad4c90f531c1e5043bfd48a88760d5211abe1bc7fb1a36910c" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:30c0ba510dc017693c970c159920ab67a5283956f9bf097d5ba345767ff7ed85" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp314-cp314-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:19004b6d44dd0f0f81a2b0209283da7647a133a3c47001f3742a8f2e9ea308bf" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1b428d71fa814353c2f7244d5d2610061143e702517ba119edd86cdb34d46ecf" },
+    { url = "https://github.com/Qinbeans/tree-sitter-bifrost/releases/download/v0.1.24/tree_sitter_bifrost-0.1.24-cp314-cp314-win_amd64.whl", hash = "sha256:0df284e14037cb85a2d91147c35c9fbde71ad1e33cb67c172c78289f0a71d807" },
 ]
 
 [[package]]

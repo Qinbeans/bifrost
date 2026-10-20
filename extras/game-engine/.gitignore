@@ -1,0 +1,3 @@
+# Bifrost build output, and the packages `bfc package` makes
+build/
+dist/

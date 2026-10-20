@@ -170,7 +170,7 @@ def sync(
         raise typer.Exit(1) from None
     for package in synced.found:
         how = "installed" if package.name in synced.unpacked else "up to date"
-        if not package.root.is_relative_to(config.parent.resolve() / "build" / "pkg"):
+        if not package.root.resolve().is_relative_to(config.parent.resolve() / "build" / "pkg"):
             how = f"by path, {package.root}"
         print(f"  {escape(package.name)} {escape(package.config.package.version)} ({escape(how)})")
     for name in synced.removed:

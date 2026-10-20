@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
+from bifrost import pipes
+
 _CELLS = {"mem.Shared", "mem.Atomic"}  # containers that may have several owners
 
 
@@ -63,7 +65,7 @@ def _text(node: Node) -> str:
 
 
 def _named(node: Node) -> list[Node]:
-    return [child for child in node.named_children if child.type != "comment"]
+    return [pipes.desugared(child) for child in node.named_children if child.type != "comment"]  # a pipe: its call
 
 
 def _unwrap(node: Node) -> Node:
@@ -404,6 +406,8 @@ class _Checker:
         parent = identifier.parent
         while parent is not None and parent.type in {"expression", "parenthesized_expression"}:
             parent = parent.parent
+        if parent is not None and parent.type == "pipe_expression":
+            return pipes.is_piped(identifier)  # `ctx |> draw`: passed to the call
         return parent is not None and parent.type in {"user_function_call", "builtin_call", "named_argument"}
 
     def name(self, node: Node, state: _State, *, field_access: bool, lent: bool) -> None:

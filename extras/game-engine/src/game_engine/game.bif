@@ -1,0 +1,250 @@
+let rl = import("raylib")
+
+module game = {
+    /* An http-style game engine on raylib: an app of handlers, each a function of the frame and the world.
+
+    A game is an App: its window, its world (any type W), and the handlers that make the next world
+    from the last. Handlers are pure: an update takes the frame and the world and returns a new
+    world; a draw reads the world and draws it with raylib. Build the app with pipes, then run it:
+
+        game.app("Breakout", 800, 600, start())
+            |> game.on_update(update)
+            |> game.on_key(keys.SPACE, serve)
+            |> game.on_draw(draw)
+            |> game.run
+    */
+
+    let Frame = struct {
+        let dt: f32,
+        let time: f64,
+        let number: i64,
+        let width: i32,
+        let height: i32,
+        let mouse: rl.Vector2
+    }
+
+    // What makes a handler run: every frame, a key or click this frame, or a timer.
+    let STARTED = 0
+    let EVERY_FRAME = 1
+    let KEY = 2
+    let CLICK = 3
+    let TIMER = 4
+
+    let Handler[W] = struct {
+        let when: i64,
+        let key: i32,
+        let seconds: f64,
+        let step: (f: Frame, w: W) => W
+    }
+
+    let Window = struct {
+        let title: str,
+        let width: i32,
+        let height: i32,
+        let fps: i32,
+        let background: rl.Color
+    }
+
+    let App[W] = struct {
+        let window: Window,
+        let world: W,
+        let handlers: Handler[W][],
+        let draws: ((f: Frame, w: W) => null)[]
+    }
+
+    let app[W] = [] (title: str, width: i32, height: i32, world: W) => App[W] {
+        /* A game of world, in a window of width x height titled title (60 frames a second, on black) */
+        let window = Window(
+            title: title,
+            width: width,
+            height: height,
+            fps: 60,
+            background: rl.Color(r: 0, g: 0, b: 0, a: 255)
+        )
+        return App(window: window, world: copy(world), handlers: #[], draws: #[])
+    }
+
+    let with_window[W] = [] (app: App[W], window: Window) => App[W] {
+        /* app, in window instead */
+        return App(
+            window: window,
+            world: copy(app.world),
+            handlers: #[...app.handlers],
+            draws: #[...app.draws]
+        )
+    }
+
+    let with_handler[W] = [] (app: App[W], handler: Handler[W]) => App[W] {
+        /* app, with one more handler (run after those before it) */
+        return App(
+            window: app.window,
+            world: copy(app.world),
+            handlers: #[...app.handlers, copy(handler)],
+            draws: #[...app.draws]
+        )
+    }
+
+    let handler[W] = [
+
+    ] (when: i64, key: i32, seconds: f64, step: (f: Frame, w: W) => W) => Handler[W] {
+        /* A handler of the world: step, run when it says */
+        return Handler(when: when, key: key, seconds: seconds, step: copy(step))
+    }
+
+    let fps[W] = [with_window] (app: App[W], fps: i32) => App[W] {
+        /* app, aiming for fps frames a second */
+        let w = app.window
+        return app
+            |> with_window(Window(title: w.title, width: w.width, height: w.height, fps: fps, background: w.background))
+    }
+
+    let background[W] = [with_window] (app: App[W], color: rl.Color) => App[W] {
+        /* app, clearing the screen to color before the draw handlers run */
+        let w = app.window
+        return app
+            |> with_window(Window(title: w.title, width: w.width, height: w.height, fps: w.fps, background: color))
+    }
+
+    let on_start[W] = [
+        with_handler,
+        handler
+    ] (app: App[W], step: (f: Frame, w: W) => W) => App[W] {
+        /* app, running step once, when the window is open: where to load what the world needs */
+        return app |> with_handler(handler(STARTED, 0, 0.0, step))
+    }
+
+    let on_update[W] = [
+        with_handler,
+        handler
+    ] (app: App[W], step: (f: Frame, w: W) => W) => App[W] {
+        /* app, running step every frame, before drawing: where the world moves on */
+        return app |> with_handler(handler(EVERY_FRAME, 0, 0.0, step))
+    }
+
+    let on_key[W] = [
+        with_handler,
+        handler
+    ] (app: App[W], key: i32, step: (f: Frame, w: W) => W) => App[W] {
+        /* app, running step in each frame key is pressed in (game_engine.keys names them) */
+        return app |> with_handler(handler(KEY, key, 0.0, step))
+    }
+
+    let on_click[W] = [
+        with_handler,
+        handler
+    ] (app: App[W], step: (f: Frame, w: W) => W) => App[W] {
+        /* app, running step in each frame the left mouse button is pressed in */
+        return app |> with_handler(handler(CLICK, 0, 0.0, step))
+    }
+
+    let every[W] = [
+        with_handler,
+        handler
+    ] (app: App[W], seconds: f64, step: (f: Frame, w: W) => W) => App[W] {
+        /* app, running step every seconds, from seconds after the window opens */
+        return app |> with_handler(handler(TIMER, 0, seconds, step))
+    }
+
+    let on_draw[W] = [] (app: App[W], draw: (f: Frame, w: W) => null) => App[W] {
+        /* app, calling draw every frame on the cleared screen: where the world is drawn, with raylib */
+        return App(
+            window: app.window,
+            world: copy(app.world),
+            handlers: #[...app.handlers],
+            draws: #[...app.draws, copy(draw)]
+        )
+    }
+
+    let runs[W] = [
+        rl.is_key_pressed,
+        rl.is_mouse_button_pressed
+    ] (h: Handler[W], f: Frame, before: f64) => bool {
+        /* Whether h runs in frame f (the last frame was at before) */
+        if h.when == EVERY_FRAME {
+            return true
+        }
+        if h.when == KEY {
+            return rl.is_key_pressed(h.key)
+        }
+        if h.when == CLICK {
+            return rl.is_mouse_button_pressed(0)
+        }
+        if h.when == TIMER {
+            return i64(f.time / h.seconds) > i64(before / h.seconds)
+        }
+        return false
+    }
+
+    let down = [rl.is_key_down] (key: i32) => bool {
+        /* Whether key is held down (game_engine.keys names them) */
+        return rl.is_key_down(key)
+    }
+
+    let pressed = [rl.is_key_pressed] (key: i32) => bool {
+        /* Whether key was pressed this frame */
+        return rl.is_key_pressed(key)
+    }
+
+    let run[W] = [
+        rl.init_window,
+        rl.set_target_fps,
+        rl.window_should_close,
+        rl.get_time,
+        rl.get_frame_time,
+        rl.get_screen_width,
+        rl.get_screen_height,
+        rl.get_mouse_position,
+        rl.begin_drawing,
+        rl.clear_background,
+        rl.end_drawing,
+        rl.close_window,
+        runs
+    ] (app: App[W]) => i32 {
+        /* Open the window and run the game until it is closed (Escape closes it) */
+        let window = app.window
+        rl.init_window(window.width, window.height, window.title)
+        rl.set_target_fps(window.fps)
+        let world = copy(app.world)
+        let frame = Frame(
+            dt: 0.0,
+            time: 0.0,
+            number: 0,
+            width: window.width,
+            height: window.height,
+            mouse: rl.get_mouse_position()
+        )
+        forall h in app.handlers {
+            if h.when == STARTED {
+                let world = h.step(frame, world)
+            }
+        }
+        let before = 0.0
+        while !rl.window_should_close() {
+            let now = rl.get_time()
+            let frame = Frame(
+                dt: rl.get_frame_time(),
+                time: now,
+                number: frame.number + 1,
+                width: rl.get_screen_width(),
+                height: rl.get_screen_height(),
+                mouse: rl.get_mouse_position()
+            )
+            forall h in app.handlers {
+                if runs(h, frame, before) {
+                    let world = h.step(frame, world)
+                }
+            }
+            rl.begin_drawing()
+            rl.clear_background(window.background)
+            forall draw in app.draws {
+                draw(frame, world)
+            }
+            rl.end_drawing()
+            let before = now
+        }
+        rl.close_window()
+        return 0
+    }
+}
+
+export(game)

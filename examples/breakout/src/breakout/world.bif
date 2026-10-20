@@ -1,0 +1,26 @@
+let rl = import("raylib")
+
+module world = {
+    /* What the game is at any moment: values the rules make new ones from */
+
+    let Ball = struct { let at: rl.Vector2, let velocity: rl.Vector2 }
+
+    let Brick = struct { let box: rl.Rectangle, let row: i64 }
+
+    let World = struct {
+        let paddle: rl.Rectangle,
+        let ball: Ball,
+        let bricks: Brick[],
+        let score: i64,
+        let lives: i64,
+        let phase: i64
+    }
+
+    // The phases of a game: the ball waits on the paddle, flies, or the game is over.
+    let SERVING = 0
+    let PLAYING = 1
+    let WON = 2
+    let LOST = 3
+}
+
+export(world)

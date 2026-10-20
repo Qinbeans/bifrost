@@ -64,7 +64,7 @@ def test_init_does_not_overwrite(workspace: Path) -> None:
     (workspace / "shop").mkdir()
     result = CliRunner().invoke(cli, ["init", "shop"])
     assert result.exit_code == 1
-    assert "already exists" in result.output
+    assert "already exists" in " ".join(result.output.split())  # rich wraps long paths
 
 
 def test_build_without_entry_says_how(workspace: Path) -> None:

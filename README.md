@@ -82,7 +82,48 @@ let main = [adder, io.printf] () => null {
 
 The language server warns at each capture that it is a copy; `// ignore: copy` on that line (or the one above) accepts it.
 
+`|>` pipes a value into a call, as its first argument: `x |> f(a)` is `f(x, a)`, so a chain of steps reads in the order they run. The right side is a call, a function's name (`x |> f` is `f(x)`), a lambda, or a method of the value (`xs |> .sorted()` is `xs.sorted()`). It is exactly that call: it needs the same dependency entry, and lends, moves and checks its arguments as the call does.
+
+```bifrost
+let total = xs
+    |> .filter([] (x: i64) => bool x > 0)  // xs.filter(...)
+    |> .map([] (x: i64) => i64 x * 2)
+    |> sum  // sum(...)
+    |> clamp(0, 100)  // clamp(..., 0, 100)
+let next = 41 |> [] (y: i64) => i64 y + 1  // a lambda, called with 41
+```
+
+`|>` binds more loosely than every other operator, so `a + b |> f` is `f(a + b)`, and a comparison needs parentheses: `(x |> f) == y`. `await` binds tighter, so a call that pauses is awaited as `await (url |> fetch)`. `bfc fmt` keeps a chain on one line when it fits, and otherwise breaks it before each `|>`.
+
 A function value is the function and what it captured, so C cannot call one. A C function that takes a callback takes a function by name, or a lambda that captures nothing: either is a plain C function pointer, so C libraries can call back into Bifrost.
+
+A list of function values is written with the function type in parentheses: `((x: i64) => i64)[]`.
+
+### Generics
+
+A function or object can take type parameters, written after its name. It is compiled once for each set of types it is used with, as in Rust or C++, so it costs nothing at run time:
+
+```bifrost
+let first[T] = [] (xs: T[]) => T xs[0]
+let empty[T] = [] () => T[] #[]
+let apply[T, U] = [] (f: (x: T) => U, x: T) => U f(x)
+
+let Pair[A, B] = struct { let left: A, let right: B }
+let swap[A, B] = [] (p: Pair[A, B]) => Pair[B, A] Pair(left: p.right, right: p.left)
+
+let double = [] (x: i64) => i64 x * 2
+
+let main = [first, empty, apply, swap, double] () => null {
+    let n = first(#[7, 8])                      // first[i64]
+    let m = apply(double, 21)                   // apply[i64, i64]
+    let q = swap(Pair(left: 1, right: 2.5))     // a Pair[f64, i64]
+    let none: i64[] = empty()                   // T from the type written where it goes
+}
+```
+
+A call's types come from its arguments' types (numbers written as arguments take the type the others give, or `f64` if one of them is one), or else from the type written where its value goes: `let none: i64[] = empty()`. A generic object's type is written with its types, `Pair[f64, i64]`. A generic compiles where it is defined, so a package's generic functions take the types of the app that calls them. Errors in a generic's body name the types it was compiled for: `in first[str]: ...`.
+
+A generic function is called, not passed as a value (pass a lambda calling it, `[first] (xs: i64[]) => i64 first(xs)`), and a generic object has no functions of its own yet: write a generic function that takes it.
 
 ### Objects
 
@@ -351,7 +392,13 @@ let users = [http.json] (ctx: http.Context) => null {
 }
 ```
 
-A list has one owner, like an owned string: the `let` holding it, freed at the end of its block, or its caller, once returned. Putting it in a record, object or another list that is kept moves it in (`let team = Team(members: xs)`); passing it to a function lends it. Reading a list out of another value (`team.members`, `rows[0]`, the `row` of `forall row in rows`) gives a view: it can be used, but not kept, so returning or storing it asks for a copy (`#[...team.members]`), and what it reads from is not replaced while the view is in use. A list made only to be lent (`total(#[1, 2, 3])`, `http.json(ctx, 200, #{users: found})`) is freed after the statement. At run time, a list is a pointer to its first item, after its length and capacity, so indexing is as fast as a C array.
+A list has one owner, like an owned string: the `let` holding it, freed at the end of its block, or its caller, once returned. Putting it in a record, object or another list that is kept moves it in (`let team = Team(members: xs)`); passing it to a function lends it. Reading a list out of another value (`team.members`, `rows[0]`, the `row` of `forall row in rows`) gives a view: it can be used, but not kept, so returning or storing it asks for a copy (`#[...team.members]`), and what it reads from is not replaced while the view is in use. A list made only to be lent (`total(#[1, 2, 3])`, `http.json(ctx, 200, #{users: found})`) is freed after the statement, and so is an object made only to be lent (`total(Team(members: xs))`), which owns what fills it: `xs` moves in. At run time, a list is a pointer to its first item, after its length and capacity, so indexing is as fast as a C array.
+
+### Copies and conversions
+
+`copy(x)` is a deep copy of any value: a new owner of the lists, strings and function values it holds, at any depth. It is what keeping a view or a parameter asks for, when it is a record or object (`world: copy(app.world)`); a list can also be copied with `#[...xs]`. A function value's copy copies what it captured.
+
+Numbers convert by calling their type: `i32(x / 2)`, `f32(column)`, `i64(2.9)` (a float becomes an integer toward zero). `/` always divides as floats, so `i32((800 - width) / 2)` centers. `copy`, `i32` and the others are the language's own functions: they need no import or dependency entry, and a local of the same name hides them.
 
 ### HTTP servers
 
@@ -378,6 +425,25 @@ let main = [http.app, http.get, http.run, get_user] () => i32 {
 ```
 
 State the handlers share is owned by `main` and passed to the server: `http.run_with(app, 8080, shared)` gives it to handlers registered with `http.get_with`, which take it as `mem.Shared[AppState]` and reach it through a guard. The example's README shows how to build and try it.
+
+### Games
+
+`examples/breakout` is Breakout on [`extras/game-engine`](./extras/game-engine), a package written in Bifrost on raylib. Like the HTTP server, a game is an app of handlers, but each handler is a pure function: an update takes the frame and the world and returns the next world; a draw reads the world. The app is a value, built with pipes, and generic over the world:
+
+```bifrost
+let update = [steering, rules.step] (f: game.Frame, w: World) => World w |> rules.step(steering(), f.dt)
+let serve = [rules.serve] (_f: game.Frame, w: World) => World rules.serve(w)
+
+let main = [game.app, game.on_update, game.on_key, game.on_draw, game.run, rules.start, update, serve, draw] () => i32 {
+    return game.app("Breakout", 800, 600, rules.start())    // a game.App[World]
+        |> game.on_update(update)
+        |> game.on_key(keys.SPACE, serve)
+        |> game.on_draw(draw)
+        |> game.run
+}
+```
+
+Since the rules are pure, a game can be tested without a window: start a world, and step it.
 
 ### Async functions
 
@@ -566,6 +632,8 @@ bifrost/
 │   ├── syntax.py          # Describes syntax errors in terms of the source
 │   ├── guards.py          # Checks locks and releases along every path
 │   ├── ownership.py       # Checks moves of owned values, and plans where they are freed
+│   ├── pipes.py           # Reads `x |> f(a)` as the call `f(x, a)`, for every check and the lowering
+│   ├── generics.py        # Generic functions and objects, and what each was compiled for
 │   ├── lowering/          # Checks a CST (dependencies, names), loads imported modules, and lowers to Python AST
 │   ├── project/           # Declares configured and standard externs; builds the executable
 │   ├── configs/           # config.yaml schema, and header traversal (libclang)
@@ -573,8 +641,8 @@ bifrost/
 │   ├── naming.py          # snake_case / PascalCase checks and conversions
 │   ├── formatter/         # The formatter
 │   └── server/            # The language server (pygls) and its analysis
-├── examples/              # http, raylib and async apps, and simple
-├── extras/                # packages (http-server, raylib) and the VS Code extension
+├── examples/              # http, raylib, breakout and async apps, and simple
+├── extras/                # packages (http-server, raylib, game-engine) and the VS Code extension
 ├── tools/                 # package_index.py: which packages CI builds, and their index page
 └── tests/
 ```
@@ -640,6 +708,14 @@ bfc build
 ./build/hello_raylib
 ```
 
+Breakout uses the game engine and raylib by path, so raylib's C library is built first too (the engine is all Bifrost):
+
+```bash
+cd examples/breakout
+bfc build
+./build/breakout             # arrows steer, space serves
+```
+
 ## Development
 
 ```bash
@@ -664,6 +740,7 @@ uv run ruff format     # format
 - **Trailing commas**
 - **More of packages**: `bfc add`, and packages for macOS and Windows
 - **Quick fixes** in the language server, such as adding a missing dependency
+- **More of generics**: a generic object's own functions, constraints on type parameters, generic functions as values, and type arguments written at a call (`empty[i64]()`)
 
 ## Project Goals
 

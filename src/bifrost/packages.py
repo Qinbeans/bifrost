@@ -151,9 +151,8 @@ def resolve(config: Config, folder: Path, *, install: bool) -> Config:
 
     """
     resolver = _Resolver(folder, install=install)
-    for name, source in config.packages.items():
-        resolver.resolve(name, source, folder, config.index)
-    return _merge(config, resolver.found.values())
+    resolver.resolve_all(config.packages, folder, config.index)
+    return _merge(config, resolver.ordered())
 
 
 def _merge(config: Config, found: Iterable[Package]) -> Config:
@@ -199,9 +198,8 @@ def sync(config_path: Path) -> Synced:
     folder = config_path.parent
     config = ConfigBuilder(config_path, resolve=False).build()
     resolver = _Resolver(folder, install=True)
-    for name, source in config.packages.items():
-        resolver.resolve(name, source, folder, config.index)
-    _merge(config, resolver.found.values())  # checks that they fit together
+    resolver.resolve_all(config.packages, folder, config.index)
+    _merge(config, resolver.ordered())  # checks that they fit together
     installed = folder / "build" / "pkg"
     removed = []
     for path in sorted(installed.iterdir()) if installed.is_dir() else []:
@@ -218,12 +216,47 @@ class _Resolver:
     def __init__(self, project: Path, *, install: bool) -> None:
         self.project = project
         self.install = install
-        self.found: dict[str, Package] = {}  # in the order C libraries link: a package before what it uses
+        self.found: dict[str, Package] = {}
+        self.uses: dict[str, list[str]] = {}  # each package's own packages
         self.unpacked: set[str] = set()  # the packages unpacked now, not already
+        # Packages the found ones use, resolved after the project's own: its entries win (`path:` over a version).
+        self.queue: list[tuple[str, str | _PackageSource, Path, dict[str, str]]] = []
+
+    def resolve_all(self, packages: dict[str, str | _PackageSource], folder: Path, indexes: dict[str, str]) -> None:
+        """Find ``packages`` (a project's), then the packages they use, breadth first."""
+        for name, source in packages.items():
+            self.resolve(name, source, folder, indexes)
+        while self.queue:
+            self.resolve(*self.queue.pop(0))
+
+    def ordered(self) -> list[Package]:
+        """Return the packages found in the order their C libraries link: each before the packages it uses.
+
+        A static library only takes from those after it, so ``game_engine`` (which calls raylib)
+        links before ``raylib``, whichever the project lists first.
+        """
+        order: list[str] = []
+        seen: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in seen or name not in self.found:
+                return
+            seen.add(name)
+            for used in self.uses.get(name, []):
+                visit(used)
+            order.append(name)  # after what it uses: reversed below
+
+        for name in self.found:
+            visit(name)
+        return [self.found[name] for name in reversed(order)]
 
     def resolve(self, name: str, source: str | _PackageSource, folder: Path, indexes: dict[str, str]) -> None:
         """Find package ``name`` as ``source`` says (relative to ``folder``, whose config names ``indexes``)."""
         if name in self.found:
+            wanted = source if isinstance(source, str) else source.version
+            version = self.found[name].config.package.version
+            if wanted is not None and wanted != version:
+                raise PackageError(f"{folder / 'config.yaml'} needs package {name} {wanted}, but {version} is used")
             return
         if isinstance(source, str) or source.index is not None:
             wanted = source if isinstance(source, str) else source.version
@@ -250,8 +283,9 @@ class _Resolver:
         if wanted is not None and config.package.version != wanted:
             raise PackageError(f"package {name} is version {config.package.version}, not {wanted}")
         self.found[name] = Package(name, root, config)
+        self.uses[name] = list(config.packages)
         for inner, inner_source in config.packages.items():  # what it uses
-            self.resolve(inner, inner_source, root, config.index)
+            self.queue.append((inner, inner_source, root, config.index))
 
     def unpack(self, archive: Path, name: str) -> Path:
         """Unpack ``archive`` into ``build/pkg/<name>/`` (unless it is there already); return that folder."""

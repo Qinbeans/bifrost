@@ -12,7 +12,7 @@ from bifrost.server.analysis import Document
 EXAMPLES = Path(__file__).parents[1] / "examples"
 
 
-@pytest.mark.parametrize("project", [EXAMPLES / "http", EXAMPLES / "raylib", EXAMPLES / "async"])
+@pytest.mark.parametrize("project", [EXAMPLES / "http", EXAMPLES / "raylib", EXAMPLES / "async", EXAMPLES / "breakout"])
 def test_example_compiles(project: Path) -> None:
     config = ConfigBuilder(project / "config.yaml").build()  # its packages from extras/ (see conftest.py)
     assert config.package.entry is not None

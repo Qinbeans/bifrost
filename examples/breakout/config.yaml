@@ -1,0 +1,17 @@
+package:
+  name: breakout
+  version: 0.1.0
+  description: Breakout, on the game_engine package
+  entry: src/breakout/main.bif
+
+flags:
+  optimization: 2
+  linker: clang
+
+# The engine (extras/game-engine) and raylib (extras/raylib), used by path while
+# they are developed here; raylib's C library is built there first (see its README).
+packages:
+  game_engine:
+    path: ../../extras/game-engine
+  raylib:
+    path: ../../extras/raylib

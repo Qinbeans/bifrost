@@ -19,11 +19,11 @@ from mlir_python.codegen import OptLevel
 from mlir_python.lang import CompileError
 from tree_sitter import Language, Node, Parser
 
-from bifrost import list_methods, std
+from bifrost import generics, list_methods, pipes, std
 from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.configs.schema import Declaration, _Extern
 from bifrost.lowering import RECORD, BifrostError, display_types, lower_file
-from bifrost.naming import extern_name, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
+from bifrost.naming import extern_name, is_constant_case, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
 from bifrost.owned import is_list
 from bifrost.packages import PackageError
 from bifrost.project import Project
@@ -353,7 +353,7 @@ class Document:
                 continue
             if what == "object" and not is_pascal_case(name):
                 message = f"object '{name}' should be PascalCase: '{to_pascal_case(name)}'"
-            elif what != "object" and not is_snake_case(name):
+            elif what != "object" and not is_snake_case(name) and not (_is_constant(node) and is_constant_case(name)):
                 message = f"{what} '{name}' should be snake_case: '{to_snake_case(name)}'"
             else:
                 continue
@@ -396,7 +396,9 @@ class Document:
             declared = [
                 identifier
                 for binding in _descendants(function, "parameter", "local_assignment", "lock", own=True)
-                if (identifier := _name_of(binding)) is not None and not _text(identifier).startswith("_")
+                if (identifier := _name_of(binding)) is not None
+                and not _text(identifier).startswith("_")
+                and (binding.parent is None or binding.parent.type != "function_type")  # `(x: i64) => i64`: a type
             ]
             used = {_text(name) for name in _uses(function)}
             for identifier in declared:
@@ -614,13 +616,28 @@ class Document:
                 return " ".join(_text(declared).split())
             return self._guard_type(locked) if locked else None
         if local.type == "local_assignment" and len(parts) > 1:
-            declared = local.child_by_field_name("type")
-            if declared is not None:
-                return " ".join(_text(declared).split())
-            value = _unwrap(parts[-1])
-            written = self._written_type(value, local) if value.type == "await_expression" else None
-            return self._type_of_value(value, local) or self._inferred_type(local) or written
+            return self._type_of_let(local, _unwrap(parts[-1]))
         return None
+
+    def _type_of_let(self, local: Node, value: Node) -> str | None:
+        """Return the type of a ``let``: written, or what its value gives."""
+        declared = local.child_by_field_name("type")
+        if declared is not None:
+            return " ".join(_text(declared).split())
+        written = self._written_type(value, local) if value.type == "await_expression" else None
+        if self._calls_generic(value, local):  # what it gives depends on the types it is called with
+            return self._inferred_type(local)
+        return self._type_of_value(value, local) or self._inferred_type(local) or written
+
+    def _calls_generic(self, value: Node, where: Node) -> bool:
+        """Whether ``value`` calls a generic function or builds a generic object (``first(xs)``, ``Pair(...)``)."""
+        call = (
+            value if value.type == "function_call" else _named(value)[-1] if value.type == "child_annotation" else None
+        )
+        inner = _named(call)[0] if call is not None and call.type == "function_call" and _named(call) else None
+        called = self._called(inner) if inner is not None and inner.type == "user_function_call" else None
+        callee = self._callee(*called, where) if called is not None else None
+        return isinstance(callee, tuple) and bool(_type_parameters(callee[1]))
 
     def _guard_type(self, locked: str) -> str:
         """Name the guard a lock gives: ``mem.Weak[Context]`` -> ``mem.WeakGuard[Context]``.
@@ -851,6 +868,8 @@ class Document:
         """
         called = self._called(call)
         names = self._parameter_names(*called, call) if called is not None else None
+        if names and pipes.takes_piped(call):  # `3 |> add(4)`: 3 is the first argument
+            names = names[1:]
         hints = []
         arguments = [argument for argument in _named(call) if argument.type == "expression"]
         for argument, name in zip(arguments, names or [], strict=False):
@@ -958,6 +977,8 @@ class Document:
             return None
         written = next((part for part in _named(declared) if part.type == "type_or_object"), None)
         shown = " ".join(_text(written).split()) if written is not None else ""
+        if set(re.findall(r"\w+", shown)) & _type_parameters(value):
+            shown = ""  # `Pair(left: 1)`: A is whatever fills it, not a type to show
         return described, Location(document.path, document.range(declared_name)), shown
 
     def _named_argument_hint(self, argument: Node) -> list[InlayHint]:
@@ -1416,17 +1437,7 @@ class Document:
         stem = before[len(before.rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")) :]
         prefix = before[: len(before) - len(stem)]
         if prefix.endswith("."):
-            owner = prefix[:-1].split()[-1].split("[")[-1].split("(")[-1] if prefix[:-1].strip() else ""
-            module = self._module_of(owner)
-            if module:
-                return self._members(module)
-            if owner in self.bindings():
-                return self._static_members(owner)
-            where = self.root.named_descendant_for_point_range((row, character), (row, character))
-            found = self._struct_of(owner, where) if where is not None and "." not in owner else None
-            if found is not None:
-                return self._fields(found[1])
-            return self._record_completions(owner, where) if where is not None and owner else []
+            return self._member_completions(prefix[:-1].rstrip(), (row, character))
         names = [
             Completion(
                 name,
@@ -1446,6 +1457,29 @@ class Document:
             + [Completion(keyword, "keyword") for keyword in KEYWORDS]
             + [Completion(kind, "type") for kind in TYPES]
         )
+
+    def _member_completions(self, head: str, point: tuple[int, int]) -> list[Completion]:
+        """Offer what follows ``head.``: a module's members, an object's static functions, or a value's fields.
+
+        After ``team |> .``, only the methods of the value piped in.
+        """
+        piped = head.endswith("|>")
+        if piped:
+            head = head[:-2]
+        owner = head.split()[-1].split("[")[-1].split("(")[-1] if head.strip() else ""
+        module = self._module_of(owner)
+        if module:
+            return [] if piped else self._members(module)
+        if owner in self.bindings():
+            return [] if piped else self._static_members(owner)
+        where = self.root.named_descendant_for_point_range(point, point)
+        found = self._struct_of(owner, where) if where is not None and "." not in owner else None
+        if found is not None:
+            fields = self._fields(found[1])
+            return [field for field in fields if field.kind == "method"] if piped else fields
+        if piped or where is None or not owner:
+            return []  # a record has no methods
+        return self._record_completions(owner, where)
 
     def _locals(self, function: Node) -> list[str]:
         found: list[str] = []
@@ -1957,6 +1991,19 @@ def _doc_text(comment: str) -> str:
     return "\n".join(line.strip().removeprefix("*").strip() for line in lines).strip()
 
 
+def _is_constant(binding: Node) -> bool:
+    """Whether a binding is a constant: a top-level or module ``let`` of a value (``let WIDTH = 800``)."""
+    value = _named(binding)[-1] if binding.type == "assignment" and _named(binding) else None
+    return value is not None and value.type == "expression" and "import(" not in _text(value)
+
+
+def _type_parameters(definition: Node) -> set[str]:
+    """Return the type parameters of the generic a definition is (``T`` of ``let first[T] = ...``), if it is one."""
+    assignment = definition.parent
+    parameters = assignment.child_by_field_name("type_parameters") if assignment is not None else None
+    return {_text(name) for name in parameters.children_by_field_name("name")} if parameters is not None else set()
+
+
 def _documented(code: str, doc: str) -> str:
     """Return a hover: the code, then its documentation (Markdown) under it."""
     return _code(code) + (f"\n\n{doc}" if doc else "")
@@ -1974,7 +2021,7 @@ def _type_name(kind: Any) -> str:  # noqa: ANN401 - a compiler type
         return "#{" + ", ".join(f"{name}: {_type_name(field)}" for name, field in kind.fields) + "}"
     if is_list(kind):
         return f"{_type_name(kind.element)}[]"
-    return {"cstr": "str"}.get(kind.name, kind.name)
+    return {"cstr": "str"}.get(kind.name, generics.display(kind.name))  # `Box__g0` is `Box[i64]`
 
 
 # Standard modules whose functions the compiler expands itself.

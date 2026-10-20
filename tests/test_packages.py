@@ -203,6 +203,21 @@ def test_errors(tmp_path: Path, extra: str, message: str) -> None:
         ConfigBuilder(app / "config.yaml", install=True).build()
 
 
+def test_the_project_s_own_entries_win(tmp_path: Path) -> None:
+    # A package asks for greeting from an index; the project lists it by path, which is used
+    # (resolved first: the project's packages, then theirs), so no index is needed.
+    _project(tmp_path / "greeting", "greeting")
+    _project(tmp_path / "middle", "middle", "packages:\n  greeting: 0.2.0\n")
+    extra = "packages:\n  middle:\n    path: ../middle\n  greeting:\n    path: ../greeting\n"
+    app = _project(tmp_path / "app", "app", extra, source=APP)
+    assert _run(app) == "Hello, ada!\n"
+    (tmp_path / "greeting" / "config.yaml").write_text(
+        (tmp_path / "greeting" / "config.yaml").read_text().replace("0.2.0", "0.3.0")
+    )
+    with pytest.raises(PackageError, match=re.escape("needs package greeting 0.2.0, but 0.3.0 is used")):
+        ConfigBuilder(app / "config.yaml", install=True).build()
+
+
 def test_only_a_library_is_a_package(tmp_path: Path) -> None:
     # `package.build: library` makes a project a package; an executable is neither packaged nor used as one.
     app = _project(tmp_path / "app", "app", source=APP)

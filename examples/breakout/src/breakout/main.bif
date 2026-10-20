@@ -1,0 +1,88 @@
+let rl = import("raylib")
+let game = import("game_engine.game:game")
+let keys = import("game_engine.keys:keys")
+let world = import("breakout.world:world")
+let rules = import("breakout.rules:rules")
+
+// Handlers are thin: each takes the frame and the world, and asks the rules (pure functions)
+// for the next world. The engine calls them, as a server calls the handlers of its routes.
+
+let steering = [game.down] () => f32 {
+    /* -1 while left is held, 1 while right is, 0 for neither (or both) */
+    let direction = 0.0
+    if game.down(keys.RIGHT) {
+        let direction = direction + 1.0
+    }
+    if game.down(keys.LEFT) {
+        let direction = direction - 1.0
+    }
+    return direction
+}
+
+let update = [steering, rules.step] (f: game.Frame, w: world.World) => world.World {
+    /* Every frame: the paddle follows the keys, and the ball flies */
+    return w |> rules.step(steering(), f.dt)
+}
+
+let serve = [rules.serve] (_f: game.Frame, w: world.World) => world.World {
+    /* Space: serve the ball, or start again once the game is over */
+    return rules.serve(w)
+}
+
+let centered = [rl.measure_text, rl.draw_text] (text: str, y: i32, size: i32) => null {
+    /* Draw text across the middle of the screen */
+    rl.draw_text(
+        text,
+        i32((800 - rl.measure_text(text, size)) / 2),
+        y,
+        size,
+        rl.Color(r: 245, g: 245, b: 245, a: 255)
+    )
+}
+
+let draw = [
+    rl.draw_rectangle_rec,
+    rl.draw_circle_v,
+    rl.draw_text,
+    rules.color_of,
+    centered
+] (_f: game.Frame, w: world.World) => null {
+    /* The bricks, the paddle, the ball, and the score: the world as it is */
+    let white = rl.Color(r: 245, g: 245, b: 245, a: 255)
+    forall brick in w.bricks {
+        rl.draw_rectangle_rec(brick.box, rules.color_of(brick.row))
+    }
+    rl.draw_rectangle_rec(w.paddle, white)
+    rl.draw_circle_v(w.ball.at, rules.RADIUS, white)
+    rl.draw_text("score {w.score}", 20, 16, 20, white)
+    rl.draw_text("lives {w.lives}", 700, 16, 20, white)
+    if w.phase == world.SERVING {
+        centered("space to serve, arrows to steer", 400, 20)
+    }
+    if w.phase == world.WON {
+        centered("you won with {w.score}! space to play again", 300, 28)
+    }
+    if w.phase == world.LOST {
+        centered("game over: {w.score}. space to play again", 300, 28)
+    }
+}
+
+let main = [
+    game.app,
+    game.background,
+    game.on_update,
+    game.on_key,
+    game.on_draw,
+    game.run,
+    rules.start,
+    update,
+    serve,
+    draw
+] () => i32 {
+    return game.app("Breakout", 800, 600, rules.start())
+        |> game.background(rl.Color(r: 24, g: 24, b: 32, a: 255))
+        |> game.on_update(update)
+        |> game.on_key(keys.SPACE, serve)
+        |> game.on_draw(draw)
+        |> game.run
+}

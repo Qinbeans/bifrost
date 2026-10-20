@@ -195,7 +195,13 @@ class _Formatter:
         identifier, value = parts[0], parts[-1]
         type_node = node.child_by_field_name("type")
         annotation = f": {self.format(type_node, depth)}" if type_node is not None else ""
-        head = f"let {_text(identifier)}{annotation} = "
+        parameters = node.child_by_field_name("type_parameters")  # `let first[T, U] = ...`
+        generic = (
+            "[" + ", ".join(_text(name) for name in parameters.children_by_field_name("name")) + "]"
+            if parameters is not None
+            else ""
+        )
+        head = f"let {_text(identifier)}{generic}{annotation} = "
         return head + self.value(value, depth, len(INDENT * depth + head))
 
     _local_assignment = _assignment
@@ -345,6 +351,32 @@ class _Formatter:
         operator = _text(node.child_by_field_name("operator"))
         right = self.format(node.child_by_field_name("right"), depth)
         return f"{left} {operator} {right}"
+
+    def _pipe_expression(self, node: Node, depth: int) -> str:
+        """``x |> f(a) |> g``: on one line, or, when the statement is too long, one stage per line.
+
+        Broken, each ``|>`` starts a line of its own, one level in, under the value piped in.
+        """
+        breaking, self._break_next_call = self._break_next_call, False
+        stages: list[Node] = []
+        current = node
+        while current.type == "pipe_expression":  # `a |> b |> c` is `(a |> b) |> c`
+            stages.append(current.child_by_field_name("into"))
+            value = current.child_by_field_name("value")
+            inner = _named(value)[0] if value.type == "expression" and _named(value) else value
+            if inner.type != "pipe_expression":
+                stages.append(value)
+                break
+            current = inner
+        stages.reverse()
+        first = self.format(stages[0], depth)
+        if not breaking:
+            return " |> ".join([first, *(self.format(stage, depth) for stage in stages[1:])])
+        rest = (f"{INDENT * (depth + 1)}|> {self.format(stage, depth + 1)}" for stage in stages[1:])
+        return "\n".join([first, *rest])
+
+    def _pipe_method(self, node: Node, depth: int) -> str:
+        return "." + self.format(_named(node)[0], depth)
 
     def _unary_expression(self, node: Node, depth: int) -> str:
         operator = _text(node.child_by_field_name("operator"))

@@ -134,8 +134,10 @@ def test_naming_conventions() -> None:
     source = (
         'let Rl = import("raylib")\n'
         "let point = struct { let X: i32, let y_pos: i32 }\n"
-        "let drawText = (fontSize: i32) => null {\n    let myValue = fontSize\n}\n"
+        "let drawText = (fontSize: i32) => null {\n    let myValue = fontSize\n    let LOCAL = 1\n}\n"
         "let Good = struct { let a: i32 }\nlet good_name = 1\n"
+        # Constants may be UPPER_CASE.
+        "let WIDTH = 800\nmodule keys = {\n    let KEY_SPACE = 32\n    let MaxSize = 3\n}\n"
     )
     messages = [d.message for d in Document.open(EXAMPLES / "scratch.bif", source).naming()]
     assert messages == [
@@ -145,6 +147,8 @@ def test_naming_conventions() -> None:
         "function 'drawText' should be snake_case: 'draw_text'",
         "parameter 'fontSize' should be snake_case: 'font_size'",
         "variable 'myValue' should be snake_case: 'my_value'",
+        "variable 'LOCAL' should be snake_case: 'local'",
+        "variable 'MaxSize' should be snake_case: 'max_size'",
     ]
 
 

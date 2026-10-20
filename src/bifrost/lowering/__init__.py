@@ -66,7 +66,7 @@ from mlir_python.lang._types import scalar_type
 from mlir_python.lang.types import FnType, ScalarType, StructType
 from tree_sitter import Language, Node, Parser
 
-from bifrost import formats, guards, list_methods, ownership, std
+from bifrost import formats, generics, guards, list_methods, ownership, pipes, std
 from bifrost.configs.schema import _Extern
 from bifrost.naming import extern_name
 from bifrost.owned import OWNED_STRING, closure_names, closure_of, is_closure, is_list, list_of, owns, signature_of
@@ -91,6 +91,11 @@ _PRIMITIVES: dict[str, object] = {
     "str": cstr,
     "null": type(None),
 }
+
+_DEPENDENCY_LISTS = {"dependency_list", "local_dependency_list"}
+
+# The numeric types a value converts to by calling them: `i32(x / 2)`, `f32(n)` (see `_convert`).
+_CONVERSIONS = {name for name in _PRIMITIVES if name not in {"bool", "str", "null"}}
 
 # A C function's `ptr` parameter, to which an owned local is lent (see `_opaque_params`).
 _OPAQUE = object()
@@ -152,7 +157,7 @@ _FN_TYPE = re.compile(r"Fn\[\[([^\[\]]*)\], ([^\[\],]+)\]")
 
 def display_types(text: str) -> str:
     """Write the compiler's type names as Bifrost does: ``Fn[[i32], None]`` is ``(i32) => null``."""
-    text = closure_names(text)
+    text = generics.display(closure_names(text))
     previous = None
     while previous != text:
         previous = text
@@ -191,8 +196,8 @@ def _copy_tree(node: ast.expr) -> ast.expr:
 
 
 def _children(node: Node) -> list[Node]:
-    """Named children, without comments (an extra that can appear anywhere)."""
-    return [child for child in node.named_children if child.type != "comment"]
+    """Named children, without comments (an extra that can appear anywhere); a pipe as the call it is."""
+    return [pipes.desugared(child) for child in node.named_children if child.type != "comment"]
 
 
 def _unwrap(node: Node) -> Node:
@@ -213,6 +218,11 @@ def _unwrap(node: Node) -> Node:
 
 def _text(node: Node) -> str:
     return (node.text or b"").decode()
+
+
+# While matching a generic's written types to values': the generic, its parameters' bindings so far
+# (each with the argument that bound it), the argument being matched, and the file to report errors in.
+type _Unifying = "tuple[generics.Generic, dict[str, tuple[object, Node]], Node, SourceUnit]"
 
 
 @dataclass(frozen=True)
@@ -424,6 +434,11 @@ class SourceUnit:
         self._owning: set[int] = set()  # ids of the expressions that are kept: what they hold moves in
         self._expected: dict[int, ScalarType] = {}  # list literals (by id) whose type is written where they go
         self._functions: set[str] = set()  # top-level functions, bound after lowering
+        self._type_env: dict[str, object] = {}  # while compiling a generic: its type parameters -> their types
+        self._instance: tuple[str, str] | None = None  # while compiling a generic function: (`first[i64]`, `first`)
+        # Values (by id) whose type is written where they go: `let xs: i64[] = empty()`, a returned value.
+        self._expected_values: dict[int, ScalarType] = {}
+        self._instance_names: dict[str, str] = {}  # generated filename of a generic's instance -> `first[i64]`
 
     # -- errors -----------------------------------------------------------------
 
@@ -454,7 +469,11 @@ class SourceUnit:
                 (point for (row, _), point in sorted(positions.items()) if row == line),
                 positions.get((1, 0), (0, 0)),
             )
-            raise BifrostError(display_types(error.msg), self.path, self.source, point) from error
+            message = display_types(error.msg)
+            instance = self._instance_names.get(error.filename or "")
+            if instance is not None:
+                message = f"in {instance}: {message}"
+            raise BifrostError(message, self.path, self.source, point) from error
 
     # -- top level ----------------------------------------------------------------
 
@@ -535,13 +554,18 @@ class SourceUnit:
         self, assignment: Node, functions: list[_PendingFunction], module: str | None, scope: dict[str, Any]
     ) -> list[_PendingFunction]:
         """Bind one ``let`` in ``scope`` (the file's globals, or a module's namespace)."""
-        identifier, value = _children(assignment)
+        parts = _children(assignment)
+        identifier, value = parts[0], parts[-1]
         name = self._identifier(identifier)
         qualified = f"{module}.{name}" if module else name
         if name in scope or any(qualified == function.name for function in functions):
             raise self.error(identifier, f"'{name}' is already defined")
         symbol = self.prefix + qualified.replace(".", "_")
         owner = self.globals[module] if module else None
+        parameters = assignment.child_by_field_name("type_parameters")
+        if parameters is not None:
+            scope[name] = self._generic(qualified, symbol, value, parameters, module)
+            return []  # compiled for each set of types it is used with (see `_instantiate_function`)
         match value.type:
             case "function_definition":
                 return [_PendingFunction(qualified, symbol, value, owner, module)]
@@ -782,8 +806,12 @@ class SourceUnit:
     def _type(self, node: Node) -> object:
         node = _children(node)[0] if node.type == "type_or_object" else node
         match node.type:
+            case "identifier" if _text(node) in self._type_env:  # a type parameter of the generic being compiled
+                return self._type_env[_text(node)]
             case "type":
                 return self._written_type(node)
+            case "parenthesized_type":  # `((x: i64) => i64)[]`'s element
+                return self._function_type(_children(node)[0])
             case "generic_type":
                 return self._generic_type(node)
             case "record_type":
@@ -793,6 +821,9 @@ class SourceUnit:
                 raise self.error(node, msg)
             case "identifier" | "child_annotation":
                 found = self._static(node)
+                if isinstance(found, generics.Generic) and found.kind == generics.OBJECT:
+                    msg = f"{found.name} is generic: write the types it holds, {found!r}, as in {found.name}[i64]"
+                    raise self.error(node, msg)
                 if not (isinstance(found, type) and hasattr(found, "__lang_struct__")):
                     raise self.error(node, f"'{_text(node)}' is not a type")
                 return found
@@ -862,6 +893,11 @@ class SourceUnit:
         """``mem.Weak[T]`` is ``Ptr[T]``; what each container allows is checked here and by ``guards``."""
         base_node = node.child_by_field_name("base")
         base = self._static(base_node)
+        if isinstance(base, generics.Generic) and base.kind == generics.OBJECT:  # `Box[i64]`
+            arguments = node.children_by_field_name("argument")
+            if len(arguments) != len(base.parameters):
+                raise self.error(node, f"{base!r} takes {len(base.parameters)} types, not {len(arguments)}")
+            return base.unit._instantiate_object(base, tuple(self._type(argument) for argument in arguments))
         if not isinstance(base, mem.Container):
             raise self._unsupported(node, f"generic type {_text(base_node)}[...]")
         if base.guards is not None:
@@ -990,6 +1026,386 @@ class SourceUnit:
                 raise self.error(part, f"'{_text(node)}' is not defined")
             found = getattr(found, _text(part))
         return found
+
+    # -- generics -------------------------------------------------------------------
+
+    def _generic(self, name: str, symbol: str, value: Node, parameters: Node, module: str | None) -> generics.Generic:
+        """Bind ``let first[T] = ...`` or ``let Box[T] = struct {...}``: compiled once for each set of types."""
+        names: list[str] = []
+        for parameter in parameters.children_by_field_name("name"):
+            written = self._identifier(parameter)
+            if written in names:
+                raise self.error(parameter, f"{name} already has a type parameter {written}")
+            if written in _PRIMITIVES or written in self.globals:
+                raise self.error(
+                    parameter, f"{written} already names a type here; give the type parameter another name"
+                )
+            names.append(written)
+        if value.type == "struct_assignment":
+            for member in _children(value):
+                if any(part.type == "local_function_definition" for part in _children(member)):
+                    member_name = _text(_children(member)[0])
+                    msg = (
+                        f"a generic object's functions are not supported yet ({member_name}); write a generic "
+                        f"function that takes the object instead: let {member_name}[{', '.join(names)}] = "
+                        f"[] (value: {name}[{', '.join(names)}]) => ..."
+                    )
+                    raise self.error(member, msg)
+            kind = generics.OBJECT
+        elif value.type == "function_definition":
+            kind = generics.FUNCTION
+        else:
+            raise self.error(value, f"only a function or an object can take type parameters: {name}[...]")
+        return generics.Generic(kind, self, name, symbol, value, names, module)
+
+    @contextmanager
+    def _instantiating(self, generic: generics.Generic, arguments: tuple[object, ...], name: str) -> Iterator[None]:
+        """Compile part of ``generic`` for ``arguments``: its type parameters mean them, in its own module."""
+        saved = (self._scope, self._outer, self._module, self._type_env, self._raw_functions, self._instance)
+        self._scope, self._outer, self._module = None, [], generic.module
+        self._type_env = dict(zip(generic.parameters, arguments, strict=True))
+        self._raw_functions = False
+        self._instance = (name, generic.name)
+        try:
+            yield
+        finally:
+            self._scope, self._outer, self._module, self._type_env, self._raw_functions, self._instance = saved
+
+    def _instance_name(self, generic: generics.Generic, arguments: tuple[object, ...]) -> str:
+        shown = ", ".join(
+            _shown(kind) if (kind := scalar_type(argument)) is not None else "null" for argument in arguments
+        )
+        return f"{generic.name}[{shown}]"
+
+    def _instantiate_object(self, generic: generics.Generic, arguments: tuple[object, ...]) -> type:
+        """Return the object type ``generic`` (an object of this file) is for ``arguments``: ``Box[i64]``."""
+        key = tuple(scalar_type(argument) for argument in arguments)
+        found = generic.instances.get(key)
+        if found is not None:
+            if found.compiled is None:
+                raise self.error(generic.node, f"{found.name} holds a {found.name} itself, which is not supported yet")
+            return found.compiled
+        name = self._instance_name(generic, arguments)
+        instance = generic.instances[key] = generics.Instance(
+            name, f"{generic.symbol}__g{len(generic.instances)}", arguments
+        )
+        try:
+            with self._instantiating(generic, arguments, name):
+                cls, _ = self._struct(instance.symbol, generic.node)
+        except BifrostError:
+            del generic.instances[key]
+            raise
+        instance.compiled = cls
+        generics.made(cls, generic, arguments, name)
+        return cls
+
+    def _instantiate_function(self, generic: generics.Generic, arguments: tuple[object, ...]) -> generics.Instance:
+        """Compile ``generic`` (a function of this file) for ``arguments``, once; return that instance.
+
+        Its result type is known before its body is compiled, so it may call itself.
+        """
+        key = tuple(scalar_type(argument) for argument in arguments)
+        found = generic.instances.get(key)
+        if found is not None:
+            return found
+        name = self._instance_name(generic, arguments)
+        symbol = f"{generic.symbol}__g{len(generic.instances)}"
+        instance = generic.instances[key] = generics.Instance(name, symbol, arguments)
+        node = generic.node
+        try:
+            with self._instantiating(generic, arguments, name):
+                self._signature(name, node, symbol)
+                instance.result = self._result_type(node)
+                if _is_async(node):
+                    self._pausing.add(name)
+                    self.project.pausing.add(symbol)
+                python = self._function(name, node, symbol)
+                try:
+                    compiled = self.project.program.function(python)
+                except ValueError as error:
+                    raise self.error(node, str(error)) from error
+        except BifrostError as error:
+            del generic.instances[key]
+            if error.msg.startswith(f"in {name}"):
+                raise
+            raise BifrostError(
+                f"in {name}: {error.msg}", Path(error.filename or self.path), self.source, self._point(error)
+            ) from error
+        self.globals[symbol] = compiled
+        self._instance_names[f"<bifrost {self.path}:{symbol}>"] = name
+        instance.compiled = compiled
+        return instance
+
+    @staticmethod
+    def _point(error: BifrostError) -> tuple[int, int]:
+        return (error.lineno or 1) - 1, (error.offset or 1) - 1
+
+    def _result_type(self, node: Node) -> ScalarType | None:
+        """Return the result type a function definition writes (with the type parameters of the one being compiled)."""
+        parts = [part for part in _children(node) if part.type not in _DEPENDENCY_LISTS]
+        if _text(parts[1]) == RECORD:
+            what = f"=> {RECORD} in a generic function; write the record's type: => #{{...}}"
+            raise self._unsupported(parts[1], what)
+        found = self._container(parts[1])
+        if found is not None and found[0] is mem.UNIQUE:
+            return scalar_type(self._stored_type(parts[1]))  # an owned string
+        return scalar_type(self._type(found[1] if found is not None else parts[1]))
+
+    def _generic_named(self, names: list[str]) -> generics.Generic | None:
+        """Return the generic a (qualified) dotted name is, if it is one: ``first``, ``rules.first``, ``Box``."""
+        if not names or names[0] not in self.globals:
+            return None
+        target: object = self.globals[names[0]]
+        for attribute in names[1:]:
+            target = getattr(target, attribute, None)
+        return target if isinstance(target, generics.Generic) else None
+
+    def _generic_callee(self, name: str, path: list[str] | None) -> generics.Generic | None:
+        """Return the generic ``name(...)`` (or ``path.name(...)``, its path qualified) calls or builds, if any."""
+        assert self._scope is not None
+        if path is None:
+            return None if name in self._scope.names else self._generic_named(self._qualify(name).split("."))
+        if not path or path[0] in self._scope.names or path[0] in self._scope.guards or path[0] == "super":
+            return None
+        return self._generic_named([*path, name])
+
+    def _generic_target(self, node: Node) -> tuple[generics.Generic, Node] | None:
+        """For a call expression (``f(x)``, ``rules.f(x)``) of a generic, the generic and its ``user_function_call``."""
+        if self._scope is None or node.type not in {"function_call", "child_annotation"}:
+            return None
+        path: list[str] | None = None
+        call = _children(node)[0]
+        if node.type == "child_annotation":
+            *parts, last = _children(node)
+            if not parts or last.type != "function_call" or any(part.type != "simple_identifier" for part in parts):
+                return None
+            first = _text(parts[0])
+            qualified = [first] if first in self._scope.names else self._qualify(first).split(".")
+            path, call = [*qualified, *(_text(part) for part in parts[1:])], _children(last)[0]
+        function = call.child_by_field_name("function") if call.type == "user_function_call" else None
+        generic = self._generic_callee(_text(function), path) if function is not None else None
+        return (generic, call) if generic is not None else None
+
+    def _instance_for(self, generic: generics.Generic, call: Node) -> generics.Instance:
+        """Compile ``generic`` for the types a call of it gives (in its own file); return that instance."""
+        arguments = self._infer(generic, call)
+        if generic.kind == generics.OBJECT:
+            generic.unit._instantiate_object(generic, arguments)
+            return generic.instances[tuple(scalar_type(argument) for argument in arguments)]
+        if generic.unit is self:
+            return self._instantiate_function(generic, arguments)
+        try:
+            return generic.unit._instantiate_function(generic, arguments)
+        except BifrostError as error:  # in another file: reported here, saying where
+            where = f"{_display(Path(error.filename or ''), self.root)}:{error.lineno}"
+            message = error.msg
+            head, _, rest = message.partition(": ")
+            shown = f"{head} ({where}): {rest}" if head.startswith("in ") and rest else f"in {where}: {message}"
+            raise self.error(call, shown) from error
+
+    def _generic_result(self, generic: generics.Generic, call: Node) -> ScalarType | None:
+        """Return the type a call of ``generic`` gives (its instance's result, or the object it builds)."""
+        try:
+            instance = self._instance_for(generic, call)
+        except BifrostError:
+            return None  # reported where the call is lowered
+        if generic.kind == generics.OBJECT:
+            return scalar_type(instance.compiled)
+        return instance.result
+
+    def _no_generic_value(self, generic: generics.Generic | None, node: Node) -> None:
+        if generic is None or generic.kind != generics.FUNCTION:
+            return
+        msg = (
+            f"{generic.name} is generic, so it is compiled for the types a call gives it; call it, or pass a "
+            f"function of the types you mean: [{generic.name}] (x: i64) => i64 {generic.name}(x)"
+        )
+        raise self.error(node, msg)
+
+    def _infer(self, generic: generics.Generic, call: Node) -> tuple[object, ...]:
+        """Find what a call of ``generic`` means its type parameters to be: written where it goes, or its arguments'."""
+        bindings: dict[str, tuple[object, Node]] = {}
+        expected = self._expected_values.get(self._call_expression(call).id)
+        if expected is not None:  # what it gives is written where it goes (`let xs: i64[] = empty()`): that first
+            self._expected_bindings(generic, call, expected, bindings)
+        pairs = self._infer_pairs(generic, call)
+        for pattern, argument in sorted(pairs, key=lambda pair: _unwrap(pair[1]).type == "literal"):
+            concrete = self._static_type(argument)  # literals last: `pick(x, 1)` takes x's type
+            if concrete is not None:
+                generic.unit._unify(pattern, concrete, (generic, bindings, argument, self))
+        missing = [parameter for parameter in generic.parameters if parameter not in bindings]
+        if missing:
+            msg = (
+                f"cannot tell what {missing[0]} is in this call of {generic!r}: no argument's type says it; "
+                f"write the type of what it gives where it goes: let x: ... = {_text(call)}"
+            )
+            raise self.error(call, msg)
+        return tuple(bindings[parameter][0] for parameter in generic.parameters)
+
+    def _expected_bindings(
+        self, generic: generics.Generic, call: Node, expected: ScalarType, bindings: dict[str, tuple[object, Node]]
+    ) -> None:
+        """Bind ``generic``'s type parameters from the type written where a call of it goes."""
+        if generic.kind == generics.FUNCTION:
+            parts = [part for part in _children(generic.node) if part.type not in _DEPENDENCY_LISTS]
+            generic.unit._unify(parts[1], expected, (generic, bindings, call, self))
+            return
+        made = generics.made_from(expected.python) if isinstance(expected, StructType) else None
+        if made is not None and made[0] is generic:
+            for parameter, kind in zip(generic.parameters, made[1], strict=True):
+                bindings.setdefault(parameter, (kind, call))
+
+    def _infer_pairs(self, generic: generics.Generic, call: Node) -> list[tuple[Node, Node]]:
+        """Pair each argument of a call of ``generic`` with the type written for it there: (type, argument)."""
+        arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
+        if generic.kind == generics.FUNCTION:
+            parts = _children(generic.node)
+            parameters = _children(next(part for part in parts if part.type == "parameter_list"))
+            if len(arguments) != len(parameters):
+                raise self.error(call, f"{generic.name} takes {len(parameters)} arguments, got {len(arguments)}")
+            named = next((argument for argument in arguments if argument.type == "named_argument"), None)
+            if named is not None:
+                raise self.error(named, f"{generic.name} takes positional arguments")
+            return [
+                (_children(parameter)[1], argument) for parameter, argument in zip(parameters, arguments, strict=True)
+            ]
+        fields = [
+            (_text(_children(member)[0]), _children(member)[1])
+            for member in _children(generic.node)
+            if member.type == "struct_field"
+        ]
+        pairs = []
+        for index, argument in enumerate(arguments):
+            if argument.type != "named_argument":
+                if index < len(fields):
+                    pairs.append((fields[index][1], argument))
+                continue
+            written = _text(argument.child_by_field_name("name"))
+            type_node = next((kind for field, kind in fields if field == written), None)
+            if type_node is None:
+                raise self.error(argument, f"{generic.name} has no field {written}")
+            pairs.append((type_node, argument.child_by_field_name("value")))
+        return pairs
+
+    def _unify(self, pattern: Node, concrete: ScalarType, found: "_Unifying") -> None:
+        """Match a type written in a generic (``T[]``, ``(x: T) => U``, ``Box[T]``) to a value type, binding T."""
+        node = pattern
+        while node.type == "type_or_object" and _children(node):
+            node = _children(node)[0]
+        if node.type == "identifier" and _text(node) in found[0].parameters:
+            self._bind_parameter(_text(node), concrete, found)
+        elif node.type in {"type", "parenthesized_type"} and _children(node):
+            self._unify_written(_children(node)[0], concrete, found)
+        elif node.type == "generic_type":
+            self._unify_applied(node, concrete, found)
+
+    @staticmethod
+    def _bind_parameter(name: str, concrete: ScalarType, found: "_Unifying") -> None:
+        """Bind the type parameter ``name`` to ``concrete``, or check it against what it is bound to."""
+        generic, bindings, argument, caller = found
+        value = concrete.python if isinstance(concrete, StructType) else concrete
+        bound = bindings.get(name)
+        if bound is None:
+            bindings[name] = (value, argument)
+            return
+        earlier = scalar_type(bound[0])
+        if earlier == concrete:
+            return
+        numbers = earlier is not None and {earlier.kind, concrete.kind} <= {"int", "float"}
+        if numbers and _unwrap(argument).type == "literal":
+            if concrete.kind == "float" and _unwrap(bound[1]).type == "literal":
+                bindings[name] = (value, argument)  # `pick(1, 2.5)`: numbers written are f64 if one is
+            return  # a number written here takes the type found for it
+        shown = _shown(earlier) if earlier is not None else "null"
+        msg = f"{generic.name}'s {name} is {shown} (from {_text(bound[1])}), but this is {_shown(concrete)}"
+        raise caller.error(argument, msg)
+
+    def _unify_written(self, inner: Node, concrete: ScalarType, found: "_Unifying") -> None:
+        """Match a list type (``T[]``) or function type (``(x: T) => U``) to a value's type."""
+        if inner.type == "list_type" and is_list(concrete) and concrete.element is not None:
+            self._unify(_children(inner)[0], concrete.element, found)
+        if inner.type != "function_type" or not is_closure(concrete):
+            return
+        signature = signature_of(concrete)
+        for parameter, kind in zip(inner.children_by_field_name("parameter"), signature.params, strict=False):
+            held = scalar_type(kind)
+            if held is not None:
+                self._unify(_children(parameter)[1] if parameter.type == "parameter" else parameter, held, found)
+        result = scalar_type(signature.result) if signature.result is not None else None
+        if result is not None:
+            self._unify(inner.child_by_field_name("return_type"), result, found)
+
+    def _unify_applied(self, node: Node, concrete: ScalarType, found: "_Unifying") -> None:
+        """Match ``mem.Weak[T]`` (the type it holds) or ``Box[T]`` (a ``Box[i64]``'s types) to a value's type."""
+        module, self._module = self._module, found[0].module  # names in it mean what they do in its module
+        try:
+            base = self._static(node.child_by_field_name("base"))
+        except BifrostError:
+            return
+        finally:
+            self._module = module
+        written = node.children_by_field_name("argument")
+        if isinstance(base, mem.Container) and written:
+            self._unify(written[0], concrete, found)  # a lent or shared value has the type it holds
+            return
+        made = generics.made_from(concrete.python) if isinstance(concrete, StructType) else None
+        if isinstance(base, generics.Generic) and made is not None and made[0] is base:
+            for argument_node, kind in zip(written, made[1], strict=False):
+                held = scalar_type(kind)
+                if held is not None:
+                    self._unify(argument_node, held, found)
+
+    def _note_expected(self, body: Node, result: object) -> None:
+        """Note the types written where values go (``let x: T = v``, returned values): a generic call may take them."""
+        for let in self._descendants(body, "local_assignment"):
+            type_node = let.child_by_field_name("type")
+            if type_node is None or self._cell(type_node) is not None:
+                continue
+            try:
+                found = self._container(type_node)
+                kind = scalar_type(self._type(found[1] if found is not None else type_node))
+            except BifrostError:
+                continue  # reported where the let is lowered
+            if kind is not None:
+                self._expected_values[_unwrap(_children(let)[-1]).id] = kind
+        kind = scalar_type(result) if result not in (None, type(None), _INFERRED) else None
+        if kind is None:
+            return
+        returned = [
+            _children(statement)[0] for statement in self._descendants(body, "return_statement") if _children(statement)
+        ]
+        if body.type != "block_expression":
+            returned.append(body)  # an expression body: `=> T value`
+        for value in returned:
+            self._expected_values[_unwrap(value).id] = kind
+
+    def _generic_call(self, node: Node, generic: generics.Generic, written: str) -> ast.expr:
+        """Call a generic function, compiled for its arguments' types; or build a generic object."""
+        assert self._scope is not None
+        function = node.child_by_field_name("function")
+        owning = self._call_expression(node).id in self._owning
+        if generic.kind == generics.OBJECT:
+            cls = self._instance_for(generic, node).compiled
+            kind = scalar_type(cls)
+            self._expect_arguments(node, kind, None)
+            positional, named = self._arguments(node, [], keeping=True)
+            built = self._at(ast.Call(self._global(cls, "type"), positional, named), node)
+            return built if owning or not owns(kind) else self._temporary(built, kind, node)
+        self._depend(written, function)
+        instance = self._instance_for(generic, node)
+        compiled = instance.compiled
+        pointees = generic.unit._pointer_params.get(instance.name, [])
+        if compiled is not None:
+            self._check_record_arguments(node, compiled, instance.name)
+            self._expect_arguments(node, None, compiled)
+            self._give_away(node, compiled)
+        positional, named = self._arguments(node, pointees)
+        if named:
+            raise self.error(node, f"{generic.name} takes positional arguments")
+        callee = self._global(compiled, "fn") if compiled is not None else ast.Name(instance.symbol, ast.Load())
+        call = self._at(ast.Call(self._at(callee, function), positional, []), node)
+        pauses = instance.symbol in self.project.pausing
+        return self._finish_call(call, node, written, (pauses, owning, instance.result))
 
     # -- functions ----------------------------------------------------------------
 
@@ -1198,6 +1614,13 @@ class SourceUnit:
 
     def _callee(self, node: Node) -> object:
         """Return what a call expression calls: a function's name here, a Function elsewhere, or a builtin."""
+        found = self._generic_target(node)
+        if found is not None:
+            try:
+                instance = self._instance_for(*found)
+            except BifrostError:
+                return None  # reported where the call is lowered
+            return instance.compiled
         if node.type == "function_call":
             inner = _children(node)[0]
             function = inner.child_by_field_name("function") if inner.type == "user_function_call" else None
@@ -1255,11 +1678,14 @@ class SourceUnit:
         text = " ".join(_text(node).split())
         if is_list(kind):
             return f"#[...{text}]"
-        return f'fmt.format("%s", {text})' if kind == OWNED_STRING else ""
+        if kind == OWNED_STRING:
+            return f'fmt.format("%s", {text})'
+        return f"copy({text})" if owns(kind) else ""
 
     def _check_ownership(self, body: Node, owned: set[str], parameters: set[str]) -> ownership.Plan:
         """Check the owned values of the function being lowered (see ``ownership``); return where to free them."""
         assert self._scope is not None
+        self._note_expected(body, self._scope.result)
         weak = {name for name, (container, _) in self._scope.held.items() if container is mem.WEAK}
         try:
             return ownership.check(
@@ -1329,7 +1755,10 @@ class SourceUnit:
                 self._scope.dependencies[_text(entry)] = entry
                 continue
             if entry.type == "this":
-                dependency = self._scope.function
+                instance = self._instance
+                # A generic function calls itself by its name (`first`), compiled for the same types.
+                same = instance is not None and instance[0] == self._scope.function
+                dependency = instance[1] if same and instance is not None else self._scope.function
             else:
                 parts = _text(entry).split(".")
                 dependency = ".".join([self._qualify(parts[0]), *parts[1:]])
@@ -1353,7 +1782,9 @@ class SourceUnit:
         if ".".join([self._qualify(parts[0]), *parts[1:]]) in self._functions:
             return True
         found = self._static(node)
-        return isinstance(found, (Function, fmt.Builtin))
+        return isinstance(found, (Function, fmt.Builtin)) or (
+            isinstance(found, generics.Generic) and found.kind == generics.FUNCTION
+        )
 
     def _depend(self, dependency: str, node: Node, verb: str = "calls") -> None:
         """Check a call to ``dependency`` (or, with ``verb="uses"``, a use as a value) against the dependency list."""
@@ -2096,6 +2527,8 @@ class SourceUnit:
         assert self._scope is not None
         name = self._identifier(node)
         qualified = self._qualify(name)
+        if name not in self._scope.names:
+            self._no_generic_value(self._generic_named(qualified.split(".")), node)
         if qualified in self._functions and name not in self._scope.names:
             self._depend(qualified, node, "uses")
             if not self._raw_functions:
@@ -2142,6 +2575,48 @@ class SourceUnit:
         value = self._closure(closure, function, self._environment(node, captures), node)
         # Only lent (`apply([n] (x: i64) => i64 x + n, 1)`): what it captured is freed after the statement.
         return value if node.id in self._owning else self._temporary(value, closure, node)
+
+    def _pipe(self, node: Node) -> ast.expr:
+        """Reject a pipe whose right side is none of a call, a function, a lambda or a method (see ``pipes``)."""
+        into = node.child_by_field_name("into")
+        raise self.error(
+            into or node,
+            "the right side of |> is a function, a call or a lambda, given the value first: "
+            "`x |> f`, `x |> f(a)` (f(x, a)), `x |> [] (y: i64) => i64 y + 1`, or a method: `xs |> .sorted()`",
+        )
+
+    def _pipe_lambda(self, node: Node) -> ast.expr:
+        """``x |> [] (y: i64) => i64 y + 1``: the lambda, called with the value piped in."""
+        assert self._scope is not None
+        function = node.child_by_field_name("function")
+        value = node.child_by_field_name("value")
+        closure = self._lambda_type(function)
+        assert closure is not None
+        signature = signature_of(closure)
+        if len(signature.params) != 1:
+            taken = len(signature.params)
+            raise self.error(
+                function, f"a lambda a pipe calls takes one parameter, the value piped in; this one takes {taken}"
+            )
+        callee = self._lambda(function)
+        if not isinstance(callee, ast.Name):  # held, to reach both its function and what it captured
+            self._scope.temporaries += 1
+            holder = f"__bifrost_temporary_{self._scope.temporaries}"
+            self._scope.before.append(
+                self._at(ast.Assign([self._at(ast.Name(holder, ast.Store()), node)], callee), node)
+            )
+            callee = self._at(ast.Name(holder, ast.Load()), node)
+        environment = self._at(ast.Attribute(_copy_tree(callee), "env", ast.Load()), node)
+        call = ast.Call(
+            self._at(ast.Attribute(callee, "fn", ast.Load()), node), [environment, self._argument(value)], []
+        )
+        result = signature.result
+        call = self._at(call, node)
+        return call if node.id in self._owning or not owns(result) else self._temporary(call, result, node)
+
+    def _pipe_lambda_type(self, node: Node) -> ScalarType | None:
+        closure = self._lambda_type(node.child_by_field_name("function"))
+        return signature_of(closure).result if closure is not None else None
 
     def _captures(self, node: Node) -> list[tuple[str, ScalarType]]:
         """Return the locals of the function around a lambda that its dependency list names, with their types."""
@@ -2288,7 +2763,7 @@ class SourceUnit:
                 else:
                     value = self._method_call(call, value, kind, parts[:index])
                 path = []
-            elif part.type == "get_expression":  # `users[0].name`: reading on from an item
+            elif part.type in {"get_expression", "expression"}:  # `users[0].name`, or a piped value's method
                 value = self._expression(part)
             elif part.type == "simple_identifier":
                 if value is None:
@@ -2412,6 +2887,9 @@ class SourceUnit:
         assert self._scope is not None
         if path and path[0] not in self._scope.names:
             path = [*self._qualify(path[0]).split("."), *path[1:]]
+        special = self._special_call(node, name, path if owner is not None else None)
+        if special is not None:
+            return special
         callee_name = ".".join([*path, name]) if owner is not None and path else self._qualify(name)
         local = owner is None and name in self._scope.names  # a function value a local holds
         pointees = [] if local else self._pointer_params.get(callee_name, [])
@@ -2438,7 +2916,8 @@ class SourceUnit:
         self._expect_arguments(
             node, result if self._builds(dotted) else None, target if owner is not None else callee_name
         )
-        keeping = owning and isinstance(result, StructType) and self._builds(dotted)
+        # An object built holds what fills it, also one built only to be lent (freed after the statement).
+        keeping = isinstance(result, StructType) and self._builds(dotted) and (owning or owns(result))
         self._mark_pattern(node, formats.PATTERNS.get(target.name) if isinstance(target, Function) else None)
         self._give_away(node, target if owner is not None else callee_name)
         positional, named = self._arguments(node, pointees, keeping=keeping)
@@ -2446,9 +2925,20 @@ class SourceUnit:
             positional = self._checked_format(node, formats.PATTERNS[target.name], positional)
         callee, positional = self._through_closure(name, owner, path, (callee, positional), node)
         call = self._at(ast.Call(callee, positional, named), node)
+        return self._finish_call(call, node, dotted, (pauses, owning, result))
+
+    def _finish_call(
+        self, call: ast.Call, node: Node, written: str, how: tuple[bool, bool, ScalarType | None]
+    ) -> ast.expr:
+        """Await a call that pauses (``written`` names it); hold an owned result that is not kept until freed.
+
+        ``how``: whether it pauses, whether its result is kept, and the result's type.
+        """
+        assert self._scope is not None
+        pauses, owning, result = how
         if not pauses and node.id in self._scope.awaited:
-            raise self.error(node, f"{dotted}(...) does not pause, so there is nothing to await")
-        value = self._awaited(call, node, dotted) if pauses else call
+            raise self.error(node, f"{written}(...) does not pause, so there is nothing to await")
+        value = self._awaited(call, node, written) if pauses else call
         return value if owning or not owns(result) else self._temporary(value, result, node)
 
     def _through_closure(
@@ -2712,6 +3202,8 @@ class SourceUnit:
         target: object = self.globals.get(names[0])
         for attribute in names[1:]:
             target = getattr(target, attribute, None)
+        if isinstance(target, generics.Generic):
+            return target.kind == generics.OBJECT  # `Box(value: x)`: a Box[T], for x's type
         return isinstance(target, type) and hasattr(target, "__lang_struct__")
 
     def _temporary(self, value: ast.expr, kind: ScalarType, node: Node) -> ast.Name:
@@ -2760,6 +3252,53 @@ class SourceUnit:
             return False
         return self._function_signature(node) is not None
 
+    def _special_call(self, node: Node, name: str, path: list[str] | None) -> ast.expr | None:
+        """Lower ``copy(x)``, ``i32(x)`` and calls of generics; ``None`` for other calls."""
+        if path is None and self._is_copy(name):
+            return self._copy(node)
+        if path is None and self._is_conversion(name):
+            return self._convert(node, name)
+        generic = self._generic_callee(name, path)
+        if generic is None:
+            return None
+        return self._generic_call(node, generic, ".".join([*path, name]) if path else self._qualify(name))
+
+    def _is_copy(self, name: str) -> bool:
+        """Whether ``name(...)`` is the prelude's ``copy``: nothing else named ``copy`` is in scope."""
+        assert self._scope is not None
+        return name == "copy" and not ({name} & (self._scope.names | self.globals.keys() | self._functions))
+
+    def _is_conversion(self, name: str) -> bool:
+        """Whether ``name(...)`` converts a number (``i32(x)``): nothing else of that name is in scope."""
+        assert self._scope is not None
+        return name in _CONVERSIONS and not ({name} & (self._scope.names | self.globals.keys() | self._functions))
+
+    def _convert(self, node: Node, name: str) -> ast.expr:
+        """``i32(x)``, ``f64(n)``: x as that number type (a float becomes an integer toward zero)."""
+        arguments = [argument for argument in _children(node) if argument.type in {"expression", "named_argument"}]
+        if len(arguments) != 1 or arguments[0].type != "expression":
+            raise self.error(node, f"{name} takes one number: {name}(x)")
+        kind = self._static_type(arguments[0])
+        if kind is not None and kind.kind not in {"int", "float"}:
+            raise self.error(arguments[0], f"{name}(...) converts a number, not a {_shown(kind)}")
+        target = self._at(self._global(_PRIMITIVES[name], "type"), node)
+        return self._at(ast.Call(target, [self._expression(arguments[0])], []), node)
+
+    def _copy(self, node: Node) -> ast.expr:
+        """``copy(x)``: a deep copy of x, a new owner (of the lists, strings and closures it holds, at any depth)."""
+        arguments = [argument for argument in _children(node) if argument.type in {"expression", "named_argument"}]
+        if len(arguments) != 1 or arguments[0].type != "expression":
+            raise self.error(node, "copy takes one value: copy(x)")
+        kind = self._static_type(arguments[0])
+        if kind is None:
+            raise self.error(arguments[0], f"cannot tell the type of {_text(arguments[0])}, to copy it")
+        value = self._expression(arguments[0])
+        if not owns(kind):
+            return value  # a number, a str, a record of those: copied as it is passed
+        clone = self._at(self._global(self.project.drops.clone(kind), "fn"), node)
+        copied = self._at(ast.Call(clone, [value], []), node)
+        return copied if self._call_expression(node).id in self._owning else self._temporary(copied, kind, node)
+
     def _language_call(self, node: Node) -> ast.expr:
         """Lower a call of a function of the language itself: ``len(xs)``."""
         builtin = _text(node.child_by_field_name("function"))
@@ -2801,9 +3340,12 @@ class SourceUnit:
         """Wait for a call that pauses, written ``await f(x)`` in an async function."""
         assert self._scope is not None
         if node.id not in self._scope.awaited:
+            written = waited = f"{name}(...)"
+            if isinstance(node, pipes.Synthetic):  # `x |> f`: awaited as `await (x |> f)`
+                written, waited = _text(node.pipe), f"({_text(node.pipe)})"
             msg = (
-                f"{name}(...) is async and is not awaited. Did you forget `await {name}(...)`? "
-                f"If not waiting is deliberate, start it with `tasks.ignore({name}(...))`"
+                f"{name}(...) is async and is not awaited. Did you forget `await {waited}`? "
+                f"If not waiting is deliberate, start it with `tasks.ignore({written})`"
             )
             raise self.error(node, msg)
         return self._at(ast.Await(call), node)
@@ -2814,6 +3356,10 @@ class SourceUnit:
         value = _unwrap(node.child_by_field_name("value"))
         call = _children(value)[-1] if value.type == "child_annotation" else value
         if call.type != "function_call":
+            if pipes.is_piped(node):  # `await x |> f` is `(await x) |> f`
+                raise self.error(
+                    value, "await binds tighter than |>, so this awaits only the value piped in: write `await (x |> f)`"
+                )
             raise self.error(value, "await a call to a function that pauses: `await http.sleep(100)`")
         inner = _children(call)[0]
         function = inner.child_by_field_name("function")
@@ -3382,10 +3928,22 @@ class SourceUnit:
         return find(self, node) if find is not None else None
 
     def _call_type(self, node: Node) -> ScalarType | None:
+        found = self._generic_target(node)
+        if found is not None:
+            return self._generic_result(*found)
         inner = _children(node)[0]
         if inner.type == "builtin_call" and _text(inner.child_by_field_name("function")) == "len":
             return i64
         function = inner.child_by_field_name("function") if inner.type == "user_function_call" else None
+        local = self._scope.types.get(_text(function)) if function is not None and self._scope is not None else None
+        if function is not None and _text(function) in getattr(self._scope, "names", set()) and is_closure(local):
+            result = signature_of(local).result  # calling a function value a local holds
+            return scalar_type(result) if result is not None else None
+        if function is not None and self._scope is not None and self._is_conversion(_text(function)):
+            return scalar_type(_PRIMITIVES[_text(function)])
+        if function is not None and self._scope is not None and self._is_copy(_text(function)):
+            copied = [argument for argument in _children(inner) if argument.type == "expression"]
+            return self._static_type(copied[0]) if len(copied) == 1 else None
         return self._returns(self._qualify(_text(function))) if function is not None else None
 
     def _unary_type(self, node: Node) -> ScalarType | None:
@@ -3478,7 +4036,7 @@ class SourceUnit:
         kind: ScalarType | None = None
         path: list[str] = []
         for index, part in enumerate(parts):
-            if part.type == "get_expression":  # `users[0].name`
+            if part.type in {"get_expression", "expression"}:  # `users[0].name`, `#[2, 1] |> .sorted()`
                 kind = self._static_type(part)
             elif part.type == "simple_identifier":
                 kind = self._name_part(kind, part, path, first=index == 0)
@@ -3489,14 +4047,29 @@ class SourceUnit:
                     return None
                 if is_list(kind) and _text(function) in list_methods.METHODS:  # `xs.map(f)`
                     kind = self._list_method_type(kind, part)
+                elif kind is not None and is_closure(field := self._field_kind(kind, _text(function))):
+                    result = signature_of(field).result  # `h.step(f, w)`: a function value a field holds
+                    kind = scalar_type(result) if result is not None else None
                 elif kind is not None:  # a method, called on a value
                     kind = self._method_result(kind, _text(function))
                 else:
-                    kind = self._returns(".".join([*path, _text(function)]))
+                    generic = self._generic_named(
+                        [*self._qualify(path[0]).split("."), *path[1:], _text(function)] if path else [_text(function)]
+                    )
+                    if generic is not None:
+                        kind = self._generic_result(generic, _children(part)[0])
+                    else:
+                        kind = self._returns(".".join([*path, _text(function)]))
                     path.clear()
             if kind is None:
                 return None
         return kind
+
+    @staticmethod
+    def _field_kind(kind: ScalarType, name: str) -> ScalarType | None:
+        """Return the type of ``kind``'s field ``name``, if it is an object with one."""
+        found = kind.field(name) if isinstance(kind, StructType) else None
+        return scalar_type(found[1]) if found else None
 
     def _name_part(self, kind: ScalarType | None, part: Node, path: list[str], *, first: bool) -> ScalarType | None:
         """Take one name of a dotted chain: a local (or ``super``) first, a field of a value, or part of a path."""
@@ -4189,6 +4762,7 @@ _STATIC_TYPES: dict[str, Callable[[SourceUnit, Node], ScalarType | None]] = {
     "unary_expression": SourceUnit._unary_type,
     "await_expression": SourceUnit._await_type,
     "local_function_definition": SourceUnit._lambda_type,
+    pipes.LAMBDA_CALL: SourceUnit._pipe_lambda_type,
     "get_expression": lambda unit, node: (
         unit._static_type(_children(node)[0])
         if _children(node)[1].type in _SLICES
@@ -4212,6 +4786,8 @@ _EXPRESSIONS: dict[str, Callable[[SourceUnit, Node], ast.expr]] = {
     "default_var": SourceUnit._default_var,
     "while": SourceUnit._statement_only,
     "forall": SourceUnit._statement_only,
+    "pipe_expression": SourceUnit._pipe,
+    pipes.LAMBDA_CALL: SourceUnit._pipe_lambda,
 }
 
 

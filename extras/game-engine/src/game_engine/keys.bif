@@ -1,0 +1,53 @@
+module keys = {
+    /* raylib's key codes, for game.on_key, game.down and game.pressed: keys.SPACE, keys.LEFT, keys.A */
+
+    let SPACE = 32
+    let ESCAPE = 256
+    let ENTER = 257
+    let TAB = 258
+    let BACKSPACE = 259
+    let RIGHT = 262
+    let LEFT = 263
+    let DOWN = 264
+    let UP = 265
+    let LEFT_SHIFT = 340
+    let LEFT_CONTROL = 341
+    let A = 65
+    let B = 66
+    let C = 67
+    let D = 68
+    let E = 69
+    let F = 70
+    let G = 71
+    let H = 72
+    let I = 73
+    let J = 74
+    let K = 75
+    let L = 76
+    let M = 77
+    let N = 78
+    let O = 79
+    let P = 80
+    let Q = 81
+    let R = 82
+    let S = 83
+    let T = 84
+    let U = 85
+    let V = 86
+    let W = 87
+    let X = 88
+    let Y = 89
+    let Z = 90
+    let N0 = 48
+    let N1 = 49
+    let N2 = 50
+    let N3 = 51
+    let N4 = 52
+    let N5 = 53
+    let N6 = 54
+    let N7 = 55
+    let N8 = 56
+    let N9 = 57
+}
+
+export(keys)

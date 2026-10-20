@@ -1,0 +1,55 @@
+let rl = import("raylib")
+
+module physics = {
+    /* Pure helpers for a game's rules: values in, new values out, nothing changed */
+
+    let clamp = [] (x: f32, low: f32, high: f32) => f32 {
+        /* x, kept between low and high */
+        if x < low {
+            return low
+        }
+        if x > high {
+            return high
+        }
+        return x
+    }
+
+    let overlaps = [] (a: rl.Rectangle, b: rl.Rectangle) => bool {
+        /* Whether two rectangles overlap */
+        return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    }
+
+    let moved = [] (r: rl.Rectangle, dx: f32, dy: f32) => rl.Rectangle {
+        /* r, moved by dx and dy */
+        return rl.Rectangle(x: r.x + dx, y: r.y + dy, width: r.width, height: r.height)
+    }
+
+    let kept_in = [clamp] (r: rl.Rectangle, width: f32, height: f32) => rl.Rectangle {
+        /* r, moved as little as it takes to be inside a width x height screen */
+        let x = clamp(r.x, 0.0, width - r.width)
+        let y = clamp(r.y, 0.0, height - r.height)
+        return rl.Rectangle(x: x, y: y, width: r.width, height: r.height)
+    }
+
+    let center = [] (r: rl.Rectangle) => rl.Vector2 {
+        /* The point in the middle of r */
+        return rl.Vector2(x: r.x + r.width / 2.0, y: r.y + r.height / 2.0)
+    }
+
+    let around = [] (point: rl.Vector2, radius: f32) => rl.Rectangle {
+        /* The square a circle of radius around point fits in */
+        return rl.Rectangle(
+            x: point.x - radius,
+            y: point.y - radius,
+            width: radius * 2.0,
+            height: radius * 2.0
+        )
+    }
+
+    let step = [] (point: rl.Vector2, velocity: rl.Vector2, dt: f32) => rl.Vector2 {
+        /* Where point is dt seconds on, moving at velocity (pixels a second) */
+        return rl.Vector2(x: point.x + velocity.x * dt, y: point.y + velocity.y * dt)
+    }
+}
+
+export(physics)

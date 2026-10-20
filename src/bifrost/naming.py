@@ -22,6 +22,11 @@ def is_snake_case(name: str) -> bool:
     return name == "_" or _SNAKE.fullmatch(name) is not None
 
 
+def is_constant_case(name: str) -> bool:
+    """``WIDTH``, ``KEY_SPACE``, ``N1``: how a constant (a top-level or module value) may be named."""
+    return re.fullmatch(r"[A-Z][A-Z0-9]*(_[A-Z0-9]+)*", name) is not None
+
+
 def is_pascal_case(name: str) -> bool:
     """``Color``, ``RenderTexture2D``."""
     return _PASCAL.fullmatch(name) is not None

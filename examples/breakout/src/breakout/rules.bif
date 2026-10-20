@@ -1,0 +1,237 @@
+let rl = import("raylib")
+let physics = import("game_engine.physics:physics")
+let world = import("breakout.world:world")
+
+module rules = {
+    /* Breakout's rules, as pure functions: each takes values and returns new ones */
+
+    let WIDTH = 800.0
+    let HEIGHT = 600.0
+    let RADIUS = 7.0
+    let SPEED = 360.0  // the ball's, in pixels a second
+    let PADDLE_SPEED = 520.0
+
+    let paddle = [] () => rl.Rectangle {
+        /* The paddle, at the bottom in the middle */
+        return rl.Rectangle(x: 350.0, y: 560.0, width: 100.0, height: 14.0)
+    }
+
+    let wall = [] () => world.Brick[] {
+        /* Five rows of ten bricks */
+        let bricks: world.Brick[] = #[]
+        forall row in #[0...5] {
+            forall column in #[0...10] {
+                let box = rl.Rectangle(
+                    x: 25.0 + f32(column) * 76.0,
+                    y: 60.0 + f32(row) * 28.0,
+                    width: 70.0,
+                    height: 22.0
+                )
+                let bricks = #[...bricks, world.Brick(box: box, row: row)]
+            }
+        }
+        return bricks
+    }
+
+    let start = [paddle, wall, held] () => world.World {
+        /* A new game: three lives, all the bricks, the ball on the paddle */
+        let bat = paddle()
+        return world.World(
+            paddle: bat,
+            ball: held(bat),
+            bricks: wall(),
+            score: 0,
+            lives: 3,
+            phase: world.SERVING
+        )
+    }
+
+    let held = [physics.center] (bat: rl.Rectangle) => world.Ball {
+        /* The ball resting on the paddle, waiting to be served */
+        let middle = physics.center(bat)
+        return world.Ball(
+            at: rl.Vector2(x: middle.x, y: bat.y - RADIUS - 1.0),
+            velocity: rl.Vector2(x: 0.0, y: 0.0)
+        )
+    }
+
+    let served = [] (ball: world.Ball) => world.Ball {
+        /* The ball, launched up and to the right */
+        return world.Ball(
+            at: ball.at,
+            velocity: rl.Vector2(x: SPEED * 0.6, y: 0.0 - SPEED * 0.8)
+        )
+    }
+
+    let steer = [
+        physics.moved,
+        physics.kept_in
+    ] (bat: rl.Rectangle, direction: f32, dt: f32) => rl.Rectangle {
+        /* The paddle, moved left (-1), right (1) or not (0), and kept on the screen */
+        return bat
+            |> physics.moved(direction * PADDLE_SPEED * dt, 0.0)
+            |> physics.kept_in(WIDTH, HEIGHT)
+    }
+
+    let fly = [physics.step] (ball: world.Ball, dt: f32) => world.Ball {
+        /* The ball, dt seconds on */
+        return world.Ball(
+            at: ball.at |> physics.step(ball.velocity, dt),
+            velocity: ball.velocity
+        )
+    }
+
+    let off_walls = [] (ball: world.Ball) => world.Ball {
+        /* The ball, turned back by the left, right and top walls */
+        let dx = ball.velocity.x
+        let dy = ball.velocity.y
+        if (ball.at.x < RADIUS && dx < 0.0) || (ball.at.x > WIDTH - RADIUS && dx > 0.0) {
+            let dx = 0.0 - dx
+        }
+        if ball.at.y < RADIUS && dy < 0.0 {
+            let dy = 0.0 - dy
+        }
+        return world.Ball(at: ball.at, velocity: rl.Vector2(x: dx, y: dy))
+    }
+
+    let off_paddle = [
+        physics.overlaps,
+        physics.around,
+        physics.center
+    ] (ball: world.Ball, bat: rl.Rectangle) => world.Ball {
+        /* The ball, sent back up from the paddle: further out the further from its middle it hits */
+        if ball.velocity.y < 0.0 || !physics.overlaps(
+            physics.around(ball.at, RADIUS),
+            bat
+        ) {
+            return ball
+        }
+        let off_center = (ball.at.x - physics.center(bat).x) / (bat.width / 2.0)
+        return world.Ball(
+            at: ball.at,
+            velocity: rl.Vector2(x: off_center * SPEED * 0.75, y: 0.0 - SPEED * 0.8)
+        )
+    }
+
+    let hits = [
+        physics.overlaps,
+        physics.around
+    ] (ball: world.Ball, brick: world.Brick) => bool {
+        /* Whether the ball touches the brick */
+        return physics.overlaps(physics.around(ball.at, RADIUS), brick.box)
+    }
+
+    let standing = [] (bricks: world.Brick[], ball: world.Ball) => world.Brick[] {
+        /* The bricks the ball does not touch */
+        return bricks.filter(
+            // ignore: copy
+            [ball, hits] (brick: world.Brick) => bool !hits(ball, brick)
+        )
+    }
+
+    let off_bricks = [] (ball: world.Ball, hit: i64) => world.Ball {
+        /* The ball, turned back when it hit any bricks */
+        if hit == 0 {
+            return ball
+        }
+        return world.Ball(
+            at: ball.at,
+            velocity: rl.Vector2(x: ball.velocity.x, y: 0.0 - ball.velocity.y)
+        )
+    }
+
+    let step = [
+        steer,
+        held,
+        fly,
+        off_walls,
+        off_paddle,
+        standing,
+        off_bricks
+    ] (w: world.World, direction: f32, dt: f32) => world.World {
+        /* The world dt seconds on: the paddle steered and, in play, the ball flying, bouncing and breaking bricks */
+        let bat = w.paddle |> steer(direction, dt)
+        if w.phase == world.SERVING {
+            return world.World(
+                paddle: bat,
+                ball: held(bat),
+                bricks: copy(w.bricks),
+                score: w.score,
+                lives: w.lives,
+                phase: w.phase
+            )
+        }
+        if w.phase != world.PLAYING {
+            return world.World(
+                paddle: bat,
+                ball: w.ball,
+                bricks: copy(w.bricks),
+                score: w.score,
+                lives: w.lives,
+                phase: w.phase
+            )
+        }
+        let ball = w.ball |> fly(dt) |> off_walls |> off_paddle(bat)
+        let left = w.bricks |> standing(ball)
+        let hit = len(w.bricks) - len(left)
+        let score = w.score + hit * 10
+        if ball.at.y > HEIGHT + RADIUS {
+            // past the paddle: a life lost
+            let phase = world.SERVING
+            if w.lives == 1 {
+                let phase = world.LOST
+            }
+            return world.World(
+                paddle: bat,
+                ball: held(bat),
+                bricks: left,
+                score: score,
+                lives: w.lives - 1,
+                phase: phase
+            )
+        }
+        let phase = world.PLAYING
+        if len(left) == 0 {
+            let phase = world.WON
+        }
+        return world.World(
+            paddle: bat,
+            ball: ball |> off_bricks(hit),
+            bricks: left,
+            score: score,
+            lives: w.lives,
+            phase: phase
+        )
+    }
+
+    let serve = [served, start] (w: world.World) => world.World {
+        /* Serve the ball, or, once the game is over, a new game */
+        if w.phase == world.SERVING {
+            return world.World(
+                paddle: w.paddle,
+                ball: served(w.ball),
+                bricks: copy(w.bricks),
+                score: w.score,
+                lives: w.lives,
+                phase: world.PLAYING
+            )
+        }
+        if w.phase == world.PLAYING {
+            return copy(w)
+        }
+        return start()
+    }
+
+    let color_of = [] (row: i64) => rl.Color {
+        /* A brick's color, by its row */
+        return match row {
+            0: rl.Color(r: 230, g: 41, b: 55, a: 255),
+            1: rl.Color(r: 255, g: 161, b: 0, a: 255),
+            2: rl.Color(r: 253, g: 249, b: 0, a: 255),
+            3: rl.Color(r: 0, g: 228, b: 48, a: 255),
+            _: rl.Color(r: 0, g: 121, b: 241, a: 255)
+        }
+    }
+}
+
+export(rules)

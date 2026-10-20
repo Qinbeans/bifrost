@@ -51,6 +51,8 @@ from dataclasses import dataclass, field
 
 from tree_sitter import Node
 
+from bifrost import pipes
+
 
 class OwnershipError(Exception):
     """An ownership rule is broken at ``node``."""
@@ -107,7 +109,7 @@ def _text(node: Node) -> str:
 
 
 def _named(node: Node) -> list[Node]:
-    return [child for child in node.named_children if child.type != "comment"]
+    return [pipes.desugared(child) for child in node.named_children if child.type != "comment"]  # a pipe: its call
 
 
 def _unwrap(node: Node) -> Node:
@@ -629,12 +631,9 @@ class _Checker:
 
     def call(self, node: Node, arguments: list[Node], state: _State, *, owned: bool) -> None:
         """Check a call: its owned result must have an owner, and its moved arguments move."""
-        if not owned and self.oracle.cell_call(node):
-            msg = (
-                f"{_text(node).split('(')[0]}(...) returns a mem.Shared or mem.Atomic, which nothing would release; "
-                "give it an owner first (`let value = ...`), then use that"
-            )
-            raise OwnershipError(node, msg)
+        self.cell_result(node, owned=owned)
+        if self.built(node, arguments, state):
+            return
         moved = self.oracle.moved_arguments(node)
         callee = _text(node).split("(")[0]
         for index in self.oracle.lent_arguments(node):
@@ -656,6 +655,26 @@ class _Checker:
             self.name(_named(node)[0], state)
             if self.oracle.changes(node):
                 self.changed(node, state)
+
+    def cell_result(self, node: Node, *, owned: bool) -> None:
+        """Reject a call returning a ``mem.Shared`` or ``mem.Atomic`` that nothing owns."""
+        if not owned and self.oracle.cell_call(node):
+            msg = (
+                f"{_text(node).split('(')[0]}(...) returns a mem.Shared or mem.Atomic, which nothing would release; "
+                "give it an owner first (`let value = ...`), then use that"
+            )
+            raise OwnershipError(node, msg)
+
+    def built(self, node: Node, arguments: list[Node], state: _State) -> bool:
+        """Check an object built only to be lent (``total(Team(members: xs))``), if ``node`` builds one.
+
+        It still owns its fields, freed with it after the statement: what fills them moves in.
+        """
+        if not (self.oracle.constructs(node) and self.oracle.owned_value(node)):
+            return False
+        for argument in [*arguments, *_named_values(node)]:
+            self.part(argument, state)
+        return True
 
     def changed(self, node: Node, state: _State) -> None:
         """Check that the object ``node`` calls a changing method on (which may replace its lists) is ours."""
