@@ -1,0 +1,93 @@
+# Releases the compiler. Releasing is bumping `version` in pyproject.toml
+# (`uv version --bump patch`) and pushing a tag `v<version>`: the compiler is
+# tested, built (one pure-Python wheel and an sdist), installed fresh the way
+# users install it, and attached to release `v<version>`. The package index at
+# https://qinbeans.github.io/mlir-python/, which also lists mlir-python and
+# tree-sitter-bifrost, then lists it:
+#   uv tool install bifrost --find-links https://qinbeans.github.io/mlir-python/
+# Bifrost packages (`<name>-v<version>` tags) release from packages.yml instead.
+# Running it by hand builds and tests without releasing.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Check the tag matches pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(uv version --short)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but pyproject.toml's version is $version"
+            exit 1
+          fi
+
+      # clang links what bfc compiles; the runner image has it.
+      - name: Test
+        run: |
+          clang --version
+          uv sync --frozen --extra dev
+          uvx ruff check src tests tools
+          uvx ruff format --check src tests tools
+          uv run --frozen pytest -q
+
+      - name: Build
+        run: uv build --out-dir dist
+
+      # The wheel alone, its dependencies from the index: what a user gets.
+      - name: Install it and build a new project
+        run: |
+          uv tool install dist/*.whl --find-links https://qinbeans.github.io/mlir-python/
+          bfc --version
+          cd "$RUNNER_TEMP"
+          bfc init hello
+          cd hello
+          bfc build
+          ./build/hello
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+
+  release:
+    name: Release ${{ github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: bifrost ${{ github.ref_name }}
+          body: |
+            The Bifrost compiler, `bfc`. Install it with
+            ```
+            uv tool install bifrost==${{ steps.version.outputs.version }} --find-links https://qinbeans.github.io/mlir-python/
+            ```
+          # The compiler's releases are the latest, not a package's (see packages.yml).
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: dist/*
+
+  index:
+    name: Update the package index
+    needs: release
+    uses: ./.github/workflows/notify-index.yml
+    secrets: inherit

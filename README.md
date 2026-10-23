@@ -601,6 +601,7 @@ let draw = [rl.begin_drawing, rl.end_drawing] (ctx: mem.Weak[Context]) => null {
 
 | Command | What it does |
 |---|---|
+| `bfc --version` | Print the compiler's version |
 | `bfc init my_api` | Create a project: `config.yaml`, `.gitignore`, `README.md`, `src/my_api/main.bif` |
 | `bfc build` (or `bfc build file.bif -c config.yaml -o out`) | Compile the project's entry (or a given file) to a native executable in `build/` |
 | `bfc fmt main.bif` (`--check` to only report) | Format source files; only ever changes whitespace |
@@ -745,11 +746,29 @@ Errors from every step, including type errors found by mlir-python, point at the
 
 Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and `clang` on `PATH` (the default linker; `config traverse` also uses its built-in headers).
 
+Install the released compiler, `bfc`:
+
 ```bash
-uv sync
+uv tool install bifrost --find-links https://qinbeans.github.io/mlir-python/
+bfc --version
 ```
 
-`mlir-python` and `tree-sitter-bifrost` are installed from the package index at `https://qinbeans.github.io/mlir-python/`, configured in `pyproject.toml`.
+The compiler and what it needs that is not on PyPI (`mlir-python`, `tree-sitter-bifrost`) come from that package index. `uv tool upgrade bifrost` updates it.
+
+To work on the compiler itself, from a checkout (the index is configured in `pyproject.toml`):
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
+To release it, bump the version and push its tag: `.github/workflows/release.yml` tests the compiler, checks that the wheel installs and builds a new project, and publishes it as release `v<version>`, which the index then lists.
+
+```bash
+uv version --bump patch
+git commit -am "release $(uv version --short)"
+git tag "v$(uv version --short)" && git push origin main "v$(uv version --short)"
+```
 
 ## Usage
 

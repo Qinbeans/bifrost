@@ -1,4 +1,5 @@
 import sys
+from importlib import metadata
 from pathlib import Path
 from typing import Annotated
 
@@ -21,8 +22,19 @@ from bifrost.project import Project
 cli = Typer()
 
 
+def _print_version(value: bool) -> None:
+    """Print the compiler's version (``bfc --version``) and stop."""
+    if value:
+        print(f"bfc {metadata.version('bifrost')}")
+        raise typer.Exit
+
+
 @cli.callback()
-def main() -> None:
+def main(
+    version: Annotated[  # noqa: FBT002 - a command-line flag, read by its callback
+        bool, typer.Option("--version", callback=_print_version, is_eager=True, help="Print the version and exit.")
+    ] = False,
+) -> None:
     """Compile Bifrost programs."""
 
 
