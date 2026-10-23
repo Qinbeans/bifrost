@@ -25,7 +25,7 @@ cli = Typer()
 def _print_version(value: bool) -> None:
     """Print the compiler's version (``bfc --version``) and stop."""
     if value:
-        print(f"bfc {metadata.version('bifrost')}")
+        print(f"bfc {metadata.version('bifrost-lang')}")
         raise typer.Exit
 
 

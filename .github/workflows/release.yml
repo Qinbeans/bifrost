@@ -4,7 +4,7 @@
 # users install it, and attached to release `v<version>`. The package index at
 # https://qinbeans.github.io/mlir-python/, which also lists mlir-python and
 # tree-sitter-bifrost, then lists it:
-#   uv tool install bifrost --find-links https://qinbeans.github.io/mlir-python/
+#   uv tool install bifrost-lang --find-links https://qinbeans.github.io/mlir-python/
 # Bifrost packages (`<name>-v<version>` tags) release from packages.yml instead.
 # Running it by hand builds and tests without releasing.
 name: Release
@@ -79,7 +79,7 @@ jobs:
           body: |
             The Bifrost compiler, `bfc`. Install it with
             ```
-            uv tool install bifrost==${{ steps.version.outputs.version }} --find-links https://qinbeans.github.io/mlir-python/
+            uv tool install bifrost-lang==${{ steps.version.outputs.version }} --find-links https://qinbeans.github.io/mlir-python/
             ```
           # The compiler's releases are the latest, not a package's (see packages.yml).
           make_latest: true

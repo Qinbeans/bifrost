@@ -749,11 +749,11 @@ Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and `clang` on `PATH` (t
 Install the released compiler, `bfc`:
 
 ```bash
-uv tool install bifrost --find-links https://qinbeans.github.io/mlir-python/
+uv tool install bifrost-lang --find-links https://qinbeans.github.io/mlir-python/
 bfc --version
 ```
 
-The compiler and what it needs that is not on PyPI (`mlir-python`, `tree-sitter-bifrost`) come from that package index. `uv tool upgrade bifrost` updates it.
+The compiler and what it needs that is not on PyPI (`mlir-python`, `tree-sitter-bifrost`) come from that package index. `uv tool upgrade bifrost-lang` updates it. The distribution is `bifrost-lang` (its module is still `bifrost`): `bifrost` on PyPI is an unrelated OpenStack project.
 
 To work on the compiler itself, from a checkout (the index is configured in `pyproject.toml`):
 
