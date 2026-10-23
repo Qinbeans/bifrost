@@ -1,0 +1,195 @@
+let axum = import("axum")
+let extract = import("axum.extract:extract")
+let json = import("axum.json:json")
+let query = import("axum.query:query")
+let response = import("axum.response:response")
+let middleware = import("axum.middleware:middleware")
+let sse = import("axum.sse:sse")
+let mem = import("std:mem")
+let io = import("std:stdio")
+let time = import("std:time")
+
+let User = struct { let id: i64, let name: mem.Unique[str] }
+let NewUser = struct { let name: mem.Unique[str] }
+let AppState = struct { let next_id: i64, let users: User[] }
+
+let ApiError = struct {
+    /* What the API answers when something is wrong: a status and a JSON message. */
+    let status: i32,
+    let message: str,
+    let into_response = [super, axum.json] () => axum.Response axum.json(super.status, #{error: super.message})
+}
+
+let root = [] () => response.Html response.Html(
+    body: "<h1>Hello from axum on Bifrost</h1>"
+)
+
+let list_users = [] (state: mem.Shared[AppState]) => json.Json[User[]] {
+    let s <- state
+    let users = #[...s.users]
+    s -> state
+    return json.Json(value: users)
+}
+
+let create_user = [
+
+] (state: mem.Shared[AppState], body: json.Json[NewUser]) => response.WithStatus[json.Json[User]] {
+    let s <- state
+    let user = User(id: s.next_id, name: copy(body.value.name))
+    s.next_id = s.next_id + 1
+    s.users = #[...s.users, copy(user)]
+    s -> state
+    return response.WithStatus(status: 201, inner: json.Json(value: user))
+}
+
+let find = [] (users: User[], id: i64) => i64 {
+    forall i in #[0...len(users)] {
+        if users[i].id == id {
+            return i
+        }
+    }
+    return -1
+}
+
+let show_user = [
+    find
+] (state: mem.Shared[AppState], id: extract.Path[i64]) => Result[json.Json[User], ApiError] {
+    let s <- state
+    let at = find(s.users, id.value)
+    if at < 0 {
+        s -> state
+        return err(ApiError(status: 404, message: "no such user"))
+    }
+    let user = copy(s.users[at])
+    s -> state
+    return ok(json.Json(value: user))
+}
+
+let delete_user = [
+    find,
+    response.NoContent.new
+] (state: mem.Shared[AppState], id: extract.Path[i64]) => Result[response.NoContent, ApiError] {
+    let s <- state
+    let at = find(s.users, id.value)
+    if at < 0 {
+        s -> state
+        return err(ApiError(status: 404, message: "no such user"))
+    }
+    s.users = #[...s.users[...at], ...s.users[at + 1...]]
+    s -> state
+    return ok(response.NoContent.new())
+}
+
+let Search = struct { let q: mem.Unique[str], let limit: i64 }
+
+let search = [axum.json] (found: query.Query[Search]) => axum.Response {
+    return axum.json(200, #{q: found.value.q, limit: found.value.limit})
+}
+
+let slow = [time.sleep, axum.text] async (ms: extract.Path[i64]) => axum.Response {
+    await time.sleep(ms.value)  // other requests are served meanwhile
+    return axum.text(200, "slept {ms.value} ms")
+}
+
+let ticks = [
+    sse.start,
+    sse.send,
+    sse.end,
+    sse.closed,
+    sse.Event.of,
+    time.sleep
+] async (req: axum.Request) => axum.Response {
+    let stream = sse.start(req)
+    forall i in #[1...4] {
+        if sse.closed(stream) {
+            return sse.end(stream)
+        }
+        await sse.send(stream, sse.Event.of("tick {i}"))
+        await time.sleep(100)
+    }
+    return sse.end(stream)
+}
+
+let timing = [
+    time.now,
+    axum.append_header
+] async (req: axum.Request, next: middleware.Next) => axum.Response {
+    let started = time.now()
+    let res = await next.run(req)
+    axum.append_header(res, "x-response-time", "{time.now() - started}ms")
+    return res
+}
+
+let not_found = [axum.json] (uri: extract.Uri) => axum.Response axum.json(404, #{error: "nothing at {uri.path}"})
+
+let shutdown = [axum.shutdown_signal, io.puts] async () => null {
+    await axum.shutdown_signal()
+    io.puts("shutting down: finishing requests in flight")
+}
+
+let users = [
+    axum.router,
+    axum.route,
+    axum.get,
+    axum.post,
+    axum.delete,
+    axum.also,
+    list_users,
+    create_user,
+    show_user,
+    delete_user,
+    search
+] () => axum.Router {
+    /* The JSON API, mounted at /api */
+    return axum.router()
+        |> axum.route("/users", axum.get(list_users) |> axum.also(axum.post(create_user)))
+        |> axum.route("/users/:id", axum.get(show_user) |> axum.also(axum.delete(delete_user)))
+        |> axum.route("/search", axum.get(search))
+}
+
+let app = [
+    axum.router,
+    axum.route,
+    axum.get,
+    axum.nest,
+    axum.fallback,
+    axum.layer,
+    axum.from_fn,
+    axum.with_state,
+    users,
+    root,
+    slow,
+    ticks,
+    not_found,
+    timing
+] (state: mem.Shared[AppState]) => axum.Router {
+    /* Every route, its middleware, and the state its handlers share */
+    return axum.router()
+        |> axum.route("/", axum.get(root))
+        |> axum.route("/slow/:ms", axum.get(slow))
+        |> axum.route("/events", axum.get(ticks))
+        |> axum.nest("/api", users())
+        |> axum.fallback(not_found)
+        |> axum.layer(axum.from_fn(timing))
+        |> axum.with_state(state)
+}
+
+let main = [
+    app,
+    axum.bind,
+    axum.listener_error,
+    axum.local_addr,
+    axum.serve_with_graceful_shutdown,
+    io.printf,
+    shutdown
+] async () => i32 {
+    let state: mem.Shared[AppState] = AppState(next_id: 1, users: #[])
+    let listener = axum.bind("0.0.0.0:3000")
+    if axum.listener_error(listener) != "" {
+        io.printf("cannot listen: %s\n", axum.listener_error(listener))
+        return 1
+    }
+    io.printf("listening on http://%s\n", axum.local_addr(listener))
+    await axum.serve_with_graceful_shutdown(listener, app(state), shutdown)
+    return 0
+}

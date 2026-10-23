@@ -49,6 +49,7 @@ from typing import Any
 
 import yaml
 
+from bifrost.configs import features
 from bifrost.configs.schema import DEFAULT_INDEX, Config, _PackageSource, source_root
 
 ARCHIVE = ".bifpkg"
@@ -98,25 +99,12 @@ def build(project: Path, output: Path | None = None) -> Path:
     """
     config_path = project / "config.yaml"
     raw: dict[str, Any] = yaml.safe_load(config_path.read_text()) or {}
-    package = raw.get("package", {})
-    name, version = package.get("name"), package.get("version")
-    if not name or not version:
-        raise PackageError(f"{config_path} needs package.name and package.version to be packaged")
-    if package.get("build") != "library":
-        raise PackageError(
-            f"{config_path} builds an executable; only a library is packaged (set package.build: library)"
-        )
+    name, version = _library_identity(config_path, raw)
     files: dict[str, Path] = {}
-    libraries: list[str] = []
-    for library in raw.get("libraries", []):
-        if "/" not in str(library):
-            libraries.append(library)  # a system library (`m`, `ssl`): linked by name where it is used
-            continue
-        found = (project / library).resolve()
-        if not found.is_file():
-            raise PackageError(f"{library} is not built yet ({found}); build it before packaging")
-        files[f"lib/{found.name}"] = found
-        libraries.append(f"./lib/{found.name}")
+    libraries = _packaged(project, raw.get("libraries", []), files)
+    for feature in (raw.get("features") or {}).values():  # a feature's libraries ship too, linked only with it
+        if isinstance(feature, dict) and feature.get("libraries"):
+            feature["libraries"] = _packaged(project, feature["libraries"], files)
     sources = source_root(project)
     for path in sorted(sources.rglob("*.bif")):
         if "build" not in path.relative_to(sources).parts:
@@ -137,6 +125,44 @@ def build(project: Path, output: Path | None = None) -> Path:
     return archive
 
 
+def _library_identity(config_path: Path, raw: dict[str, Any]) -> tuple[str, str]:
+    """Return the name and version of the library ``config_path`` (read as ``raw``) configures.
+
+    Raises:
+        PackageError: If it lacks either, or builds an executable.
+
+    """
+    package = raw.get("package", {})
+    name, version = package.get("name"), package.get("version")
+    if not name or not version:
+        raise PackageError(f"{config_path} needs package.name and package.version to be packaged")
+    if package.get("build") != "library":
+        raise PackageError(
+            f"{config_path} builds an executable; only a library is packaged (set package.build: library)"
+        )
+    return name, version
+
+
+def _packaged(project: Path, written: list[str], files: dict[str, Path]) -> list[str]:
+    """Add the libraries built in ``project`` to the package's lib/ (``files``); return how its config.yaml names them.
+
+    Raises:
+        PackageError: If one has not been built.
+
+    """
+    libraries: list[str] = []
+    for library in written:
+        if "/" not in str(library):
+            libraries.append(library)  # a system library (`m`, `ssl`): linked by name where it is used
+            continue
+        found = (project / library).resolve()
+        if not found.is_file():
+            raise PackageError(f"{library} is not built yet ({found}); build it before packaging")
+        files[f"lib/{found.name}"] = found
+        libraries.append(f"./lib/{found.name}")
+    return libraries
+
+
 # -- using ----------------------------------------------------------------------------------
 
 
@@ -152,26 +178,40 @@ def resolve(config: Config, folder: Path, *, install: bool) -> Config:
     """
     resolver = _Resolver(folder, install=install)
     resolver.resolve_all(config.packages, folder, config.index)
-    return _merge(config, resolver.ordered())
+    return _merge(config, resolver.ordered(), resolver.requests)
 
 
-def _merge(config: Config, found: Iterable[Package]) -> Config:
-    """Add the externs, libraries and sources of the packages ``found`` to ``config``.
+def _merge(config: Config, found: Iterable[Package], requests: dict[str, tuple[set[str], bool]]) -> Config:
+    """Add the externs, libraries and sources of the packages ``found`` to ``config``, with the features asked for.
+
+    ``requests``: for each package, the features its users ask for, and whether any wants its defaults.
 
     Raises:
-        PackageError: If two declare one module.
+        PackageError: If two declare one module, or a feature asked for does not exist.
 
     """
     modules = {extern.module for extern in config.externs}
     for package in found:
-        for extern in package.config.externs:
+        requested, defaults = requests.get(package.name, (set(), True))
+        try:
+            features.check(package.config)
+            package.config.enabled = features.enabled(
+                package.config, requested, defaults=defaults, owner=f"package {package.name}"
+            )
+        except features.FeatureError as error:
+            raise PackageError(str(error)) from None
+        externs, libraries, gated = features.apply(package.config, package.root, package.config.enabled)
+        for extern in externs:
             if extern.module in modules:
                 raise PackageError(f"package {package.name} declares module {extern.module}, which is already declared")
             modules.add(extern.module)
             config.externs.append(extern)
             config.declared_in[extern.module] = package.root / "config.yaml"
-        config.libraries.extend(library for library in package.config.libraries if library not in config.libraries)
+        for library in [*package.config.libraries, *libraries]:
+            if library not in config.libraries:
+                config.libraries.append(library)
         config.sources.append(source_root(package.root))
+        config.gated.update(gated)
     return config
 
 
@@ -199,7 +239,7 @@ def sync(config_path: Path) -> Synced:
     config = ConfigBuilder(config_path, resolve=False).build()
     resolver = _Resolver(folder, install=True)
     resolver.resolve_all(config.packages, folder, config.index)
-    _merge(config, resolver.ordered())  # checks that they fit together
+    _merge(config, resolver.ordered(), resolver.requests)  # checks that they fit together
     installed = folder / "build" / "pkg"
     removed = []
     for path in sorted(installed.iterdir()) if installed.is_dir() else []:
@@ -221,6 +261,8 @@ class _Resolver:
         self.unpacked: set[str] = set()  # the packages unpacked now, not already
         # Packages the found ones use, resolved after the project's own: its entries win (`path:` over a version).
         self.queue: list[tuple[str, str | _PackageSource, Path, dict[str, str]]] = []
+        # Each package's features its users ask for, and whether any of them wants its defaults.
+        self.requests: dict[str, tuple[set[str], bool]] = {}
 
     def resolve_all(self, packages: dict[str, str | _PackageSource], folder: Path, indexes: dict[str, str]) -> None:
         """Find ``packages`` (a project's), then the packages they use, breadth first."""
@@ -252,27 +294,14 @@ class _Resolver:
 
     def resolve(self, name: str, source: str | _PackageSource, folder: Path, indexes: dict[str, str]) -> None:
         """Find package ``name`` as ``source`` says (relative to ``folder``, whose config names ``indexes``)."""
+        self.request(name, source)
+        wanted = source if isinstance(source, str) else source.version
         if name in self.found:
-            wanted = source if isinstance(source, str) else source.version
             version = self.found[name].config.package.version
             if wanted is not None and wanted != version:
                 raise PackageError(f"{folder / 'config.yaml'} needs package {name} {wanted}, but {version} is used")
             return
-        if isinstance(source, str) or source.index is not None:
-            wanted = source if isinstance(source, str) else source.version
-            assert wanted is not None  # an index source has its version (see _PackageSource)
-            index = index_location(name, source, indexes)
-            root = self.unpack(_from_index(name, wanted, folder, index, install=self.install), name)
-        else:
-            assert source.path is not None
-            path = (folder / source.path).resolve()
-            if path.is_dir():
-                root = path  # a project folder: used as it is
-            elif path.is_file():
-                root = self.unpack(path, name)
-            else:
-                raise PackageError(f"package {name}: {source.path} is neither a project folder nor a {ARCHIVE} file")
-            wanted = source.version
+        root = self.locate(name, source, folder, indexes)
         from bifrost.configs import ConfigBuilder  # noqa: PLC0415 - it resolves packages in turn
 
         config = ConfigBuilder(root / "config.yaml", resolve=False).build()
@@ -286,6 +315,35 @@ class _Resolver:
         self.uses[name] = list(config.packages)
         for inner, inner_source in config.packages.items():  # what it uses
             self.queue.append((inner, inner_source, root, config.index))
+
+    def request(self, name: str, source: str | _PackageSource) -> None:
+        """Note the features ``source`` asks of package ``name``, besides those other uses ask."""
+        requested, defaults = self.requests.get(name, (set(), False))
+        if isinstance(source, str):
+            defaults = True
+        else:
+            requested = requested | set(source.features)
+            defaults = defaults or source.default_features
+        self.requests[name] = (requested, defaults)
+
+    def locate(self, name: str, source: str | _PackageSource, folder: Path, indexes: dict[str, str]) -> Path:
+        """Return the folder package ``name`` is in: from an index, a ``.bifpkg``, or a project folder.
+
+        Raises:
+            PackageError: If ``source`` names a path that is neither.
+
+        """
+        if isinstance(source, str) or source.path is None:
+            wanted = source if isinstance(source, str) else source.version
+            assert wanted is not None  # an index source has its version (see _PackageSource)
+            index = index_location(name, source, indexes)
+            return self.unpack(_from_index(name, wanted, folder, index, install=self.install), name)
+        path = (folder / source.path).resolve()
+        if path.is_dir():
+            return path  # a project folder: used as it is
+        if path.is_file():
+            return self.unpack(path, name)
+        raise PackageError(f"package {name}: {source.path} is neither a project folder nor a {ARCHIVE} file")
 
     def unpack(self, archive: Path, name: str) -> Path:
         """Unpack ``archive`` into ``build/pkg/<name>/`` (unless it is there already); return that folder."""
@@ -516,7 +574,14 @@ def _entry(name: str, source: str | _PackageSource, indent: str) -> list[str]:
     if isinstance(source, str):
         return [f"{indent}{name}: {_scalar(source)}"]
     lines = [f"{indent}{name}:"]
-    lines += [f"{indent * 2}{key}: {_scalar(value)}" for key, value in source.model_dump(exclude_none=True).items()]
+    written = source.model_dump(exclude_none=True, exclude_defaults=True, by_alias=True)
+    for key, value in written.items():
+        shown = (
+            f"[{', '.join(value)}]"
+            if isinstance(value, list)
+            else _scalar(str(value).lower() if isinstance(value, bool) else value)
+        )
+        lines.append(f"{indent * 2}{key}: {shown}")
     return lines
 
 

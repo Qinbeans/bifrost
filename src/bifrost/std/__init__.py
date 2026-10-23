@@ -14,7 +14,7 @@ from bifrost.configs.schema import _Extern
 
 PREFIX = "std:"
 # Standard modules built into the compiler rather than declared in YAML.
-BUILTIN = {"mem", "fmt", "json", "tasks"}
+BUILTIN = {"mem", "fmt", "json", "tasks", "form"}
 
 
 def available() -> list[str]:

@@ -11,6 +11,7 @@ from typer import Typer
 
 from bifrost import packages, scaffold, versioning
 from bifrost.configs import Config, ConfigBuilder, source_root
+from bifrost.configs.features import FeatureError
 from bifrost.configs.schema import DEFAULT_INDEX
 from bifrost.formatter import FormatError, format_source
 from bifrost.lowering import BifrostError, lower_file
@@ -47,16 +48,25 @@ def build(
     path: Annotated[
         Path | None, typer.Option("--output", "-o", help="Output folder; default: build/ next to config.yaml.")
     ] = None,
+    features: Annotated[
+        str, typer.Option("--features", "-F", help="The project's features to turn on, by comma: --features ws,tls")
+    ] = "",
+    no_default_features: Annotated[  # noqa: FBT002 - a command-line flag
+        bool, typer.Option("--no-default-features", help="Leave the project's default features off.")
+    ] = False,
 ) -> None:
     """Compile a Bifrost source file (by default, the project's entry) into the configured executable."""
     config_path = config
+    wanted = {feature.strip() for feature in features.split(",") if feature.strip()}
     try:
-        config = ConfigBuilder(config_path, install=True).build()  # fetching and unpacking its packages
+        config = ConfigBuilder(  # fetching and unpacking its packages
+            config_path, install=True, features=wanted, default_features=not no_default_features
+        ).build()
     except FileNotFoundError:
         msg = f"no {config_path}; create a project with `bfc init <name>`"
         print(f"[bold red]✘ ERROR[/bold red]: {escape(msg)}", file=sys.stderr)
         raise typer.Exit(1) from None
-    except PackageError as error:
+    except (PackageError, FeatureError) as error:
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     project_folder = config_path.parent

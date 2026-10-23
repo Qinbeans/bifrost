@@ -1,0 +1,13 @@
+let axum = import("axum")
+
+module connect_info = {
+    /* Who is connected (the tokio feature: axum's ConnectInfo<SocketAddr>). */
+
+    let ConnectInfo = struct {
+        /* The client's address: "127.0.0.1:50422", "[::1]:50422". */
+        let addr: str,
+        static let from_request = [axum.peer_addr] (req: axum.Request) => ConnectInfo ConnectInfo(addr: axum.peer_addr(req))
+    }
+}
+
+export(connect_info)

@@ -32,8 +32,13 @@ def _packages_from_extras(monkeypatch: pytest.MonkeyPatch) -> None:
     def from_extras(
         self: object, name: str, source: str | _PackageSource, folder: Path, indexes: dict[str, str]
     ) -> None:
-        if name in local and (isinstance(source, str) or source.index is not None):
-            source = _PackageSource(path=str(local[name]))
+        if name in local and (isinstance(source, str) or source.path is None):
+            picked = (
+                {}
+                if isinstance(source, str)
+                else {"features": source.features, "default-features": source.default_features}
+            )
+            source = _PackageSource(path=str(local[name]), **picked)
         resolve(self, name, source, folder, indexes)
 
     monkeypatch.setattr(packages._Resolver, "resolve", from_extras)

@@ -385,6 +385,9 @@ class _Formatter:
     def _await_expression(self, node: Node, depth: int) -> str:
         return "await " + self.format(node.child_by_field_name("value"), depth)
 
+    def _try_expression(self, node: Node, depth: int) -> str:
+        return self.format(node.child_by_field_name("value"), depth) + "?"
+
     def _parenthesized_expression(self, node: Node, depth: int) -> str:
         return f"({self.format(_named(node)[0], depth)})"
 

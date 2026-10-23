@@ -1,0 +1,34 @@
+let axum = import("axum")
+let form = import("std:form")
+let mem = import("std:mem")
+
+module query = {
+    /* Query strings (the query feature). */
+
+    let Query[T] = struct {
+        /* The query string as T (a record or object, by name): ?page=2&q=x. A 400 when it does not fit T. */
+        let value: T,
+        static let from_request = [
+            axum.query,
+            axum.text,
+            form.decode
+        ] (req: axum.Request) => Result[Query[T], axum.Response] {
+            let found: Result[T, mem.Unique[str]] = form.decode(axum.query(req))
+            match found {
+                ok(v): return ok(Query(value: copy(v))),
+                err(e): return err(axum.text(400, "Failed to deserialize query string: {e}"))
+            }
+        }
+    }
+
+    let RawQuery = struct {
+        /* The query string as written ("" when there is none: then present is false). */
+        let value: str,
+        let present: bool,
+        static let from_request = [axum.query, axum.has_query] (req: axum.Request) => RawQuery {
+            return RawQuery(value: axum.query(req), present: axum.has_query(req))
+        }
+    }
+}
+
+export(query)

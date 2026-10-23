@@ -1,0 +1,22 @@
+let axum = import("axum")
+
+module matched_path = {
+    /* The route a request matched (the matched-path feature). */
+
+    let MatchedPath = struct {
+        /* The pattern of the route the request matched: "/users/{id}" (a 500 in a fallback, which matched none). */
+        let value: str,
+        static let from_request = [
+            axum.matched_path,
+            axum.text
+        ] (req: axum.Request) => Result[MatchedPath, axum.Response] {
+            let found = axum.matched_path(req)
+            if found == "" {
+                return err(axum.text(500, "No matched path found"))
+            }
+            return ok(MatchedPath(value: found))
+        }
+    }
+}
+
+export(matched_path)

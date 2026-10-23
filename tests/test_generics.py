@@ -222,10 +222,6 @@ def test_errors(tmp_path: Path, body: str, message: str) -> None:
     ("source", "message"),
     [
         (
-            "let Box[T] = struct { let value: T, let get = [super] () => T super.value }\n",
-            "a generic object's functions are not supported yet (get); write a generic function that takes",
-        ),
-        (
             "let Thing = struct { let a: i64 }\nlet id[Thing] = [] (x: Thing) => Thing x\n",
             "Thing already names a type here; give the type parameter another name",
         ),
@@ -308,3 +304,43 @@ def test_editor(tmp_path: Path) -> None:
     assert format_source(FUNCTIONS).count("let pick[T] = ") == 1
     assert format_source(ENGINE) == format_source(format_source(ENGINE))
     assert "let updates: ((n: i64, w: W) => W)[]" in format_source(ENGINE)
+
+
+def test_a_generic_objects_functions(tmp_path: Path) -> None:
+    # Each object type made from a generic one gets its functions, compiled for its types:
+    # methods that read it, change it (lent), and make another of the same type.
+    source = r"""
+let io = import("std:stdio")
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+
+let Box[T] = struct {
+    let value: T,
+    let items: T[],
+    let get = [super] () => T super.value,
+    let bump = [super] (by: T) => null {
+        let b <- super
+        b.value = b.value + by
+        b.items = #[...b.items, by]
+        b -> super
+    },
+    let mapped = [super] (f: (x: T) => T) => Box[T] Box(value: f(super.value), items: super.items.map(f)),
+    let describe = [super, fmt.format] () => mem.Unique[str] fmt.format("Box(%v, %v)", super.value, super.items)
+}
+
+let double = [] (x: i64) => i64 x * 2
+let half = [] (x: f64) => f64 x / 2.0
+
+let main = [io.printf, io.puts, double, half] () => null {
+    let b = Box(value: 5, items: #[1])
+    b.bump(2)
+    io.printf("%d\n", b.get())
+    let c = b.mapped(double)
+    io.puts(c.describe())
+    let f = Box(value: 3.0, items: #[1.0])
+    io.puts(f.mapped(half).describe())
+}
+"""
+    lines, leaked = _run(tmp_path, source)
+    assert lines == ["7", "Box(14, [2, 4])", "Box(1.5, [0.5])"]
+    assert leaked == 0

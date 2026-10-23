@@ -1,0 +1,106 @@
+let axum = import("axum")
+let form = import("std:form")
+let mem = import("std:mem")
+
+module extract = {
+    /* Extractors: what a handler's parameters are given from the request, by their types (axum::extract).
+       Take the state as a mem.Shared or mem.Atomic parameter, and the whole request as an axum.Request. */
+
+    let Path[T] = struct {
+        /* The path's captures as T: Path[i64] for "/users/{id}", a record or object (by name) for several.
+           A 400 when they do not fit T. */
+        let value: T,
+        static let from_request = [
+            axum.path_params,
+            axum.text,
+            form.decode
+        ] (req: axum.Request) => Result[Path[T], axum.Response] {
+            let found: Result[T, mem.Unique[str]] = form.decode(axum.path_params(req))
+            match found {
+                ok(v): return ok(Path(value: copy(v))),
+                err(e): return err(axum.text(400, "Invalid URL: {e}"))
+            }
+        }
+    }
+
+    let RawPathParams = struct {
+        /* The path's captures as they came, as a form: id=7&name=x */
+        let text: str,
+        static let from_request = [axum.path_params] (req: axum.Request) => RawPathParams RawPathParams(text: axum.path_params(req))
+    }
+
+    let Method = struct {
+        /* The request's method: "GET", "POST", ... */
+        let name: str,
+        let matches = [super] (method: str) => bool super.name == method,
+        static let from_request = [axum.method] (req: axum.Request) => Method Method(name: axum.method(req))
+    }
+
+    let Uri = struct {
+        /* The request's URI (as the router sees it: nesting strips a prefix); OriginalUri has it whole. */
+        let path: str,
+        let query: str,
+        let text: str,
+        static let from_request = [axum.path, axum.query, axum.uri] (req: axum.Request) => Uri {
+            return Uri(
+                path: axum.path(req),
+                query: axum.query(req),
+                text: axum.uri(req)
+            )
+        }
+    }
+
+    let Version = struct {
+        /* The request's HTTP version: "HTTP/1.1", "HTTP/2.0", "HTTP/3.0". */
+        let name: str,
+        static let from_request = [axum.version] (req: axum.Request) => Version Version(name: axum.version(req))
+    }
+
+    let HeaderMap = struct {
+        /* The request's headers: get(name) ("" if none), contains(name), count(), and name(i)/value(i) by index. */
+        let request: axum.Request,
+        let get = [super, axum.header] (name: str) => str axum.header(super.request, name),
+        let contains = [super, axum.has_header] (name: str) => bool axum.has_header(super.request, name),
+        let count = [super, axum.header_count] () => i64 axum.header_count(super.request),
+        let name = [super, axum.header_name] (index: i64) => str axum.header_name(super.request, index),
+        let value = [super, axum.header_value] (index: i64) => str axum.header_value(super.request, index),
+        static let from_request = [] (req: axum.Request) => HeaderMap HeaderMap(request: req)
+    }
+
+    let Text = struct {
+        /* The request's body, as text (axum's String extractor). */
+        let value: str,
+        static let from_request = [axum.body] (req: axum.Request) => Text Text(value: axum.body(req))
+    }
+
+    let Host = struct {
+        /* The host the request was sent to (its Host header, or HTTP/2's :authority): "example.org:8080". */
+        let value: str,
+        static let from_request = [
+            axum.header,
+            axum.has_header,
+            axum.text
+        ] (req: axum.Request) => Result[Host, axum.Response] {
+            if !axum.has_header(req, "host") {
+                return err(axum.text(400, "No host found in request"))
+            }
+            return ok(Host(value: axum.header(req, "host")))
+        }
+    }
+
+    let NestedPath = struct {
+        /* The prefix of the router this one is nested in: "/api" ("" when not nested). */
+        let value: str,
+        static let from_request = [axum.nested_path] (req: axum.Request) => NestedPath NestedPath(value: axum.nested_path(req))
+    }
+
+    let Extension = struct {
+        /* The extensions layers gave the request: get(key) ("" if none), contains(key) (axum.extension(key, value)). */
+        let request: axum.Request,
+        let get = [super, axum.extension_value] (key: str) => str axum.extension_value(super.request, key),
+        let contains = [super, axum.has_extension] (key: str) => bool axum.has_extension(super.request, key),
+        static let from_request = [] (req: axum.Request) => Extension Extension(request: req)
+    }
+}
+
+export(extract)

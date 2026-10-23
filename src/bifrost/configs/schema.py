@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Literal
 
 from mlir_python.codegen import Library, OptLevel
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _Flags(BaseModel):
@@ -35,6 +35,11 @@ class _Struct(BaseModel):
     name: str
     type: Literal["struct"]
     fields: dict[str, str]
+    # A handle C allocates and frees: the C function (of this module) that frees one. Bifrost
+    # then owns each one made (as it owns a list), and frees it where its owner's scope ends.
+    drop: str | None = None
+    # With `drop`: the C function that copies one, what `copy(x)` calls (without it, none is copied).
+    clone: str | None = None
     # The name Bifrost code uses, when not the C name made PascalCase (`as: Request`).
     bifrost_name: str | None = Field(None, alias="as")
     # One line about it, shown in the editor.
@@ -78,8 +83,35 @@ def source_root(project: Path) -> Path:
 DEFAULT_INDEX = "https://qinbeans.github.io/bifrost/packages/"
 
 
+def _library_paths(libraries: object) -> object:
+    """Read path-like library entries (``./build/lib/libx.a``) as paths, relative to config.yaml; others are names."""
+    if not isinstance(libraries, list):
+        return libraries
+    return [Path(library) if isinstance(library, str) and "/" in library else library for library in libraries]
+
+
+class _Feature(BaseModel):
+    """What a feature turns on: other features, and what only it brings (see ``bifrost.configs.features``)."""
+
+    # The other features it turns on.
+    features: list[str] = []
+    # Bifrost files only it may import, by module path: `axum.ws` is src/axum/ws.bif.
+    modules: list[str] = []
+    # Extern modules (of externs:) declared only with it.
+    externs: list[str] = []
+    # Libraries linked only with it, as `libraries:` writes them.
+    libraries: list[Library] = []
+
+    @field_validator("libraries", mode="before")
+    @classmethod
+    def _paths(cls, libraries: object) -> object:
+        return _library_paths(libraries)
+
+
 class _PackageSource(BaseModel):
     """Where a package comes from, when not the default index: a named index, a ``.bifpkg`` or a project folder."""
+
+    model_config = ConfigDict(populate_by_name=True)
 
     # A `.bifpkg` file or a project folder, relative to config.yaml.
     path: str | None = None
@@ -87,11 +119,17 @@ class _PackageSource(BaseModel):
     index: str | None = None
     # The version it must have: required from an index.
     version: str | None = None
+    # Its features this project uses, besides its defaults (see `bifrost.configs.features`).
+    features: list[str] = []
+    # Whether its default features are on too (`default-features: false`: only those listed).
+    default_features: bool = Field(True, alias="default-features")
 
     @model_validator(mode="after")
     def _one_source(self) -> "_PackageSource":
+        if self.path is None and self.index is None and self.version is not None:
+            return self  # `{version: 0.1.0, features: [...]}`: from the default index
         if (self.path is None) == (self.index is None):
-            msg = "a package comes from a path or an index: give one of path: and index:"
+            msg = "a package comes from the default index, a path or an index: give one of version:, path: and index:"
             raise ValueError(msg)
         if self.index is not None and self.version is None:
             msg = f"a package from index {self.index} needs its version:"
@@ -110,8 +148,15 @@ class Config(BaseModel):
     # else DEFAULT_INDEX.
     index: dict[str, str] = {}
     # The packages this project uses: name -> version (from the default index), {index: name,
-    # version: ...}, or {path: ...}.
+    # version: ...}, or {path: ...}; either of the last two may pick its features.
     packages: dict[str, str | _PackageSource] = {}
+    # Its features: name -> the features it turns on, or what only it brings; `default: [...]`
+    # lists those on unless turned off (see `bifrost.configs.features`).
+    features: dict[str, list[str] | _Feature] = {}
+    # The features in use, once resolved (its own, as a project; as a package, what its users ask for).
+    enabled: set[str] = Field(default_factory=set, exclude=True)
+    # Files that cannot be imported, since the feature gating them is off -> why.
+    gated: dict[Path, str] = Field(default_factory=dict, exclude=True)
     # Where `import("a.b:module")` also looks, after the project's own sources: its packages'.
     # Filled in when the packages are resolved (see `bifrost.packages`), never written.
     sources: list[Path] = Field(default_factory=list, exclude=True)
@@ -130,7 +175,4 @@ class Config(BaseModel):
     @classmethod
     def parse_library_paths(cls, libraries: object) -> object:
         """Convert path-like library entries from YAML into Path objects."""
-        if not isinstance(libraries, list):
-            return libraries
-
-        return [Path(library) if isinstance(library, str) and "/" in library else library for library in libraries]
+        return _library_paths(libraries)

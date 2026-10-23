@@ -1,0 +1,38 @@
+let axum = import("axum")
+let std_json = import("std:json")
+let mem = import("std:mem")
+
+module json = {
+    /* JSON bodies (the json feature): Json[T] reads one into a T, and makes one of a T. */
+
+    let Json[T] = struct {
+        /* A JSON body, as T: as an extractor, a 415 without Content-Type: application/json, a 400 when it is
+           not JSON, a 422 when it does not fit T; as a response, T as JSON (200). */
+        let value: T,
+        static let from_request = [
+            axum.content_type_is,
+            axum.body,
+            axum.json_valid,
+            axum.text,
+            std_json.decode
+        ] (req: axum.Request) => Result[Json[T], axum.Response] {
+            if !axum.content_type_is(req, "application/json", "+json") {
+                return err(
+                    axum.text(415, "Expected request with `Content-Type: application/json`")
+                )
+            }
+            let body = axum.body(req)
+            if !axum.json_valid(body) {
+                return err(axum.text(400, "Failed to parse the request body as JSON"))
+            }
+            let found: Result[T, mem.Unique[str]] = std_json.decode(body)
+            match found {
+                ok(v): return ok(Json(value: copy(v))),
+                err(e): return err(axum.text(422, "Failed to deserialize the JSON body into the target type: {e}"))
+            }
+        },
+        let into_response = [super, axum.json] () => axum.Response axum.json(200, super.value)
+    }
+}
+
+export(json)

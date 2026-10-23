@@ -27,7 +27,7 @@ from bifrost.naming import extern_name, is_constant_case, is_pascal_case, is_sna
 from bifrost.owned import is_list
 from bifrost.packages import PackageError
 from bifrost.project import Project
-from bifrost.std import fmt, json, mem, tasks
+from bifrost.std import fmt, form, json, mem, tasks
 from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
@@ -1638,6 +1638,8 @@ class Document:
             return "values as JSON text: " + ", ".join(json.FUNCTIONS)
         if name == "tasks":
             return "running async functions at the same time: " + ", ".join(tasks.FUNCTIONS)
+        if name == "form":
+            return "values as forms (a=1&b=x): " + ", ".join(form.FUNCTIONS)
         return std.load(name).description
 
     def _fields(self, struct: Node) -> list[Completion]:
@@ -2028,6 +2030,7 @@ def _type_name(kind: Any) -> str:  # noqa: ANN401 - a compiler type
 _BUILTIN_FUNCTIONS = {
     f"{std.PREFIX}fmt": fmt.FUNCTIONS,
     f"{std.PREFIX}json": json.FUNCTIONS,
+    f"{std.PREFIX}form": form.FUNCTIONS,
     f"{std.PREFIX}tasks": tasks.FUNCTIONS,
 }
 

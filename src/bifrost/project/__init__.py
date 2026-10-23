@@ -14,6 +14,7 @@ from mlir_python.lang import (
     Fn,
     Function,
     Program,
+    Ptr,
     Token,
     cstr,
     f32,
@@ -33,13 +34,18 @@ from mlir_python.lang import (
 from bifrost import std
 from bifrost.configs import Config
 from bifrost.configs.schema import Declaration, _Extern, _Function
+from bifrost.decoding import Decoders
 from bifrost.list_methods import ListMethods
 from bifrost.naming import to_snake_case
-from bifrost.owned import Drops
+from bifrost.owned import Drops, own_handle
 
 # The C functions behind owned values: name -> (parameters, result).
 # `(Request, i32) => None` in an extern declaration: a function type (one level; no nesting).
 _FUNCTION_TYPE = re.compile(r"\(([^()]*)\)\s*=>\s*([^()]+)")
+# `handler(Request) => Response`: a parameter taking any function whose parameters are extractors
+# (see `SourceUnit._handler_argument`); C calls the adapter the compiler writes, `(request, state,
+# out) => token`, which puts the handler's response in `*out`.
+_HANDLER_TYPE = re.compile(r"handler\(\s*(\w+)\s*\)\s*=>\s*(\w+)")
 
 _RUNTIME = {
     "malloc": ({"size": "u64"}, "cstr"),
@@ -119,16 +125,24 @@ class Project:
         self.cell_results: dict[str, tuple[Any, object] | None] = {}
         # C symbol -> the indexes of its `json` parameters (a record or object passed to one is encoded).
         self.json_parameters: dict[str, set[int]] = {}
+        # C symbol -> its `handler(Request) => Response` parameters: index -> (Request, Response).
+        self.handler_parameters: dict[str, dict[int, tuple[type, type]]] = {}
+        # An object type (by id) -> its static functions -> (Bifrost name, symbol, the SourceUnit defining it).
+        self.statics: dict[int, dict[str, tuple[str, str, Any]]] = {}
         # Compiled symbols of the Bifrost functions that pause (async functions).
         self.pausing: set[str] = set()
         # Record fields ((name, type), ...) -> their record type, shared by every file.
         self.records: dict[tuple[tuple[str, object], ...], type] = {}
         # An object's type -> its methods (functions without `static`) -> (Bifrost name, compiled symbol).
         self.methods: dict[type, dict[str, tuple[str, str]]] = {}
+        # Compiled symbol of a generic object's method -> its result type, for that object type's types.
+        self.method_results: dict[str, Any] = {}
         # Compiled symbols of the methods that change their object (they lock `super`): it is lent to them.
         self.changing: set[str] = set()
         # The functions freeing and copying lists, and the records and objects holding them.
         self.drops = Drops(self.program)
+        # The decoders of json.decode and form.decode, generated per type.
+        self.decoders = Decoders(self.program, self.drops)
         # A list's own functions (xs.map(f), g.sort()), generated per element type.
         self.list_methods = ListMethods(self.drops)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
@@ -184,14 +198,25 @@ class Project:
 
         extern_function.__name__ = declaration.name
         extern_function.__annotations__ = {
-            parameter_name: cstr if parameter_type == "json" else self._resolve_type(module, parameter_type)
-            for parameter_name, parameter_type in declaration.parameters.items()
+            parameter_name: cstr if parameter_type == "json" else self._parameter_type(module, declaration, index)
+            for index, (parameter_name, parameter_type) in enumerate(declaration.parameters.items())
         }
         json_indexes = {index for index, kind in enumerate(declaration.parameters.values()) if kind == "json"}
         if json_indexes:
             self.json_parameters[declaration.name] = json_indexes
         extern_function.__annotations__["return"] = self._resolve_type(module, declaration.return_type)
         return self.program.extern(extern_function, name=declaration.name)
+
+    def _parameter_type(self, module: str, declaration: _Function, index: int) -> object:
+        """Return a C function's parameter type; a ``handler(Request) => Response`` is the adapter C calls."""
+        written = list(declaration.parameters.values())[index]
+        handler = _HANDLER_TYPE.fullmatch(written.strip())
+        if handler is None:
+            return self._resolve_type(module, written)
+        request = self._resolve_type(module, handler.group(1))
+        response = self._resolve_type(module, handler.group(2))
+        self.handler_parameters.setdefault(declaration.name, {})[index] = (request, response)
+        return Fn[[request, ptr, Ptr[response]], Token]
 
     def _init_declarations(self) -> None:
         for extern in self.config.externs:
@@ -249,6 +274,28 @@ class Project:
                     extern_struct = self._create_struct(module, declaration)
                     self.type_map[f"{module}_{declaration.name}"] = extern_struct
                     setattr(self, f"{module}_{declaration.name}", extern_struct)
+        for declaration in extern.declarations:
+            if declaration.type == "struct" and declaration.drop is not None:
+                own_handle(
+                    self.type_map[f"{module}_{declaration.name}"],
+                    self._handle_function(module, declaration.name, declaration.drop, "drop"),
+                    self._handle_function(module, declaration.name, declaration.clone, "clone"),
+                )
+
+    def _handle_function(self, module: str, struct_name: str, name: str | None, what: str) -> Any:  # noqa: ANN401
+        """Return the C function a handle's declaration names to free (``drop:``) or copy (``clone:``) one.
+
+        Raises:
+            ValueError: If the module declares no such function.
+
+        """
+        if name is None:
+            return None
+        found = self.extern_table.get(f"{module}_{name}")
+        if found is None:
+            msg = f"{module}'s {struct_name} names {name} as its {what}, but {module} declares no function {name}"
+            raise ValueError(msg)
+        return found
 
     def main(self, handler: Callable[[Context], None]) -> Callable[..., Any]:
         """Register a context-based entry point with lowered registry accesses."""
@@ -282,10 +329,11 @@ class Project:
 
     def build(self) -> Path:
         """Build the project executable (with Bifrost's async runtime, if anything pauses)."""
+        runtimes = [self._c_runtime("decode_runtime")] if self.decoders.used else []
         return self.program.build_executable(
             self.config.path / self.config.package.name,
             opt_level=self.config.flags.optimization,
-            libraries=self.config.libraries,
+            libraries=[*self.config.libraries, *runtimes],
             linker=self.config.flags.linker,
             async_runtime=self._async_runtime() if self.pausing or self._returns_tokens() else None,
         )
@@ -298,14 +346,18 @@ class Project:
         )
 
     def _async_runtime(self) -> Path:
-        """Compile Bifrost's async runtime (``std/async_runtime.c``) into the build folder.
+        """Compile Bifrost's async runtime (``std/async_runtime.c``) into the build folder."""
+        return self._c_runtime("async_runtime", "bifrost_async.o")
+
+    def _c_runtime(self, name: str, output_name: str | None = None) -> Path:
+        """Compile a runtime of Bifrost's written in C (``std/<name>.c``) into the build folder.
 
         Raises:
             RuntimeError: If the compiler fails.
 
         """
-        source = Path(std.__file__).parent / "async_runtime.c"
-        output = self.config.path / "bifrost_async.o"
+        source = Path(std.__file__).parent / f"{name}.c"
+        output = self.config.path / (output_name or f"bifrost_{name}.o")
         command = [self.config.flags.linker, "-c", "-O2", "-fPIC", str(source), "-o", str(output)]
         result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603
         if result.returncode != 0:

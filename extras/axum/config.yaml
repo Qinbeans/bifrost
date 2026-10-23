@@ -1,0 +1,1064 @@
+# axum for Bifrost: see README.md. The C side is built by CMake first (CMakeLists.txt):
+#   cmake -B build -G Ninja && cmake --build build
+# Handlers are any functions: a parameter declared `handler(axum_Request) => axum_Response` takes one,
+# and the compiler writes what extracts its parameters and makes its response.
+package:
+  name: axum
+  version: 0.1.0
+  build: library
+  description: 'axum for Bifrost: routers of handlers that take extractors, middleware, and a server on h2o (HTTP/1.1, HTTP/2,
+    HTTP/3)'
+flags:
+  optimization: 2
+  linker: clang
+features:
+  default:
+  - form
+  - http1
+  - json
+  - matched-path
+  - original-uri
+  - query
+  - tokio
+  - tower-log
+  - tracing
+  json:
+    modules:
+    - axum.json
+  form:
+    modules:
+    - axum.form
+  query:
+    modules:
+    - axum.query
+  matched-path:
+    modules:
+    - axum.matched_path
+    libraries:
+    - ./build/lib/axum_feature_matched_path.o
+  original-uri:
+    modules:
+    - axum.original_uri
+    libraries:
+    - ./build/lib/axum_feature_original_uri.o
+  http1:
+    libraries:
+    - ./build/lib/axum_feature_http1.o
+  http2:
+    libraries:
+    - ./build/lib/axum_feature_http2.o
+  tokio:
+    modules:
+    - axum.connect_info
+  tracing:
+    libraries:
+    - ./build/lib/axum_feature_tracing.o
+  macros: []
+  tower-log: []
+  ws:
+    modules:
+    - axum.ws
+    externs:
+    - axum_ws
+    libraries:
+    - ./build/lib/libaxum_ws.a
+  multipart:
+    modules:
+    - axum.multipart
+    externs:
+    - axum_multipart
+    libraries:
+    - ./build/lib/libaxum_multipart.a
+libraries:
+- ./build/lib/libbifrost_axum.a
+- ./build/lib/libh2o-evloop.a
+- ssl
+- crypto
+- z
+- m
+externs:
+- module: axum
+  description: 'axum''s core (c/axum.c): routers, middleware, requests, responses, the server'
+  declarations:
+  - name: Router
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'A router: routes, layers and a fallback. Made by axum.router(), built with pipes.'
+  - name: MethodRouter
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'A route''s handlers by method: axum.get(h), axum.post(h), ..., joined with axum.and.'
+  - name: Layer
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'Middleware: axum.from_fn(f), axum.map_request(f), axum.map_response(f), axum.body_limit(n), ...'
+  - name: Request
+    type: struct
+    fields:
+      raw: ptr
+    doc: The request a handler serves. Valid until its response is sent.
+  - name: Response
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'A response: a status, headers and a body. Owned: freed where its owner''s scope ends, unless returned.'
+    drop: axum_response_free
+    clone: axum_response_clone
+  - name: Next
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'The rest of the middleware stack: next.run(req) (axum.middleware''s Next).'
+  - name: Listener
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'A bound TCP address: axum.bind("0.0.0.0:3000").'
+  - name: Stream
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'A response body written bit by bit: server-sent events (axum.sse), or axum.stream_open.'
+  - name: axum_response_free
+    as: response_free
+    type: function
+    parameters:
+      response: axum_Response
+    return: None
+    doc: Free a response (Bifrost does, where its owner's scope ends).
+  - name: axum_response_clone
+    as: response_clone
+    type: function
+    parameters:
+      response: axum_Response
+    return: axum_Response
+    doc: A copy of a response (what copy(res) does).
+  - name: axum_router
+    as: router
+    type: function
+    parameters: {}
+    return: axum_Router
+    doc: 'A new router, with no routes: 404 for everything.'
+  - name: axum_route
+    as: route
+    type: function
+    parameters:
+      router: axum_Router
+      path: cstr
+      methods: axum_MethodRouter
+    return: axum_Router
+    doc: Route a path ("/users/{id}", "/files/{*rest}") to a method router. The same path again merges them.
+  - name: axum_route_service
+    as: route_service
+    type: function
+    parameters:
+      router: axum_Router
+      path: cstr
+      service: handler(axum_Request) => axum_Response
+    return: axum_Router
+    doc: Route a path to a handler for every method.
+  - name: axum_nest
+    as: nest
+    type: function
+    parameters:
+      router: axum_Router
+      path: cstr
+      other: axum_Router
+    return: axum_Router
+    doc: Mount a router under a prefix ("/api"); its handlers see the URI without it.
+  - name: axum_nest_service
+    as: nest_service
+    type: function
+    parameters:
+      router: axum_Router
+      path: cstr
+      service: handler(axum_Request) => axum_Response
+    return: axum_Router
+    doc: 'Mount a handler under a prefix: the path and everything below it.'
+  - name: axum_merge
+    as: merge
+    type: function
+    parameters:
+      router: axum_Router
+      other: axum_Router
+    return: axum_Router
+    doc: Take another router's routes (and fallback).
+  - name: axum_layer
+    as: layer
+    type: function
+    parameters:
+      router: axum_Router
+      layer: axum_Layer
+    return: axum_Router
+    doc: Wrap the routes added so far (and the fallback) in middleware; the last added runs first.
+  - name: axum_route_layer
+    as: route_layer
+    type: function
+    parameters:
+      router: axum_Router
+      layer: axum_Layer
+    return: axum_Router
+    doc: Wrap the routes added so far (not the fallback) in middleware, run only once one matches.
+  - name: axum_fallback
+    as: fallback
+    type: function
+    parameters:
+      router: axum_Router
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Router
+    doc: What answers paths no route matches (a 404 otherwise).
+  - name: axum_reset_fallback
+    as: reset_fallback
+    type: function
+    parameters:
+      router: axum_Router
+    return: axum_Router
+    doc: 'Forget the fallback: unmatched paths are 404s again.'
+  - name: axum_method_not_allowed_fallback
+    as: method_not_allowed_fallback
+    type: function
+    parameters:
+      router: axum_Router
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Router
+    doc: What answers a path matched with another method (a 405 otherwise).
+  - name: axum_with_state
+    as: with_state
+    type: function
+    parameters:
+      router: axum_Router
+      state: ptr
+    return: axum_Router
+    doc: 'The state its handlers take: a mem.Shared or mem.Atomic, owned by main, lent to the server.'
+  - name: axum_has_routes
+    as: has_routes
+    type: function
+    parameters:
+      router: axum_Router
+    return: bool
+    doc: Whether it has any route.
+  - name: axum_get
+    as: get
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering GET with a handler.
+  - name: axum_post
+    as: post
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering POST with a handler.
+  - name: axum_put
+    as: put
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering PUT with a handler.
+  - name: axum_delete
+    as: delete
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering DELETE with a handler.
+  - name: axum_patch
+    as: patch
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering PATCH with a handler.
+  - name: axum_head
+    as: head
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering HEAD with a handler.
+  - name: axum_options
+    as: options
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering OPTIONS with a handler.
+  - name: axum_trace
+    as: trace
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering TRACE with a handler.
+  - name: axum_connect
+    as: connect
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering CONNECT with a handler.
+  - name: axum_any
+    as: any
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering every method with a handler.
+  - name: axum_on
+    as: 'on'
+    type: function
+    parameters:
+      methods: cstr
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: A method router answering the methods named ("GET", "PUT,PATCH") with a handler.
+  - name: axum_and
+    as: also
+    type: function
+    parameters:
+      methods: axum_MethodRouter
+      other: axum_MethodRouter
+    return: axum_MethodRouter
+    doc: 'Both method routers in one: axum.get(list) |> axum.also(axum.post(create)).'
+  - name: axum_method_fallback
+    as: method_fallback
+    type: function
+    parameters:
+      methods: axum_MethodRouter
+      handler: handler(axum_Request) => axum_Response
+    return: axum_MethodRouter
+    doc: What answers the methods it has no handler for (a 405 otherwise).
+  - name: axum_method_layer
+    as: method_layer
+    type: function
+    parameters:
+      methods: axum_MethodRouter
+      layer: axum_Layer
+    return: axum_MethodRouter
+    doc: Wrap its handlers (and a 405) in middleware.
+  - name: axum_method_route_layer
+    as: method_route_layer
+    type: function
+    parameters:
+      methods: axum_MethodRouter
+      layer: axum_Layer
+    return: axum_MethodRouter
+    doc: Wrap its handlers (not a 405) in middleware.
+  - name: axum_from_fn
+    as: from_fn
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: 'Middleware from a function of extractors, a request and a Next: it runs the rest with next.run(req).'
+  - name: axum_from_fn_with_state
+    as: from_fn_with_state
+    type: function
+    parameters:
+      state: ptr
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: from_fn, its function given this state.
+  - name: axum_map_request
+    as: map_request
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: 'Middleware that changes (or answers) a request: what it returns is the response, or nothing to go on.'
+  - name: axum_map_request_with_state
+    as: map_request_with_state
+    type: function
+    parameters:
+      state: ptr
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: map_request, its function given this state.
+  - name: axum_map_response
+    as: map_response
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: Middleware given the response (a Response parameter), returning the one sent.
+  - name: axum_map_response_with_state
+    as: map_response_with_state
+    type: function
+    parameters:
+      state: ptr
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: map_response, its function given this state.
+  - name: axum_from_extractor
+    as: from_extractor
+    type: function
+    parameters:
+      handler: handler(axum_Request) => axum_Response
+    return: axum_Layer
+    doc: Middleware that runs extractors (its function's parameters) and stops the request if one rejects it.
+  - name: axum_body_limit
+    as: body_limit
+    type: function
+    parameters:
+      bytes: i64
+    return: axum_Layer
+    doc: The largest body requests may have, in bytes (2 MB by default); larger ones are 413s.
+  - name: axum_disable_body_limit
+    as: disable_body_limit
+    type: function
+    parameters: {}
+    return: axum_Layer
+    doc: No limit on request bodies.
+  - name: axum_default_header
+    as: default_header
+    type: function
+    parameters:
+      name: cstr
+      value: cstr
+    return: axum_Layer
+    doc: Add a header to responses that have none of that name.
+  - name: axum_extension
+    as: extension
+    type: function
+    parameters:
+      key: cstr
+      value: cstr
+    return: axum_Layer
+    doc: Give requests a value (Extension), read with axum.extension_value(req, key).
+  - name: axum_method
+    as: method
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'Its method: "GET".'
+  - name: axum_path
+    as: path
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'Its path, as the router sees it (nesting strips a prefix): "/users/7".'
+  - name: axum_query
+    as: query
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'Its query, as written ("" if none): "page=2&q=x".'
+  - name: axum_version
+    as: version
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: '"HTTP/1.1", "HTTP/2.0" or "HTTP/3.0".'
+  - name: axum_body
+    as: body
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: Its body, as text.
+  - name: axum_path_params
+    as: path_params
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'Its path''s captures as a form: id=7&name=x.'
+  - name: axum_peer_addr
+    as: peer_addr
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'The client''s address: "127.0.0.1:50422".'
+  - name: axum_uri
+    as: uri
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'Its path and query: "/users?page=2".'
+  - name: axum_original_uri
+    as: original_uri
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: Its URI before nesting stripped a prefix.
+  - name: axum_matched_path
+    as: matched_path
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'The pattern of the route it matched: "/users/{id}".'
+  - name: axum_nested_path
+    as: nested_path
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: 'The prefix nesting stripped: "/api" ("" if none).'
+  - name: axum_has_query
+    as: has_query
+    type: function
+    parameters:
+      request: axum_Request
+    return: bool
+    doc: Whether its URI has a query (even an empty one).
+  - name: axum_body_len
+    as: body_len
+    type: function
+    parameters:
+      request: axum_Request
+    return: i64
+    doc: Its body's length in bytes.
+  - name: axum_header
+    as: header
+    type: function
+    parameters:
+      request: axum_Request
+      name: cstr
+    return: cstr
+    doc: A header, by case-insensitive name ("" if none).
+  - name: axum_has_header
+    as: has_header
+    type: function
+    parameters:
+      request: axum_Request
+      name: cstr
+    return: bool
+    doc: Whether it has a header of that name.
+  - name: axum_header_count
+    as: header_count
+    type: function
+    parameters:
+      request: axum_Request
+    return: i64
+    doc: How many headers it has.
+  - name: axum_header_name
+    as: header_name
+    type: function
+    parameters:
+      request: axum_Request
+      index: i64
+    return: cstr
+    doc: The name (lower case) of its header at an index.
+  - name: axum_header_value
+    as: header_value
+    type: function
+    parameters:
+      request: axum_Request
+      index: i64
+    return: cstr
+    doc: The value of its header at an index.
+  - name: axum_set_request_header
+    as: set_request_header
+    type: function
+    parameters:
+      request: axum_Request
+      name: cstr
+      value: cstr
+    return: None
+    doc: Set a header of the request (in middleware).
+  - name: axum_remove_request_header
+    as: remove_request_header
+    type: function
+    parameters:
+      request: axum_Request
+      name: cstr
+    return: None
+    doc: Remove a header of the request (in middleware).
+  - name: axum_set_method
+    as: set_method
+    type: function
+    parameters:
+      request: axum_Request
+      method: cstr
+    return: None
+    doc: Change the request's method (in middleware).
+  - name: axum_set_body_text
+    as: set_body_text
+    type: function
+    parameters:
+      request: axum_Request
+      body: cstr
+    return: None
+    doc: Change the request's body (in middleware).
+  - name: axum_extension_value
+    as: extension_value
+    type: function
+    parameters:
+      request: axum_Request
+      key: cstr
+    return: cstr
+    doc: A value an extension layer (or middleware) gave the request ("" if none).
+  - name: axum_has_extension
+    as: has_extension
+    type: function
+    parameters:
+      request: axum_Request
+      key: cstr
+    return: bool
+    doc: Whether the request has that extension.
+  - name: axum_insert_extension
+    as: insert_extension
+    type: function
+    parameters:
+      request: axum_Request
+      key: cstr
+      value: cstr
+    return: None
+    doc: Give the request a value, for handlers after (in middleware).
+  - name: axum_content_type_is
+    as: content_type_is
+    type: function
+    parameters:
+      request: axum_Request
+      essence: cstr
+      suffix: cstr
+    return: bool
+    doc: Whether its Content-Type is essence ("application/json"), or ends with suffix ("+json").
+  - name: axum_json_valid
+    as: json_valid
+    type: function
+    parameters:
+      text: cstr
+    return: bool
+    doc: Whether text is JSON (whatever its shape).
+  - name: axum_response
+    as: response
+    type: function
+    parameters:
+      status: i32
+    return: axum_Response
+    doc: A response with a status, no headers and no body.
+  - name: axum_text
+    as: text
+    type: function
+    parameters:
+      status: i32
+      text: cstr
+    return: axum_Response
+    doc: A text/plain response.
+  - name: axum_html
+    as: html
+    type: function
+    parameters:
+      status: i32
+      html: cstr
+    return: axum_Response
+    doc: A text/html response.
+  - name: axum_json
+    as: json
+    type: function
+    parameters:
+      status: i32
+      body: json
+    return: axum_Response
+    doc: 'An application/json response: a record or object (encoded for you), or JSON text.'
+  - name: axum_redirect
+    as: redirect
+    type: function
+    parameters:
+      status: i32
+      location: cstr
+    return: axum_Response
+    doc: A redirect (303, 307, 308) to a location.
+  - name: axum_status
+    as: status
+    type: function
+    parameters:
+      response: axum_Response
+    return: i32
+    doc: Its status.
+  - name: axum_set_status
+    as: set_status
+    type: function
+    parameters:
+      response: axum_Response
+      status: i32
+    return: None
+    doc: Change its status.
+  - name: axum_set_header
+    as: set_header
+    type: function
+    parameters:
+      response: axum_Response
+      name: cstr
+      value: cstr
+    return: None
+    doc: Set a header (replacing those of that name).
+  - name: axum_append_header
+    as: append_header
+    type: function
+    parameters:
+      response: axum_Response
+      name: cstr
+      value: cstr
+    return: None
+    doc: Add a header (keeping those of that name).
+  - name: axum_remove_header
+    as: remove_header
+    type: function
+    parameters:
+      response: axum_Response
+      name: cstr
+    return: None
+    doc: Remove the headers of a name.
+  - name: axum_response_header
+    as: response_header
+    type: function
+    parameters:
+      response: axum_Response
+      name: cstr
+    return: cstr
+    doc: A header of the response ("" if none).
+  - name: axum_set_body
+    as: set_body
+    type: function
+    parameters:
+      response: axum_Response
+      body: cstr
+    return: None
+    doc: Change its body.
+  - name: axum_response_body
+    as: response_body
+    type: function
+    parameters:
+      response: axum_Response
+    return: cstr
+    doc: Its body, as text.
+  - name: axum_next_of
+    as: next_of
+    type: function
+    parameters:
+      request: axum_Request
+    return: axum_Next
+    doc: The rest of the stack below the from_fn middleware running (Next's extractor).
+  - name: axum_next_run
+    as: next_run
+    type: function
+    parameters:
+      next: axum_Next
+      request: axum_Request
+    return: token
+    doc: Run the rest of the stack (await it), then take its response with axum.next_response.
+  - name: axum_next_response
+    as: next_response
+    type: function
+    parameters:
+      next: axum_Next
+    return: axum_Response
+    doc: The response the rest of the stack gave.
+  - name: axum_bind
+    as: bind
+    type: function
+    parameters:
+      address: cstr
+    return: axum_Listener
+    doc: Bind a TCP address ("0.0.0.0:3000", "[::]:8080", "127.0.0.1:0"); axum.listener_error says if it failed.
+  - name: axum_listener_error
+    as: listener_error
+    type: function
+    parameters:
+      listener: axum_Listener
+    return: cstr
+    doc: Why binding failed ("" if it did not).
+  - name: axum_local_addr
+    as: local_addr
+    type: function
+    parameters:
+      listener: axum_Listener
+    return: cstr
+    doc: 'The address it listens on: "0.0.0.0:3000".'
+  - name: axum_local_port
+    as: local_port
+    type: function
+    parameters:
+      listener: axum_Listener
+    return: i32
+    doc: The port it listens on (the one the system chose, for :0).
+  - name: axum_tcp_nodelay
+    as: tcp_nodelay
+    type: function
+    parameters:
+      listener: axum_Listener
+      'on': bool
+    return: axum_Listener
+    doc: Set TCP_NODELAY on the connections it accepts.
+  - name: axum_serve
+    as: serve
+    type: function
+    parameters:
+      listener: axum_Listener
+      router: axum_Router
+    return: token
+    doc: 'Serve a router: HTTP/1.1 and HTTP/2 (h2c). Await it: it runs until the program ends.'
+  - name: axum_serve_with_graceful_shutdown
+    as: serve_with_graceful_shutdown
+    type: function
+    parameters:
+      listener: axum_Listener
+      router: axum_Router
+      signal: () => token
+    return: token
+    doc: Serve until signal (an async function) returns, then finish the requests in flight and stop.
+  - name: axum_serve_tls
+    as: serve_tls
+    type: function
+    parameters:
+      listener: axum_Listener
+      router: axum_Router
+      cert: cstr
+      key: cstr
+    return: token
+    doc: Serve HTTPS (HTTP/1.1, HTTP/2) and HTTP/3, with a certificate and its key (PEM files).
+  - name: axum_shutdown_signal
+    as: shutdown_signal
+    type: function
+    parameters: {}
+    return: token
+    doc: 'Completes on Ctrl+C or SIGTERM: await it in a graceful shutdown''s signal.'
+  - name: axum_stream_open
+    as: stream_open
+    type: function
+    parameters:
+      request: axum_Request
+      status: i32
+      content_type: cstr
+    return: axum_Stream
+    doc: Send the response's head now; write its body with axum.stream_write (Body::from_stream).
+  - name: axum_stream_write
+    as: stream_write
+    type: function
+    parameters:
+      stream: axum_Stream
+      text: cstr
+    return: token
+    doc: 'Write to a stream: await it (it completes once the bytes are taken).'
+  - name: axum_stream_closed
+    as: stream_closed
+    type: function
+    parameters:
+      stream: axum_Stream
+    return: bool
+    doc: Whether the client has gone (writes then do nothing).
+  - name: axum_stream_end
+    as: stream_end
+    type: function
+    parameters:
+      stream: axum_Stream
+    return: None
+    doc: End the stream once what was written is sent.
+  - name: axum_stream_keep_alive
+    as: stream_keep_alive
+    type: function
+    parameters:
+      stream: axum_Stream
+      milliseconds: i64
+      text: cstr
+    return: None
+    doc: Write text every so often while the stream is idle (an SSE keep-alive comment).
+  - name: axum_sse_send
+    as: sse_send
+    type: function
+    parameters:
+      stream: axum_Stream
+      event: cstr
+      data: cstr
+      id: cstr
+      retry: i64
+    return: token
+    doc: Write one server-sent event.
+  - name: axum_stream_response
+    as: stream_response
+    type: function
+    parameters:
+      stream: axum_Stream
+    return: axum_Response
+    doc: End the stream; what a streaming handler returns.
+- module: axum_ws
+  description: 'WebSockets (c/ws.c): the ws feature'
+  declarations:
+  - name: Socket
+    type: struct
+    fields:
+      raw: ptr
+    doc: A websocket, accepted from a WebSocketUpgrade (axum.ws).
+  - name: axum_ws_rejection
+    as: rejection
+    type: function
+    parameters:
+      request: axum_Request
+    return: cstr
+    doc: Why the request is not a websocket handshake ("" if it is).
+  - name: axum_ws_accept
+    as: accept
+    type: function
+    parameters:
+      request: axum_Request
+    return: axum_ws_Socket
+    doc: 'Accept the handshake: the 101 goes out, and the socket is the handler''s.'
+  - name: axum_ws_recv
+    as: recv
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: token
+    doc: Wait for the next message (or the end); then take it with take.
+  - name: axum_ws_take
+    as: take
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: bool
+    doc: 'Take the message recv waited for: false once the socket has closed.'
+  - name: axum_ws_text
+    as: text
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: cstr
+    doc: The message taken, as text.
+  - name: axum_ws_kind
+    as: kind
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: i32
+    doc: 'The kind of message taken: 1 text, 2 binary, 8 close.'
+  - name: axum_ws_len
+    as: size
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: i64
+    doc: The length of the message taken, in bytes.
+  - name: axum_ws_close_code
+    as: close_code
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: i32
+    doc: The code the client closed with (1000 normal; 0 not closed).
+  - name: axum_ws_closed
+    as: closed
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: bool
+    doc: Whether the socket has closed.
+  - name: axum_ws_send
+    as: send
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+      text: cstr
+    return: token
+    doc: 'Send a text message: await it.'
+  - name: axum_ws_ping
+    as: ping
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+      data: cstr
+    return: token
+    doc: Send a ping (the client answers with a pong).
+  - name: axum_ws_close
+    as: close
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+      code: i32
+      reason: cstr
+    return: None
+    doc: 'Close the socket with a code (1000: normal) and a reason.'
+  - name: axum_ws_done
+    as: done
+    type: function
+    parameters:
+      socket: axum_ws_Socket
+    return: axum_Response
+    doc: 'Close the socket if open: what a websocket handler returns.'
+- module: axum_multipart
+  description: 'multipart/form-data (c/multipart.c): the multipart feature'
+  declarations:
+  - name: Multipart
+    type: struct
+    fields:
+      raw: ptr
+    doc: The fields of a multipart/form-data body (axum.multipart).
+  - name: axum_multipart_of
+    as: of
+    type: function
+    parameters:
+      request: axum_Request
+    return: axum_multipart_Multipart
+    doc: The request's form fields; error says if its body is not multipart/form-data.
+  - name: axum_multipart_error
+    as: error
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: cstr
+    doc: Why the body is not multipart/form-data ("" when it is).
+  - name: axum_multipart_next
+    as: next
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: bool
+    doc: 'Move to the next field: whether there is one.'
+  - name: axum_field_name
+    as: name
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: cstr
+    doc: The field's name.
+  - name: axum_field_file_name
+    as: file_name
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: cstr
+    doc: The field's file name ("" if not a file).
+  - name: axum_field_content_type
+    as: content_type
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: cstr
+    doc: The field's content type ("" if none given).
+  - name: axum_field_text
+    as: text
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: cstr
+    doc: The field's data, as text.
+  - name: axum_field_len
+    as: size
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+    return: i64
+    doc: The field's data's length in bytes.
+  - name: axum_field_header
+    as: header
+    type: function
+    parameters:
+      multipart: axum_multipart_Multipart
+      name: cstr
+    return: cstr
+    doc: A header of the field ("" if none).

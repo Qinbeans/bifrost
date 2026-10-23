@@ -1,0 +1,13 @@
+let axum = import("axum")
+
+module original_uri = {
+    /* The URI before nesting stripped its prefix (the original-uri feature). */
+
+    let OriginalUri = struct {
+        /* The request's URI as it came: "/api/users?page=2", where the nested router sees "/users?page=2". */
+        let value: str,
+        static let from_request = [axum.original_uri] (req: axum.Request) => OriginalUri OriginalUri(value: axum.original_uri(req))
+    }
+}
+
+export(original_uri)

@@ -1,0 +1,29 @@
+let axum = import("axum")
+let fields = import("axum_multipart")
+
+module multipart = {
+    /* Forms with files (the multipart feature, axum::extract::Multipart): multipart/form-data. */
+
+    let Multipart = struct {
+        /* The fields of a multipart/form-data body, one at a time: while form.next_field() { form.name() ... }.
+           A 400 for a body that is not one. */
+        let handle: fields.Multipart,
+        let next_field = [super, fields.next] () => bool fields.next(super.handle),
+        let name = [super, fields.name] () => str fields.name(super.handle),
+        let file_name = [super, fields.file_name] () => str fields.file_name(super.handle),
+        let content_type = [super, fields.content_type] () => str fields.content_type(super.handle),
+        let text = [super, fields.text] () => str fields.text(super.handle),
+        let size = [super, fields.size] () => i64 fields.size(super.handle),
+        let header = [super, fields.header] (name: str) => str fields.header(super.handle, name),
+        static let from_request = [fields.of, fields.error, axum.text] (req: axum.Request) => Result[Multipart, axum.Response] {
+            let found = fields.of(req)
+            let why = fields.error(found)
+            if why != "" {
+                return err(axum.text(400, why))
+            }
+            return ok(Multipart(handle: found))
+        }
+    }
+}
+
+export(multipart)

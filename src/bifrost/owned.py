@@ -16,9 +16,11 @@ import re
 from types import CodeType, FunctionType
 from typing import Any
 
-from mlir_python.lang import Fn, Program, Ptr, ptr, struct
+from mlir_python.lang import Fn, Program, Ptr, i32, ptr, stack, struct, u64
 from mlir_python.lang._types import FnType, ScalarType, StructType, function_type, scalar_type
 
+from bifrost.results import is_result
+from bifrost.results import parts as result_parts
 from bifrost.std import list_runtime
 
 _LIST = "List["
@@ -97,12 +99,32 @@ def closure_names(text: str) -> str:
     return re.sub(rf"\b{_CLOSURE}\d+\b", lambda match: _DISPLAYS.get(match.group(), match.group()), text)
 
 
+# C structs that are handles C frees (`drop:` in config.yaml): id of the struct -> (struct, drop, clone).
+_HANDLES: dict[int, tuple[type, Any, Any]] = {}
+
+
+def own_handle(cls: type, drop: Any, clone: Any) -> None:  # noqa: ANN401 - compiled C functions
+    """Make the C struct ``cls`` a handle Bifrost owns: freed with ``drop``, copied with ``clone`` (or never)."""
+    _HANDLES[id(cls)] = (cls, drop, clone)
+
+
+def handle_of(kind: object) -> tuple[Any, Any] | None:
+    """For a C struct Bifrost owns, its drop and clone functions (clone ``None`` if it cannot be copied)."""
+    found = scalar_type(kind)
+    entry = _HANDLES.get(id(found.python)) if isinstance(found, StructType) else None
+    return (entry[1], entry[2]) if entry is not None and entry[0] is found.python else None
+
+
 def owns(kind: object) -> bool:
-    """Whether a value of ``kind`` owns memory: a list, a closure, or a record or object holding one."""
+    """Whether a value of ``kind`` owns memory: a list, a closure, a C handle, or a record or object holding one."""
     kind = scalar_type(kind)
-    if is_list(kind) or kind == OWNED_STRING or is_closure(kind):
+    if is_list(kind) or kind == OWNED_STRING or is_closure(kind) or handle_of(kind) is not None:
         return True
     return isinstance(kind, StructType) and any(owns(field) for _, field in kind.fields)
+
+
+class CannotCopyError(ValueError):
+    """A value holding a C handle that has no clone function."""
 
 
 class Drops:
@@ -113,6 +135,7 @@ class Drops:
         self._functions: dict[tuple[str, ScalarType], Any] = {}
         self._environments: dict[tuple[tuple[str, ScalarType], ...], tuple[type, Any, Any]] = {}
         self._count = 0
+        self._memset: Any = None  # C's memset, declared when a zero value is first made
 
     def drop(self, kind: ScalarType) -> Any:  # noqa: ANN401 - a compiled function
         """Return the function that frees a ``kind`` value and all it owns."""
@@ -122,14 +145,83 @@ class Drops:
         """Return the function that makes a deep copy of a ``kind`` value."""
         return self._get("clone", kind)
 
+    def zero(self, kind: ScalarType) -> Any:  # noqa: ANN401 - a compiled function
+        """Return the function that makes a ``kind`` value of all zeros: what a ``Result`` holds on its unset side."""
+        return self._get("zero", kind)
+
     def _get(self, action: str, kind: ScalarType) -> Any:  # noqa: ANN401
-        if kind == OWNED_STRING:
+        if kind == OWNED_STRING and action != "zero":
             return list_runtime.bifrost_string_free if action == "drop" else list_runtime.bifrost_string_copy
         key = (action, kind)
         if key not in self._functions:
-            make = self._list if is_list(kind) else self._closure if is_closure(kind) else self._struct
+            if action == "zero":
+                make = self._zero
+            elif handle_of(kind) is not None:
+                make = self._handle
+            elif is_result(kind):
+                make = self._result
+            else:
+                make = self._list if is_list(kind) else self._closure if is_closure(kind) else self._struct
             self._functions[key] = make(action, kind)
         return self._functions[key]
+
+    def _handle(self, action: str, kind: ScalarType) -> Any:  # noqa: ANN401
+        """Free or copy a C handle: with the C functions config.yaml names (``drop:``, ``clone:``)."""
+        found = handle_of(kind)
+        assert found is not None
+        function = found[0] if action == "drop" else found[1]
+        if function is None:
+            raise CannotCopyError(f"a {kind.name} cannot be copied (its declaration in config.yaml has no clone)")
+        return function
+
+    def _zero(self, _action: str, kind: ScalarType) -> Any:  # noqa: ANN401
+        """Zero a slot on the stack, and read it: zero numbers, null pointers, an empty closure."""
+        if self._memset is None:
+
+            def memset(pointer: ptr, byte: i32, size: u64) -> ptr: ...
+
+            self._memset = self.program.extern(memset, name="memset")
+        names: dict[str, object] = {"Value": kind.python if isinstance(kind, StructType) else kind}
+        names |= {"stack": stack, "memset": self._memset, "u64": u64}
+        lines = [
+            "def {name}():",
+            "    slot = stack(Value)",
+            f"    memset(slot, 0, u64({kind.size}))",
+            "    return slot[0]",
+        ]
+        return self.function(lines, names, {"return": kind})
+
+    def _result(self, action: str, kind: ScalarType) -> Any:  # noqa: ANN401
+        """Free or copy a ``Result``: only the side it holds (the other is zero)."""
+        assert isinstance(kind, StructType)
+        value, error = result_parts(kind)
+        names: dict[str, object] = {"Value": kind.python}
+        sides = [("value", value), ("error", error)]
+        for field, held in sides:
+            if held is not None and owns(held):
+                names[f"{action}_{field}"] = self._get(action, held)
+            if held is not None and action == "clone":
+                names[f"zero_{field}"] = self.zero(held)
+        if action == "drop":
+            lines = ["def {name}(value):", "    if value.ok:"]
+            lines.append("        drop_value(value.value)" if "drop_value" in names else "        pass")
+            lines.append("    else:")
+            lines.append("        drop_error(value.error)" if "drop_error" in names else "        pass")
+            return self.function(lines, names, {"value": kind, "return": None})
+
+        def side(field: str) -> str:
+            return f"{field}=clone_{field}(value.{field})" if f"clone_{field}" in names else f"{field}=value.{field}"
+
+        has_value = value is not None
+        when_ok = ["ok=True", *([side("value")] if has_value else []), "error=zero_error()"]
+        when_err = ["ok=False", *(["value=zero_value()"] if has_value else []), side("error")]
+        lines = [
+            "def {name}(value):",
+            "    if value.ok:",
+            f"        return Value({', '.join(when_ok)})",
+            f"    return Value({', '.join(when_err)})",
+        ]
+        return self.function(lines, names, {"value": kind, "return": kind})
 
     def _closure(self, action: str, kind: ScalarType) -> Any:  # noqa: ANN401
         """Free or copy a closure: what it captured knows how (see ``environment``)."""
@@ -209,7 +301,8 @@ class Drops:
             "free": list_runtime.bifrost_list_free,
         }
         if action == "drop":
-            lines = ["def {name}(items):"]
+            names["is_null"] = list_runtime.bifrost_list_is_null
+            lines = ["def {name}(items):", "    if is_null(items):", "        return"]
             if deep:
                 names["inner"] = self.drop(element)
                 lines += [
@@ -275,12 +368,15 @@ class Drops:
 __all__ = [
     "CAPTURED",
     "OWNED_STRING",
+    "CannotCopyError",
     "Drops",
     "closure_names",
     "closure_of",
+    "handle_of",
     "is_closure",
     "is_list",
     "list_of",
+    "own_handle",
     "owns",
     "signature_of",
 ]

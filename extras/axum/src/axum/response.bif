@@ -1,0 +1,90 @@
+let axum = import("axum")
+
+module response = {
+    /* Responses: what handlers return (axum::response). An object with an into_response method is one,
+       and so is an axum.Response (axum.text, axum.html, axum.json, axum.redirect, axum.response). */
+
+    let OK = 200
+    let CREATED = 201
+    let ACCEPTED = 202
+    let NO_CONTENT = 204
+    let MOVED_PERMANENTLY = 301
+    let FOUND = 302
+    let SEE_OTHER = 303
+    let NOT_MODIFIED = 304
+    let TEMPORARY_REDIRECT = 307
+    let PERMANENT_REDIRECT = 308
+    let BAD_REQUEST = 400
+    let UNAUTHORIZED = 401
+    let FORBIDDEN = 403
+    let NOT_FOUND = 404
+    let METHOD_NOT_ALLOWED = 405
+    let CONFLICT = 409
+    let PAYLOAD_TOO_LARGE = 413
+    let UNSUPPORTED_MEDIA_TYPE = 415
+    let UNPROCESSABLE_ENTITY = 422
+    let TOO_MANY_REQUESTS = 429
+    let INTERNAL_SERVER_ERROR = 500
+    let NOT_IMPLEMENTED = 501
+    let SERVICE_UNAVAILABLE = 503
+
+    let StatusCode = struct {
+        /* A response of only a status: StatusCode(code: 404) (or a constant: response.NOT_FOUND). */
+        let code: i32,
+        let into_response = [super, axum.response] () => axum.Response axum.response(super.code)
+    }
+
+    let NoContent = struct {
+        /* 204, no body. */
+        let none: bool,
+        static let new = [] () => NoContent NoContent(none: false),
+        let into_response = [axum.response] () => axum.Response axum.response(204)
+    }
+
+    let Html = struct {
+        /* An HTML page (text/html). For text made at run time, return axum.html(200, text). */
+        let body: str,
+        let into_response = [super, axum.html] () => axum.Response axum.html(200, super.body)
+    }
+
+    let Text = struct {
+        /* Plain text (text/plain). For text made at run time, return axum.text(200, text). */
+        let body: str,
+        let into_response = [super, axum.text] () => axum.Response axum.text(200, super.body)
+    }
+
+    let Redirect = struct {
+        /* A redirect: Redirect.to (303 See Other), .temporary (307) or .permanent (308). */
+        let status: i32,
+        let location: str,
+        static let to = [] (uri: str) => Redirect Redirect(status: 303, location: uri),
+        static let temporary = [] (uri: str) => Redirect Redirect(status: 307, location: uri),
+        static let permanent = [] (uri: str) => Redirect Redirect(status: 308, location: uri),
+        let into_response = [super, axum.redirect] () => axum.Response axum.redirect(super.status, super.location)
+    }
+
+    let WithStatus[T] = struct {
+        /* Another response, with this status: (StatusCode, T) in axum. WithStatus(status: 201, inner: Json(value: user)). */
+        let status: i32,
+        let inner: T,
+        let into_response = [super, axum.set_status] () => axum.Response {
+            let made = super.inner.into_response()
+            axum.set_status(made, super.status)
+            return made
+        }
+    }
+
+    let WithHeader[T] = struct {
+        /* Another response, with this header added (AppendHeaders in axum). */
+        let name: str,
+        let value: str,
+        let inner: T,
+        let into_response = [super, axum.append_header] () => axum.Response {
+            let made = super.inner.into_response()
+            axum.append_header(made, super.name, super.value)
+            return made
+        }
+    }
+}
+
+export(response)

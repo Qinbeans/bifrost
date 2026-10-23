@@ -9,6 +9,12 @@ built into the compiler.
   strings are escaped, integers and floats written as numbers, bools as
   ``true``/``false``.
 
+- ``json.decode(text)``: the value JSON text holds, as a ``Result[T,
+  mem.Unique[str]]``: ``T`` is the type written where it goes (``let user:
+  Result[User, mem.Unique[str]] = json.decode(body)``), and the error says what
+  is wrong with the text. The compiler writes the decoder from ``T``'s fields
+  (see ``bifrost.decoding``); strings decoded are owned (``mem.Unique[str]``).
+
 A C function can take JSON too: a parameter declared ``json`` in
 ``config.yaml`` (``body: json``) receives a record or object encoded at the
 call, and freed after it; a ``str`` passes through as JSON text already.
@@ -23,6 +29,13 @@ ENCODE = Builtin(
     module="json",
 )
 
-FUNCTIONS = {builtin.name: builtin for builtin in (ENCODE,)}
+DECODE = Builtin(
+    "decode",
+    "(text: str) => Result[T, mem.Unique[str]]",
+    "the value JSON text holds, of the type written where it goes, or what is wrong with the text",
+    module="json",
+)
 
-__all__ = ["ENCODE", "FUNCTIONS"]
+FUNCTIONS = {builtin.name: builtin for builtin in (ENCODE, DECODE)}
+
+__all__ = ["DECODE", "ENCODE", "FUNCTIONS"]

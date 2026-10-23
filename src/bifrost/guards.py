@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from bifrost import pipes
+from bifrost import pipes, results
 
 _CELLS = {"mem.Shared", "mem.Atomic"}  # containers that may have several owners
 
@@ -282,12 +282,12 @@ class _Checker:
         scrutinee, *arms = _named(node)
         self.uses(scrutinee, state)
         paths: list[tuple[_State | None, str]] = []
-        has_default = False
+        has_default = results.exhaustive([_named(arm)[0] for arm in arms])  # `ok(v)` and `err(e)`
         for arm in arms:
             condition, body = _named(arm)
             if _unwrap(condition).type == "default_var":
                 has_default = True
-            else:
+            elif results.pattern(condition) is None:  # `ok(v)` binds v; it reads nothing
                 self.uses(condition, state)
             label = f"in the `{' '.join(_text(condition).split())}` arm (line {_line(arm)})"
             branch = state.copy()
@@ -330,22 +330,35 @@ class _Checker:
             return
         match node.type:
             case "local_function_definition":
-                return  # a lambda is a function of its own, checked when it is lowered
+                pass  # a lambda is a function of its own, checked when it is lowered
             case "identifier":
                 self.name(node, state, field_access=False, lent=self.is_argument(node))
-                return
             case "get_expression":
                 self.index_read(node, state)
-                return
             case "child_annotation":
                 self.chain(node, state)
-                return
             case "function_call":
                 self.arguments(node, state)
                 self.pause(node, state)
-                return
-        for child in _named(node):
-            self.uses(child, state)
+            case "try_expression":
+                for child in _named(node):
+                    self.uses(child, state)
+                self.early_return(node, state)
+            case _:
+                for child in _named(node):
+                    self.uses(child, state)
+
+    @staticmethod
+    def early_return(node: Node, state: _State) -> None:
+        """Reject ``x?`` while a guard is held: on an error it returns, which would skip the release."""
+        if not state.held:
+            return
+        lock = next(iter(state.held.values()))
+        msg = (
+            f"`?` may return here while {lock.guard} still holds {lock.source} (locked on line {_line(lock.node)}); "
+            f"release it first with {_release_hint(lock)}, or read the Result with match"
+        )
+        raise GuardError(node, msg)
 
     def index_read(self, node: Node, state: _State) -> None:
         """Check ``g[i]``, which reaches into what ``g`` holds, as ``g.x`` does."""

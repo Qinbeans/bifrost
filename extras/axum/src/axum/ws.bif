@@ -1,0 +1,49 @@
+let axum = import("axum")
+let socket = import("axum_ws")
+
+module ws = {
+    /* WebSockets (the ws feature, axum::extract::ws), on HTTP/1.1. A handler takes a WebSocketUpgrade,
+       accepts it, and talks over the socket until it returns:
+       let s = upgrade.accept(); while await ws.recv(s) { await ws.send(s, ws.text(s)) }; return ws.done(s) */
+
+    let WebSocketUpgrade = struct {
+        /* A websocket handshake: a 400 (axum's rejection) for a request that is not one. */
+        let request: axum.Request,
+        let accept = [super, socket.accept] () => socket.Socket socket.accept(super.request),
+        static let from_request = [socket.rejection, axum.text] (req: axum.Request) => Result[WebSocketUpgrade, axum.Response] {
+            let why = socket.rejection(req)
+            if why != "" {
+                return err(axum.text(400, why))
+            }
+            return ok(WebSocketUpgrade(request: req))
+        }
+    }
+
+    let TEXT = 1
+    let BINARY = 2
+    let CLOSE = 8
+
+    let recv = [socket.recv, socket.take] async (s: socket.Socket) => bool {
+        /* Wait for the next message: true when one came (ws.text, ws.kind), false once the socket closed. */
+        await socket.recv(s)
+        return socket.take(s)
+    }
+
+    let text = [socket.text] (s: socket.Socket) => str socket.text(s)
+    let kind = [socket.kind] (s: socket.Socket) => i32 socket.kind(s)
+    let closed = [socket.closed] (s: socket.Socket) => bool socket.closed(s)
+
+    let send = [socket.send] async (s: socket.Socket, message: str) => null {
+        /* Send a text message: it completes once it is written. */
+        await socket.send(s, message)
+    }
+
+    let close = [socket.close] (s: socket.Socket, code: i32, reason: str) => null socket.close(s, code, reason)
+
+    let done = [socket.done] (s: socket.Socket) => axum.Response {
+        /* Close the socket (if it is open): what a websocket handler returns. */
+        return socket.done(s)
+    }
+}
+
+export(ws)

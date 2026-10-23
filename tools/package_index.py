@@ -101,6 +101,9 @@ def check(folder: Path) -> list[str]:
     """
     raw = yaml.safe_load((folder / "config.yaml").read_text()) or {}
     libraries = [str(library) for library in raw.get("libraries", [])]
+    for feature in (raw.get("features") or {}).values():  # what features bring is linked too (all of them)
+        if isinstance(feature, dict):
+            libraries += [str(library) for library in feature.get("libraries", []) if str(library) not in libraries]
     archives = [str(folder / library) for library in libraries if "/" in library]
     if not archives:
         return []

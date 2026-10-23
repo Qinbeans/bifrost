@@ -1,0 +1,21 @@
+let axum = import("axum")
+
+module middleware = {
+    /* Middleware written as functions (axum::middleware): axum.from_fn(f), axum.map_request(f), axum.map_response(f). */
+
+    let Next = struct {
+        /* The rest of the stack, below a from_fn middleware: await next.run(req) gives its response. */
+        let handle: axum.Next,
+        let run = [
+            super,
+            axum.next_run,
+            axum.next_response
+        ] async (req: axum.Request) => axum.Response {
+            await axum.next_run(super.handle, req)
+            return axum.next_response(super.handle)
+        },
+        static let from_request = [axum.next_of] (req: axum.Request) => Next Next(handle: axum.next_of(req))
+    }
+}
+
+export(middleware)

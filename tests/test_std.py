@@ -56,7 +56,7 @@ def test_printf_program_runs(tmp_path: Path) -> None:
         (
             'let io = import("std:nope")\n',
             "unknown standard module 'std:nope' "
-            "(available: std:fmt, std:json, std:mem, std:stdio, std:tasks, std:time)",
+            "(available: std:fmt, std:form, std:json, std:mem, std:stdio, std:tasks, std:time)",
         ),
         (
             'let io = import("std:stdio")\nlet main = [io.puts] () => null {\n    io.puts("\\q")\n}\n',
@@ -84,7 +84,7 @@ def test_editor_knows_standard_modules(tmp_path: Path) -> None:
 
 
 def test_mem_is_a_builtin_standard_module(tmp_path: Path) -> None:
-    assert std.available() == ["fmt", "json", "mem", "stdio", "tasks", "time"]
+    assert std.available() == ["fmt", "form", "json", "mem", "stdio", "tasks", "time"]
     typing = Document.open(tmp_path / "x.bif", 'let mem = import("std:mem")\nlet f = (c: mem.) => null {}\n')
     assert [c.label for c in typing.completions((1, len("let f = (c: mem.")))] == [
         "Unique",
@@ -106,8 +106,9 @@ def test_import_suggests_modules() -> None:
     )
     completions = document.completions((0, len(source)))
     # Standard modules, then exported Bifrost modules (from src/), then config.yaml's.
-    assert [c.label for c in completions][:8] == [
+    assert [c.label for c in completions][:9] == [
         "std:fmt",
+        "std:form",
         "std:json",
         "std:mem",
         "std:stdio",

@@ -123,7 +123,17 @@ let main = [first, empty, apply, swap, double] () => null {
 
 A call's types come from its arguments' types (numbers written as arguments take the type the others give, or `f64` if one of them is one), or else from the type written where its value goes: `let none: i64[] = empty()`. A generic object's type is written with its types, `Pair[f64, i64]`. A generic compiles where it is defined, so a package's generic functions take the types of the app that calls them. Errors in a generic's body name the types it was compiled for: `in first[str]: ...`.
 
-A generic function is called, not passed as a value (pass a lambda calling it, `[first] (xs: i64[]) => i64 first(xs)`), and a generic object has no functions of its own yet: write a generic function that takes it.
+A generic function is called, not passed as a value (pass a lambda calling it, `[first] (xs: i64[]) => i64 first(xs)`).
+
+A generic object's own functions are compiled with each object type made from it: `Box[i64]`'s methods are found on a `Box[i64]` (`box.get()`), and its static functions are what the compiler calls for it (an [extractor](#http-servers)'s `from_request`):
+
+```bifrost
+let Box[T] = struct {
+    let value: T,
+    let get = [super] () => T super.value,
+    let mapped = [super] (f: (x: T) => T) => Box[T] Box(value: f(super.value))
+}
+```
 
 ### Objects
 
@@ -263,6 +273,8 @@ stdio.printf("%v\n", team)                          // core (2 members), from Te
 stdio.printf("%s\n", xs)                            // error: xs is a list, which %s cannot print; print it with %v
 ```
 
+Strings compare by their text: `name == "ada"`, `a < b` (in `strcmp`'s order).
+
 A string with values in braces interpolates them: `"Hello, {name}!"` is a new owned string, as `fmt.format` makes, with no import or dependency entry. Each `{value}` prints as `%v` does, and `{value:spec}` with a printf conversion (`{price:.2f}`), checked at compile time. In a printf pattern, interpolated values go where the pattern reads them. `{{` and `}}` are braces in the text:
 
 ```bifrost
@@ -305,7 +317,46 @@ let timed = [time.now, time.sleep] async (name: str, ms: i64) => Record {
 let point = [] (x: i64, y: i64) => #{x: i64, y: i64} #{x: x, y: y}
 ```
 
+`json.decode(text)` goes the other way: the value JSON text holds, of the type written where it goes, as a `Result` whose error says what is wrong with the text. The compiler writes the decoder from the type's fields; strings it makes are new, so a type decoded holds owned ones (`mem.Unique[str]`). `std:form`'s `form.decode` does the same with forms (`a=1&b=x+y`: query strings, form bodies):
+
+```bifrost
+let User = struct { let name: mem.Unique[str], let age: i64, let tags: mem.Unique[str][] }
+
+let found: Result[User, mem.Unique[str]] = json.decode(body)
+match found {
+    ok(user): io.printf("%s is %d\n", user.name, user.age),
+    err(why): io.printf("bad JSON: %s\n", why)      // missing field `age`, expected an integer at 9, ...
+}
+```
+
 Every `return` of a `Record` function must give a record of the same shape; if two differ, the compiler asks to consolidate them into one (or to write the type). The order of fields does not matter: `#{y: 2, x: 1}` is a `#{x: i64, y: i64}`.
+
+### Results
+
+A function that can fail returns a `Result[T, E]`: a value of type `T`, or an error of type `E` that says why there is none. `ok(value)` and `err(error)` make one, of the type written where it goes (the function's result, a `let`'s type, a parameter's); `match` reads either side, and `?` passes an error on:
+
+```bifrost
+let parse_age = [] (n: i64) => Result[i64, str] {
+    if n < 0 {
+        return err("negative")
+    }
+    return ok(n)
+}
+
+let next_age = [parse_age] (n: i64) => Result[i64, str] {
+    let age = parse_age(n)?             // the value, or else return the error from next_age
+    return ok(age + 1)
+}
+
+let show = [io.printf] (r: Result[i64, str]) => null {
+    match r {
+        ok(age): io.printf("%d\n", age),
+        err(why): io.printf("no: %s\n", why)
+    }
+}
+```
+
+`x?` is the value `x` holds; if it holds an error, the function returns it at once, freeing what is alive as `return` does, so its result must be a `Result` with the same error type (and no guard may be held). `Result[null, E]` says only whether something worked: `ok()`, and `check()?` as a statement. In a `match`, `ok(v)` binds the value and `err(e)` the error (`_` binds nothing); the two arms cover every Result. `r.is_ok()` and `r.is_err()` say which it holds. A Result owns what it holds, and frees only the side it holds; a `match` on one that owns names it first (`let r = find(id)`).
 
 ### Lists
 
@@ -401,6 +452,19 @@ A list has one owner, like an owned string: the `let` holding it, freed at the e
 Numbers convert by calling their type: `i32(x / 2)`, `f32(column)`, `i64(2.9)` (a float becomes an integer toward zero). `/` always divides as floats, so `i32((800 - width) / 2)` centers. `copy`, `i32` and the others are the language's own functions: they need no import or dependency entry, and a local of the same name hides them.
 
 ### HTTP servers
+
+[`extras/axum`](./extras/axum) is [axum](https://docs.rs/axum/latest/axum/) for Bifrost: routers built with pipes, handlers that are any functions (their parameters are extractors: `extract.Path[i64]`, `json.Json[NewUser]`, the state as a `mem.Shared`), middleware written as functions, server-sent events and websockets, served on h2o. Its README maps axum's API to Bifrost's; [`examples/axum`](./examples/axum) is a JSON API built with it:
+
+```bifrost
+let show_user = [find] (state: mem.Shared[AppState], id: extract.Path[i64]) => Result[json.Json[User], ApiError] { ... }
+
+let app = [axum.router, axum.route, axum.get, axum.layer, axum.from_fn, axum.with_state, show_user, timing] (state: mem.Shared[AppState]) => axum.Router {
+    return axum.router()
+        |> axum.route("/users/:id", axum.get(show_user))
+        |> axum.layer(axum.from_fn(timing))
+        |> axum.with_state(state)
+}
+```
 
 `examples/http` is a JSON API on [h2o](https://github.com/h2o/h2o), serving HTTP/1.1, HTTP/2 and, with a certificate, HTTP/3. Its `http` library is a package, [`extras/http-server`](./extras/http-server): a small C wrapper (`c/http.c`) built with CMake and declared in the package's `config.yaml`, and a Bifrost module of ready-made handlers. Routes take handlers, fasthttp style, since functions are values:
 
@@ -582,6 +646,10 @@ externs:
 
 Library paths are relative to `config.yaml`. A parameter that takes a C callback has a function type, `handler: "(http_Context) => None"`: Bifrost passes it a function (or a lambda), and C calls it back. A declaration's `as:` gives it a Bifrost name other than the default, and `doc:` a line shown in the editor.
 
+A struct that is a handle C allocates says how C frees it, `drop: axum_response_free` (and copies it, `clone: ...`): Bifrost then owns each one a C function returns, as it owns a list, and frees it where its owner's scope ends, unless it moves on (returned, or put in a value that is kept).
+
+A parameter declared `handler(axum_Request) => axum_Response` takes any function, whose parameters are extractors: the compiler writes the adapter C calls, `(request, state, out) => token`, which gives each parameter its value by its type (the request; the state, for a `mem.Shared` or `mem.Atomic`; for an object type, what its `static let from_request = (req: Request) => ...` returns, a `Result`'s error being the response instead), calls the function, and puts what it returns in `*out`: a response, an object's `into_response()`, or a `Result` of those. This is how [axum](./extras/axum)'s handlers are any functions.
+
 Writing `externs` by hand is rarely needed: `bfc config traverse` reads the headers with libclang and generates them, one module per header. It reports each declaration it skips and why (variadic functions, structs with array members, C++ functions without `extern "C"`, ...).
 
 ## Packages
@@ -594,6 +662,20 @@ package:
   version: 0.2.0
   build: library      # the default is `executable`: `bfc build` compiles package.entry
 ```
+
+A package can have features, as Cargo's crates do: parts used only when asked for. Each is named in its `config.yaml`, with what it turns on (other features, and Bifrost files, extern modules and libraries only it brings); `default` lists those on unless a user turns them off:
+
+```yaml
+features:
+  default: [json]
+  json:
+    modules: [axum.json]          # src/axum/json.bif: only importable with it
+  ws:
+    externs: [axum_ws]            # declared only with it
+    libraries: [./build/lib/libaxum_ws.a]   # linked only with it
+```
+
+A project picks a package's features where it lists it, `axum: {version: 0.1.0, features: [ws], default-features: false}`; a package used by several gets all the features they ask for. Importing a file of a feature that is off is an error saying which to turn on. A project's own features are its defaults, or what `bfc build --features a,b` (`--no-default-features`) gives.
 
 `bfc build` refuses a library, and `bfc package` anything else. `bfc package` makes it a `.bifpkg` file in `dist/`, a gzipped tarball named like a Python wheel:
 
@@ -632,17 +714,19 @@ bifrost/
 │   ├── syntax.py          # Describes syntax errors in terms of the source
 │   ├── guards.py          # Checks locks and releases along every path
 │   ├── ownership.py       # Checks moves of owned values, and plans where they are freed
+│   ├── results.py         # Result[T, E]: its types, and its match patterns
+│   ├── decoding.py        # The decoders json.decode and form.decode compile to
 │   ├── pipes.py           # Reads `x |> f(a)` as the call `f(x, a)`, for every check and the lowering
 │   ├── generics.py        # Generic functions and objects, and what each was compiled for
 │   ├── lowering/          # Checks a CST (dependencies, names), loads imported modules, and lowers to Python AST
 │   ├── project/           # Declares configured and standard externs; builds the executable
-│   ├── configs/           # config.yaml schema, and header traversal (libclang)
-│   ├── std/               # Standard modules: stdio.yaml, and mem, fmt and json (built in)
+│   ├── configs/           # config.yaml schema, features, and header traversal (libclang)
+│   ├── std/               # Standard modules: stdio.yaml, mem, fmt, json, form and tasks (built in), C runtimes
 │   ├── naming.py          # snake_case / PascalCase checks and conversions
 │   ├── formatter/         # The formatter
 │   └── server/            # The language server (pygls) and its analysis
-├── examples/              # http, raylib, breakout and async apps, and simple
-├── extras/                # packages (http-server, raylib, game-engine) and the VS Code extension
+├── examples/              # http, axum, raylib, breakout and async apps, and simple
+├── extras/                # packages (axum, http-server, raylib, game-engine) and the VS Code extension
 ├── tools/                 # package_index.py: which packages CI builds, and their index page
 └── tests/
 ```
@@ -740,7 +824,8 @@ uv run ruff format     # format
 - **Trailing commas**
 - **More of packages**: `bfc add`, and packages for macOS and Windows
 - **Quick fixes** in the language server, such as adding a missing dependency
-- **More of generics**: a generic object's own functions, constraints on type parameters, generic functions as values, and type arguments written at a call (`empty[i64]()`)
+- **More of generics**: constraints on type parameters, generic functions as values, and type arguments written at a call (`empty[i64]()`), which would also let code call a generic object's static functions
+- **Passing ownership** of values other than strings to a function (a `mem.Unique[T]` parameter), and converting errors with `?` (Rust's `From`)
 
 ## Project Goals
 

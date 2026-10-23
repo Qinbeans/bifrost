@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 
 from tree_sitter import Node
 
-from bifrost import pipes
+from bifrost import pipes, results
 
 
 class OwnershipError(Exception):
@@ -315,10 +315,10 @@ class _Checker:
     def guard(self, item: Node) -> None:
         """Follow which local each guard locks, so that a field changed through it changes that local's."""
         guard, source = item.child_by_field_name("guard"), item.child_by_field_name("source")
+        # Kept after a release: a release on one path (before an early return) does not end the lock on
+        # others, and `guards` already rejects a guard used once released.
         if item.type == "lock" and guard is not None and source is not None:
             self.guards[_text(guard)] = _root(source) or ""
-        elif item.type == "release" and guard is not None:
-            self.guards.pop(_text(guard), None)
 
     def view(self, name: str, value: Node, item: Node, block: Node, state: _State) -> None:
         """Make ``name`` a view of what ``value`` reads, which is then not moved while the view is alive."""
@@ -432,15 +432,20 @@ class _Checker:
         scrutinee, *arms = _named(node)
         self.expression(scrutinee, state)
         paths: list[tuple[_State | None, str]] = []
-        has_default = False
+        has_default = results.exhaustive([_named(arm)[0] for arm in arms])  # `ok(v)` and `err(e)`
         for arm in arms:
             condition, body = _named(arm)
+            pattern = results.pattern(condition)
             if _unwrap(condition).type == "default_var":
                 has_default = True
-            else:
+            elif pattern is None:
                 self.expression(condition, state)
             label = f"in the `{' '.join(_text(condition).split())}` arm (line {_line(arm)})"
             branch = state.copy()
+            if pattern is not None and pattern[1] is not None:  # `ok(v)`: v reads the Result's value
+                self.oracle.bind(_text(pattern[1]), arm)
+                block = body if body.type == "block_expression" else arm
+                self.view(_text(pattern[1]), scrutinee, arm, block, branch)
             paths.append(
                 (self.block(body, branch) if body.type == "block_expression" else self.item(body, branch), label)
             )
@@ -481,6 +486,8 @@ class _Checker:
             return inner.type == "list" or (inner.type in {"record", "string"} and self.oracle.owned_value(core))
         if core.type == "get_expression" and _named(core)[1].type in {"spread_between", "rest_of", "spread_action"}:
             return True  # a slice: a new list
+        if core.type == "try_expression":
+            return self.oracle.owned_value(core)  # the value taken out of a new Result
         # `await f()` has the type of what it waits for.
         return _call_arguments(core) is not None and self.oracle.owned_value(_unwrap(node))
 
@@ -497,7 +504,7 @@ class _Checker:
         if core.type == "literal" and _named(core)[0].type in {"list", "record"}:
             self.literal(_named(core)[0], state)
             return
-        if core.type == "get_expression":  # a slice copies what it reads
+        if core.type in {"get_expression", "try_expression"}:  # a slice copies; `f()?` takes f()'s value
             self.expression(core, state)
             return
         arguments = _call_arguments(core)
@@ -582,7 +589,9 @@ class _Checker:
             self.captures(node, state)  # its body is a function of its own, checked when it is lowered
             return
         arguments = _call_arguments(node)
-        if arguments is not None:
+        if node.type == "try_expression":
+            self.try_(node, state)
+        elif arguments is not None:
             self.call(node, arguments, state, owned=owned)
         elif node.type == "identifier":
             self.name(node, state)
@@ -591,6 +600,17 @@ class _Checker:
         else:
             for child in _named(node):
                 self.expression(child, state)
+
+    def try_(self, node: Node, state: _State) -> None:
+        """``r?``: r is used up (its value or its error moves on), and on an error the function returns here."""
+        value = node.child_by_field_name("value")
+        inner = _unwrap(value) if value is not None else None
+        if inner is not None and inner.type == "identifier" and _text(inner) in state.alive:
+            self.move(inner, state, node)
+        else:
+            self.expression(value, state, owned=True)
+        if state.alive:
+            self.plan.before_return[node.id] = list(state.alive)
 
     def captures(self, node: Node, state: _State) -> None:
         """Check what a lambda captures: copies of the locals its dependency list names (an owned one moves in).

@@ -1,0 +1,16 @@
+package:
+  name: axum_example
+  version: 0.1.0
+  description: A JSON API with axum (routes, extractors, state, middleware, server-sent events)
+  entry: src/axum_example/main.bif
+  type: async
+
+flags:
+  optimization: 2
+  linker: clang
+
+# axum, from extras/ (published to the default index as `axum: 0.1.0`)
+packages:
+  axum:
+    path: ../../extras/axum
+    features: [http2]

@@ -1,0 +1,44 @@
+let axum = import("axum")
+
+module sse = {
+    /* Server-sent events (axum::response::sse): start a stream on the request, send events, and return.
+       let stream = sse.start(req); await sse.send(stream, sse.Event.of("hi")); return sse.end(stream) */
+
+    let Event = struct {
+        /* One event: its data (lines), and optionally its name, id and the retry time it asks of clients (ms). */
+        let data: str,
+        let event: str,
+        let id: str,
+        let retry: i64,
+        static let of = [] (text: str) => Event Event(data: text, event: "", id: "", retry: 0),
+        static let named = [] (name: str, text: str) => Event Event(data: text, event: name, id: "", retry: 0)
+    }
+
+    let start = [axum.stream_open] (req: axum.Request) => axum.Stream {
+        /* Start the response (200, text/event-stream) now; its events follow. */
+        return axum.stream_open(req, 200, "text/event-stream")
+    }
+
+    let send = [axum.sse_send] async (stream: axum.Stream, event: Event) => null {
+        /* Send an event: it completes once the event is taken (a slow client slows the sender down). */
+        await axum.sse_send(stream, event.event, event.data, event.id, event.retry)
+    }
+
+    let keep_alive = [
+        axum.stream_keep_alive
+    ] (stream: axum.Stream, milliseconds: i64) => null {
+        /* Send a comment every so often while no event is sent, so proxies keep the stream open (KeepAlive). */
+        axum.stream_keep_alive(stream, milliseconds, ":\n\n")
+    }
+
+    let closed = [axum.stream_closed] (stream: axum.Stream) => bool axum.stream_closed(
+        stream
+    )
+
+    let end = [axum.stream_response] (stream: axum.Stream) => axum.Response {
+        /* End the stream: what the handler returns. */
+        return axum.stream_response(stream)
+    }
+}
+
+export(sse)

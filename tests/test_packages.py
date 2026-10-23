@@ -188,7 +188,7 @@ def test_a_package_from_a_url_index(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             "index:\n  mine: ../index\npackages:\n  greeting:\n    index: mine\n",
             "a package from index mine needs its version:",
         ),
-        ("packages:\n  greeting:\n    version: 0.2.0\n", "give one of path: and index:"),
+        ("packages:\n  greeting:\n    features: [loud]\n", "give one of version:, path: and index:"),
         ("index: ../index\n", "index: names its indexes"),
         ("packages:\n  greeting:\n    path: ../greeting\n    version: 1.0.0\n", "package greeting is version 0.2.0"),
         ("packages:\n  other:\n    path: ../greeting\n", "package other is named greeting in its config.yaml"),

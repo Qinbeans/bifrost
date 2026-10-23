@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
 
-      # What the packages' C libraries build with: h2o (http_server) needs
+      # What the packages' C libraries build with: h2o (http_server, axum) needs
       # OpenSSL and zlib; raylib, X11, Wayland (and wayland-scanner) and OpenGL.
       - name: Install build tools and libraries
         if: matrix.native

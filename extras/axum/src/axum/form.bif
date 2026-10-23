@@ -1,0 +1,66 @@
+let axum = import("axum")
+let std_form = import("std:form")
+let mem = import("std:mem")
+
+module form = {
+    /* Form bodies (the form feature): what an HTML form submits, application/x-www-form-urlencoded. */
+
+    let Form[T] = struct {
+        /* A form as T (a record or object, by name): a POST's body, or a GET's query. A 415 without
+           Content-Type: application/x-www-form-urlencoded, a 422 (or, from a query, 400) when it does not fit T. */
+        let value: T,
+        static let from_request = [
+            axum.method,
+            axum.query,
+            axum.body,
+            axum.content_type_is,
+            axum.text,
+            std_form.decode
+        ] (req: axum.Request) => Result[Form[T], axum.Response] {
+            let method = axum.method(req)
+            let from_query = method == "GET" || method == "HEAD"
+            if !from_query && !axum.content_type_is(
+                req,
+                "application/x-www-form-urlencoded",
+                ""
+            ) {
+                return err(
+                    axum.text(415, "Form requests must have `Content-Type: application/x-www-form-urlencoded`")
+                )
+            }
+            let text = if from_query {
+                axum.query(req)
+            } else {
+                axum.body(req)
+            }
+            let found: Result[T, mem.Unique[str]] = std_form.decode(text)
+            match found {
+                ok(v): return ok(Form(value: copy(v))),
+                err(e): {
+                    if from_query {
+                        return err(axum.text(400, "Failed to deserialize form: {e}"))
+                    }
+                    return err(axum.text(422, "Failed to deserialize form body: {e}"))
+                }
+            }
+        }
+    }
+
+    let RawForm = struct {
+        /* A form as it came (a POST's body, or a GET's query), not decoded. */
+        let value: str,
+        static let from_request = [
+            axum.method,
+            axum.query,
+            axum.body
+        ] (req: axum.Request) => RawForm {
+            let method = axum.method(req)
+            if method == "GET" || method == "HEAD" {
+                return RawForm(value: axum.query(req))
+            }
+            return RawForm(value: axum.body(req))
+        }
+    }
+}
+
+export(form)

@@ -177,5 +177,12 @@ def bifrost_env_free(env: ptr) -> None:
 
 @runtime.function
 def bifrost_list_free(items: ptr) -> None:
-    """Free the list itself (what its items own is freed first, by its drop function)."""
-    c_free(Ptr[i64](items) - 2)
+    """Free the list itself (what its items own is freed first, by its drop function); a null list is none."""
+    if items != ptr(0):
+        c_free(Ptr[i64](items) - 2)
+
+
+@runtime.function
+def bifrost_list_is_null(items: ptr) -> bool:
+    """Whether a list is the null one a zero value holds (a Result's unset side, a value decoded in part)."""
+    return items == ptr(0)
