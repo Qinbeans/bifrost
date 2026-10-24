@@ -7,6 +7,7 @@ let middleware = import("axum.middleware:middleware")
 let sse = import("axum.sse:sse")
 let mem = import("std:mem")
 let io = import("std:stdio")
+let fs = import("std:fs")
 let time = import("std:time")
 
 let User = struct { let id: i64, let name: mem.Unique[str] }
@@ -20,9 +21,14 @@ let ApiError = struct {
     let into_response = [super, axum.json] () => axum.Response axum.json(super.status, #{error: super.message})
 }
 
-let root = [] () => response.Html response.Html(
-    body: "<h1>Hello from axum on Bifrost</h1>"
-)
+let root = [fs.read_to_string, axum.text] () => Result[response.Html[mem.Unique[str]], axum.Response] {
+    /* The page in index.html (read on each request: edit it and reload) */
+    let page = fs.read_to_string("index.html")
+    match page {
+        ok(text): return ok(response.Html(body: copy(text))),
+        err(e): return err(axum.text(500, e))
+    }
+}
 
 let list_users = [] (state: mem.Shared[AppState]) => json.Json[User[]] {
     let s <- state

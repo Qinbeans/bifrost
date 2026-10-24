@@ -7,8 +7,9 @@
 # tree-sitter-bifrost, then lists it:
 #   uv tool install bifrost-lang --find-links https://qinbeans.github.io/mlir-python/
 # Bifrost packages (`<name>-v<version>` tags) release from packages.yml, the
-# same way. A push changing pyproject.toml without a new version, a pull
-# request changing it, or a run by hand builds and tests without releasing.
+# same way. Running it by hand releases a version not yet released (after a
+# failed run, say); a push without a new version, or a pull request, builds and
+# tests without releasing.
 name: Release
 
 on:
@@ -39,7 +40,7 @@ jobs:
         run: |
           version=$(uv version --short)
           release=false
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
               echo "v$version is released already"
             else

@@ -9,8 +9,11 @@ flags:
   optimization: 2
   linker: clang
 
-# axum, from extras/ (published to the default index as `axum: 0.1.0`)
+# axum, from the package index (built from extras/axum and published there)
 packages:
   axum:
-    path: ../../extras/axum
-    features: [http2]
+    index: bifrost_extras
+    version: 0.3.0
+
+index:
+  bifrost_extras: https://qinbeans.github.io/bifrost/packages/
