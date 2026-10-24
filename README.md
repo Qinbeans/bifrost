@@ -779,12 +779,11 @@ uv sync --extra dev
 uv run pytest
 ```
 
-To release it, bump the version and push its tag: `.github/workflows/release.yml` tests the compiler, checks that the wheel installs and builds a new project, and publishes it as release `v<version>`, which the index then lists.
+To release it, bump the version and push it to `main`: when there is no tag `v<version>` yet, `.github/workflows/release.yml` tests the compiler, checks that the wheel installs and builds a new project, and publishes it as release `v<version>`, creating the tag; the index then lists it. Packages in `extras/` release the same way, when their `package.version` changes.
 
 ```bash
 uv version --bump patch
-git commit -am "release $(uv version --short)"
-git tag "v$(uv version --short)" && git push origin main "v$(uv version --short)"
+git commit -am "release $(uv version --short)" && git push
 ```
 
 ## Usage

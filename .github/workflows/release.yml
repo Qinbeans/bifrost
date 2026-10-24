@@ -1,35 +1,62 @@
 # Releases the compiler. Releasing is bumping `version` in pyproject.toml
-# (`uv version --bump patch`) and pushing a tag `v<version>`: the compiler is
-# tested, built (one pure-Python wheel and an sdist), installed fresh the way
-# users install it, and attached to release `v<version>`. The package index at
+# (`uv version --bump patch`) and pushing it to main: when no tag `v<version>`
+# exists yet, the compiler is tested, built (one pure-Python wheel and an sdist),
+# installed fresh the way users install it, and published as release
+# `v<version>` (creating the tag at that commit). The package index at
 # https://qinbeans.github.io/mlir-python/, which also lists mlir-python and
 # tree-sitter-bifrost, then lists it:
 #   uv tool install bifrost-lang --find-links https://qinbeans.github.io/mlir-python/
-# Bifrost packages (`<name>-v<version>` tags) release from packages.yml instead.
-# Running it by hand builds and tests without releasing.
+# Bifrost packages (`<name>-v<version>` tags) release from packages.yml, the
+# same way. A push changing pyproject.toml without a new version, a pull
+# request changing it, or a run by hand builds and tests without releasing.
 name: Release
 
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: [main]
+    # A version bump; or this workflow changed, which releases a version not yet released.
+    paths: ["pyproject.toml", ".github/workflows/release.yml"]
+  pull_request:
+    paths: ["pyproject.toml", ".github/workflows/release.yml"]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a run on main: it may be publishing a release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  plan:
+    name: Find a new version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - id: plan
+        run: |
+          version=$(uv version --short)
+          release=false
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+              echo "v$version is released already"
+            else
+              release=true
+              echo "v$version is new: releasing it"
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
   build:
-    name: Test and build
+    name: Test and build ${{ needs.plan.outputs.version }}
+    needs: plan
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-
-      - name: Check the tag matches pyproject.toml
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          version=$(uv version --short)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME, but pyproject.toml's version is $version"
-            exit 1
-          fi
 
       # clang links what bfc compiles; the runner image has it.
       - name: Test
@@ -60,9 +87,9 @@ jobs:
           path: dist/*
 
   release:
-    name: Release ${{ github.ref_name }}
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Release v${{ needs.plan.outputs.version }}
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -71,15 +98,16 @@ jobs:
         with:
           name: dist
           path: dist
-      - id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # Creates the tag at this commit.
       - uses: softprops/action-gh-release@v3
         with:
-          name: bifrost ${{ github.ref_name }}
+          tag_name: v${{ needs.plan.outputs.version }}
+          name: bifrost v${{ needs.plan.outputs.version }}
+          target_commitish: ${{ github.sha }}
           body: |
             The Bifrost compiler, `bfc`. Install it with
             ```
-            uv tool install bifrost-lang==${{ steps.version.outputs.version }} --find-links https://qinbeans.github.io/mlir-python/
+            uv tool install bifrost-lang==${{ needs.plan.outputs.version }} --find-links https://qinbeans.github.io/mlir-python/
             ```
           # The compiler's releases are the latest, not a package's (see packages.yml).
           make_latest: true
