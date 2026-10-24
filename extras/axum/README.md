@@ -36,7 +36,7 @@ let main = [app, axum.bind, axum.serve] async () => null {
 package:
   type: async            # axum.serve is awaited: main is async
 packages:
-  axum: 0.2.0            # or {path: ../extras/axum}, or {version: 0.2.0, features: [ws]}
+  axum: 0.3.0            # or {path: ../extras/axum}, or {version: 0.3.0, features: [ws]}
 ```
 
 ## How axum's API reads here
@@ -103,7 +103,7 @@ The extractors:
 
 ### Responses
 
-`axum.response` (the module, `import("axum.response:response")`) has axum's `IntoResponse` types as objects: `Html(body: ...)`, `Text(body: ...)`, `Redirect.to(uri)` (303) / `.temporary` (307) / `.permanent` (308), `StatusCode(code: 404)`, `NoContent.new()`, `WithStatus(status: 201, inner: json.Json(value: user))` (axum's `(StatusCode, T)`), `WithHeader(name: ..., value: ..., inner: ...)` (`AppendHeaders`), and constants (`response.NOT_FOUND`). An `axum.Response` is a handle Bifrost owns: it is freed where its owner's scope ends unless it is returned, and `axum.set_status`, `axum.set_header`, `axum.append_header`, `axum.remove_header` and `axum.set_body` change it.
+`axum.response` (the module, `import("axum.response:response")`) has axum's `IntoResponse` types as objects: `Html(body: ...)`, `Text(body: ...)` (axum's `Html<T>`: `Html[str]` lends a literal, `Html[mem.Unique[str]]` owns text made at run time, like a file's), `Redirect.to(uri)` (303) / `.temporary` (307) / `.permanent` (308), `StatusCode(code: 404)`, `NoContent.new()`, `WithStatus(status: 201, inner: json.Json(value: user))` (axum's `(StatusCode, T)`), `WithHeader(name: ..., value: ..., inner: ...)` (`AppendHeaders`), and constants (`response.NOT_FOUND`). An `axum.Response` is a handle Bifrost owns: it is freed where its owner's scope ends unless it is returned, and `axum.set_status`, `axum.set_header`, `axum.append_header`, `axum.remove_header` and `axum.set_body` change it.
 
 Your own error type is an object with `into_response`, and a handler returning `Result[T, AppError]` answers with either side, as in axum:
 
@@ -187,7 +187,7 @@ axum.router()
     |> axum.fallback_service(axum.serve_file("404.html"))
 ```
 
-It answers GET and HEAD with the file, its type from its extension (`text/html`, `image/png`, ..., or `application/octet-stream`; `serve_file_with_mime` gives one), `Last-Modified` and `Accept-Ranges`. `If-Modified-Since` gets a 304 when the file has not changed and `If-Unmodified-Since` a 412 when it has; one `Range: bytes=...` gets a 206 of that part (a 416 past the end; several ranges get the whole file). A missing file is a 404, another method a 405. The path is relative to where the server runs, and the file is read on each request (whole, into memory), so a change shows at once. Layers wrap a service as they wrap handlers. To make a page from a file's text instead, read it with `std:fs` in a handler.
+It answers GET and HEAD with the file, its type from its extension (`text/html`, `image/png`, ..., or `application/octet-stream`; `serve_file_with_mime` gives one), `Last-Modified` and `Accept-Ranges`. `If-Modified-Since` gets a 304 when the file has not changed and `If-Unmodified-Since` a 412 when it has; one `Range: bytes=...` gets a 206 of that part (a 416 past the end; several ranges get the whole file). A missing file is a 404, another method a 405. The path is relative to where the server runs, and the file is read on each request (whole, into memory), so a change shows at once. Layers wrap a service as they wrap handlers. To make a page from a file's text instead, read it with `std:fs` in a handler and return it as a `response.Html[mem.Unique[str]]`.
 
 ## Features
 
@@ -214,7 +214,7 @@ h2o needs OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt inst
 
 ```bash
 cmake -B build -G Ninja && cmake --build build      # h2o (pinned), c/axum.c, and the features' libraries
-bfc package                                         # dist/axum-0.2.0-<target>.bifpkg
+bfc package                                         # dist/axum-0.3.0-<target>.bifpkg
 ```
 
 The C side is `c/axum.c` (routers, middleware, requests, responses, the server), `c/stream.c` (streamed bodies), `c/ws.c` and `c/multipart.c` (their features), and `c/features/` (one flag each for the features the C side reads). `tests/test_axum.py` drives a server built from all of it over HTTP.

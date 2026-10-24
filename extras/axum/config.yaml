@@ -4,7 +4,7 @@
 # and the compiler writes what extracts its parameters and makes its response.
 package:
   name: axum
-  version: 0.2.0
+  version: 0.3.0
   build: library
   description: 'axum for Bifrost: routers of handlers that take extractors, middleware, and a server on h2o (HTTP/1.1, HTTP/2,
     HTTP/3)'

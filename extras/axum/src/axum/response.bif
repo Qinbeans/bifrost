@@ -41,15 +41,16 @@ module response = {
         let into_response = [axum.response] () => axum.Response axum.response(204)
     }
 
-    let Html = struct {
-        /* An HTML page (text/html). For text made at run time, return axum.html(200, text). */
-        let body: str,
+    let Html[T] = struct {
+        /* An HTML page (text/html), as axum's Html<T>: Html[str] lends its text (a literal),
+           Html[mem.Unique[str]] owns text made at run time (a file read, fmt.format). */
+        let body: T,
         let into_response = [super, axum.html] () => axum.Response axum.html(200, super.body)
     }
 
-    let Text = struct {
-        /* Plain text (text/plain). For text made at run time, return axum.text(200, text). */
-        let body: str,
+    let Text[T] = struct {
+        /* Plain text (text/plain): Text[str] lends its text, Text[mem.Unique[str]] owns it. */
+        let body: T,
         let into_response = [super, axum.text] () => axum.Response axum.text(200, super.body)
     }
 

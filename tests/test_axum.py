@@ -39,6 +39,8 @@ let ws = import("axum.ws:ws")
 let multipart = import("axum.multipart:multipart")
 let mem = import("std:mem")
 let io = import("std:stdio")
+let fmt = import("std:fmt")
+let fs = import("std:fs")
 
 let Counter = struct { let hits: i64 }
 let Login = struct { let user: mem.Unique[str], let remember: bool }
@@ -103,10 +105,31 @@ let files = [axum.text] (uri: extract.Uri) => axum.Response axum.text(
 )
 let teapot = [axum.text] () => axum.Response axum.text(418, "only GET here")
 let nested_missing = [axum.text] () => axum.Response axum.text(404, "no such api")
-let created = [] () => response.WithStatus[response.Text] response.WithStatus(
+let created = [] () => response.WithStatus[response.Text[str]] response.WithStatus(
     status: 201,
     inner: response.Text(body: "made")
 )
+let lent_page = [] () => response.Html[str] response.Html(body: "<p>lent</p>")
+let made_page = [fmt.format] (counter: mem.Shared[Counter]) => response.Html[mem.Unique[str]] {
+    let c <- counter
+    let hits = c.hits
+    c -> counter
+    return response.Html(body: fmt.format("<p>%d hits</p>", hits))
+}
+let file_page = [fs.read_to_string, axum.text] () => Result[response.Html[mem.Unique[str]], axum.Response] {
+    let page = fs.read_to_string("page.html")
+    match page {
+        ok(text): return ok(response.Html(body: copy(text))),
+        err(e): return err(axum.text(500, e))
+    }
+}
+let file_text = [fs.read_to_string, axum.text] () => Result[response.Text[mem.Unique[str]], axum.Response] {
+    let notes = fs.read_to_string("missing.md")
+    match notes {
+        ok(text): return ok(response.Text(body: copy(text))),
+        err(e): return err(axum.text(500, e))
+    }
+}
 let moved = [response.Redirect.permanent] () => response.Redirect response.Redirect.permanent(
     "/static"
 )
@@ -225,6 +248,10 @@ let app = [
     axum.fallback_service,
     axum.serve_file,
     axum.serve_file_with_mime,
+    lent_page,
+    made_page,
+    file_page,
+    file_text,
     api,
     extra,
     hit,
@@ -269,6 +296,10 @@ let app = [
         |> axum.route("/chat", axum.get(chat))
         |> axum.route("/upload", axum.post(upload))
         |> axum.route("/page", axum.get_service(axum.serve_file("page.html")))
+        |> axum.route("/lent", axum.get(lent_page))
+        |> axum.route("/made", axum.get(made_page))
+        |> axum.route("/file-page", axum.get(file_page))
+        |> axum.route("/file-text", axum.get(file_text))
         |> axum.route("/logo", axum.get_service(axum.serve_file("logo.png")))
         |> axum.route("/notes", axum.any_service(axum.serve_file_with_mime("notes.md", "text/markdown; charset=utf-8")))
         |> axum.route("/gone", axum.get_service(axum.serve_file("missing.txt")))
@@ -525,6 +556,15 @@ def _raw(port: int, method: str, path: str, headers: dict[str, str] | None = Non
     body = answer.read()
     connection.close()
     return answer.status, {name.lower(): value for name, value in answer.getheaders()}, body
+
+
+def test_html_and_text_lend_or_own(server) -> None:  # noqa: ANN001
+    port = server[0]
+    assert _raw(port, "GET", "/lent")[::2] == (200, b"<p>lent</p>")
+    status, headers, body = _raw(port, "GET", "/made")
+    assert (status, headers["content-type"], body.endswith(b" hits</p>")) == (200, "text/html; charset=utf-8", True)
+    assert _raw(port, "GET", "/file-page")[::2] == (200, PAGE.encode())
+    assert _raw(port, "GET", "/file-text")[::2] == (500, b"missing.md: No such file or directory")
 
 
 def test_serve_file(server) -> None:  # noqa: ANN001
