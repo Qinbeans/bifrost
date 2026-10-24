@@ -38,6 +38,7 @@ from bifrost.decoding import Decoders
 from bifrost.list_methods import ListMethods
 from bifrost.naming import to_snake_case
 from bifrost.owned import Drops, own_handle
+from bifrost.std.fs import Files
 
 # The C functions behind owned values: name -> (parameters, result).
 # `(Request, i32) => None` in an extern declaration: a function type (one level; no nesting).
@@ -143,6 +144,8 @@ class Project:
         self.drops = Drops(self.program)
         # The decoders of json.decode and form.decode, generated per type.
         self.decoders = Decoders(self.program, self.drops)
+        # std:fs's functions, compiled when a file imports it.
+        self.files = Files(self.program, self.drops, self.owned_signatures)
         # A list's own functions (xs.map(f), g.sort()), generated per element type.
         self.list_methods = ListMethods(self.drops)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
@@ -330,6 +333,8 @@ class Project:
     def build(self) -> Path:
         """Build the project executable (with Bifrost's async runtime, if anything pauses)."""
         runtimes = [self._c_runtime("decode_runtime")] if self.decoders.used else []
+        if self.files.used:
+            runtimes.append(self._c_runtime("fs_runtime"))
         return self.program.build_executable(
             self.config.path / self.config.package.name,
             opt_level=self.config.flags.optimization,
@@ -361,6 +366,6 @@ class Project:
         command = [self.config.flags.linker, "-c", "-O2", "-fPIC", str(source), "-o", str(output)]
         result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603
         if result.returncode != 0:
-            msg = f"compiling the async runtime failed: {' '.join(command)}\n{result.stderr}"
+            msg = f"compiling {source.name} failed: {' '.join(command)}\n{result.stderr}"
             raise RuntimeError(msg)
         return output

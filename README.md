@@ -358,6 +358,23 @@ let show = [io.printf] (r: Result[i64, str]) => null {
 
 `x?` is the value `x` holds; if it holds an error, the function returns it at once, freeing what is alive as `return` does, so its result must be a `Result` with the same error type (and no guard may be held). `Result[null, E]` says only whether something worked: `ok()`, and `check()?` as a statement. In a `match`, `ok(v)` binds the value and `err(e)` the error (`_` binds nothing); the two arms cover every Result. `r.is_ok()` and `r.is_err()` say which it holds. A Result owns what it holds, and frees only the side it holds; a `match` on one that owns names it first (`let r = find(id)`).
 
+A `match` is a value too: `let page = match r { ok(text): axum.html(200, text), err(e): axum.html(500, e) }`. Only the arm that matches runs. When every arm makes a new value (a call returning an owned string, a list, a handle), the match's value is new as well and owned by where it goes, like a call's; arms that give back what the Result holds (`ok(t): t`) lend it, and it stays the Result's.
+
+### Files
+
+`import("std:fs")` reads and writes whole files, as Rust's `std::fs` does:
+
+```bifrost
+let fs = import("std:fs")
+
+let load = [fs.read_to_string] (path: str) => Result[mem.Unique[str], mem.Unique[str]] {
+    let text = fs.read_to_string(path)?     // the file's text, or "notes.txt: No such file or directory"
+    return ok(text)
+}
+```
+
+`fs.read_to_string(path)` gives the text as a new string, or why it cannot be read (text is UTF-8 without NUL bytes; other files are an error). `fs.write(path, text)` replaces the file's contents, or creates it, as a `Result[null, mem.Unique[str]]`, and `fs.exists(path)` says whether a file or folder is there. Paths are relative to where the program runs. Reading blocks, so a server reads its files at start, or serves them with `axum.serve_file`.
+
 ### Lists
 
 A list is written `#[4, 8, 15]` and typed `i64[]`. Index it with `xs[i]` (`xs[-1]` is the last item; an index out of range stops the program), take `len(xs)`, and loop over it with `forall`. `#[a...b]` is the range from `a` up to `b`, `b` excluded; `forall` counts through a range without making a list:
@@ -556,7 +573,7 @@ A C library that runs an event loop lets the runtime use it: it calls `bifrost_a
 
 `import("raylib")` brings in a module declared in `config.yaml`, the project's or a package's (raylib's is [`extras/raylib`](./extras/raylib)). Its functions take Bifrost names: `InitWindow` is `rl.init_window`, and structs keep PascalCase (`rl.Color`). The C symbols are unchanged.
 
-`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, and `import("std:fmt")` formatting.
+`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, and `import("std:fs")` [files](#files).
 
 ### Modules
 

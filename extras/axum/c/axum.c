@@ -425,6 +425,37 @@ AxumMethodRouter axum_any(AxumHandler handler)
     return methods;
 }
 
+static Service *service_of(AxumService service, const char *function)
+{
+    if (service.raw == NULL)
+        fatal(function, "not a service (it was made empty)", NULL);
+    return service.raw;
+}
+
+/* A service for the methods `filter` names ("GET,POST"): routing::on_service. */
+AxumMethodRouter axum_on_service(const char *filter, AxumService service)
+{
+    Service *s = service_of(service, "on_service");
+    AxumMethodRouter methods = axum_on(filter, s->handler);
+    MethodRouter *m = methods.raw;
+    for (size_t i = 0; i < METHOD_COUNT; i++)
+        if (m->handlers[i] != NULL)
+            m->data[i] = s->data;
+    return methods;
+}
+
+/* routing::get_service: `axum.route("/", axum.get_service(axum.serve_file("index.html")))`. */
+AxumMethodRouter axum_get_service(AxumService service) { return axum_on_service("GET", service); }
+
+/* routing::any_service: every method goes to the service. */
+AxumMethodRouter axum_any_service(AxumService service)
+{
+    Service *s = service_of(service, "any_service");
+    AxumMethodRouter methods = axum_any(s->handler);
+    ((MethodRouter *)methods.raw)->any_data = s->data;
+    return methods;
+}
+
 /* `get(a) |> also(post(b))`: one method router with both (MethodRouter::merge). */
 AxumMethodRouter axum_and(AxumMethodRouter methods, AxumMethodRouter other)
 {
@@ -433,12 +464,14 @@ AxumMethodRouter axum_and(AxumMethodRouter methods, AxumMethodRouter other)
         if (from->handlers[i] == NULL)
             continue;
         methods_set(into, (int)i, from->handlers[i], "and");
+        into->data[i] = from->data[i];
         into->layers[i] = layers_copy(&from->layers[i]);
     }
     if (from->any != NULL) {
         if (into->any != NULL)
             fatal("and", "both method routers handle any method", NULL);
         into->any = from->any;
+        into->any_data = from->any_data;
         into->any_layers = layers_copy(&from->any_layers);
     }
     if (from->fallback != NULL)
@@ -724,6 +757,15 @@ AxumRouter axum_fallback(AxumRouter router, AxumHandler handler)
     Router *r = router_of(router, "fallback");
     r->fallback = endpoint_new(NULL, handler, &r->state);
     return router;
+}
+
+/* Router::fallback_service: a service answers paths no route matches. */
+AxumRouter axum_fallback_service(AxumRouter router, AxumService service)
+{
+    Service *s = service_of(service, "fallback_service");
+    AxumRouter routed = axum_fallback(router, s->handler);
+    ((Router *)routed.raw)->fallback->service_data = s->data;
+    return routed;
 }
 
 /* Forget the fallback set so far: unmatched paths are 404s again (Router::reset_fallback). */
@@ -1108,6 +1150,8 @@ static void dispatch(Request *r, Router *router)
         if (fallback != NULL) {
             r->handler = fallback->service;
             r->state = fallback->state != NULL ? *fallback->state : router->state;
+            if (fallback->service_data != NULL)
+                r->state = fallback->service_data;
         }
         return;
     }
@@ -1123,20 +1167,27 @@ static void dispatch(Request *r, Router *router)
     }
     if (endpoint->service != NULL) {
         r->handler = endpoint->service;
+        if (endpoint->service_data != NULL)
+            r->state = endpoint->service_data;
         choose_layers(r, &endpoint->layers, NULL);
         return;
     }
     MethodRouter *m = endpoint->methods;
     AxumHandler handler = method >= 0 ? m->handlers[method] : NULL;
+    void *data = method >= 0 ? m->data[method] : NULL;
     const Layers *method_layers = method >= 0 ? &m->layers[method] : NULL;
     if (handler == NULL && method == 5 /* HEAD */ && m->handlers[0] != NULL) {
         handler = m->handlers[0]; /* GET answers HEAD (without its body) */
+        data = m->data[0];
         method_layers = &m->layers[0];
     }
     if (handler == NULL && m->any != NULL) {
         handler = m->any;
+        data = m->any_data;
         method_layers = &m->any_layers;
     }
+    if (data != NULL)
+        r->state = data; /* a service's: what it serves */
     if (handler == NULL && m->fallback != NULL) {
         handler = m->fallback;
         method_layers = &m->fallback_layers;

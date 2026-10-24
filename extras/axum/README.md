@@ -36,7 +36,7 @@ let main = [app, axum.bind, axum.serve] async () => null {
 package:
   type: async            # axum.serve is awaited: main is async
 packages:
-  axum: 0.1.0            # or {path: ../extras/axum}, or {version: 0.1.0, features: [ws]}
+  axum: 0.2.0            # or {path: ../extras/axum}, or {version: 0.2.0, features: [ws]}
 ```
 
 ## How axum's API reads here
@@ -51,6 +51,7 @@ Rust chains methods on values; Bifrost pipes a value into a call as its first ar
 | `get`, `post`, `put`, `delete`, `patch`, `head`, `options`, `trace`, `connect`, `any`, `on(MethodFilter, h)` | `axum.get(h)`, ..., `axum.any(h)`, `axum.on("GET,POST", h)` |
 | `MethodRouter::fallback`, `::layer`, `::route_layer` | `axum.method_fallback`, `axum.method_layer`, `axum.method_route_layer` |
 | `.route_service(path, s)` | `axum.route_service(path, h)` (a handler for every method) |
+| `get_service(s)`, `any_service(s)`, `on_service(filter, s)`, `.fallback_service(s)` | `axum.get_service(s)`, `axum.any_service(s)`, `axum.on_service("GET,POST", s)`, `axum.fallback_service(s)`: route an `axum.Service` (see [Serving files](#serving-files)) |
 | `.nest(path, router)`, `.nest_service(path, s)` | `axum.nest`, `axum.nest_service` |
 | `.merge(other)` | `axum.merge(other)` |
 | `.layer(l)`, `.route_layer(l)` | `axum.layer(l)`, `axum.route_layer(l)` |
@@ -127,6 +128,7 @@ let show = [find] (state: mem.Shared[AppState], id: extract.Path[i64]) => Result
 | `DefaultBodyLimit::max(n)`, `::disable()` | `axum.body_limit(n)` (2 MB by default), `axum.disable_body_limit()` |
 | `Extension(value)` as a layer | `axum.extension(key, value)` |
 | tower-http's `SetResponseHeader::if_not_present` | `axum.default_header(name, value)` |
+| tower-http's `ServeFile::new(path)`, `::new_with_mime` | `axum.serve_file(path)`, `axum.serve_file_with_mime(path, mime)` (see [Serving files](#serving-files)) |
 
 ```bifrost
 let timing = [time.now, axum.append_header] async (req: axum.Request, next: middleware.Next) => axum.Response {
@@ -174,6 +176,19 @@ let echo = [ws.recv, ws.text, ws.send, ws.done] async (upgrade: ws.WebSocketUpgr
 
 `axum.stream_open(req, status, content_type)` and `axum.stream_write` stream any body (`Body::from_stream`). Since the head goes out before the handler returns, layers that change responses do not change a streamed one.
 
+### Serving files
+
+`axum.serve_file(path)` is tower-http's `ServeFile`: an `axum.Service` answering with one file, routed with `axum.get_service`, `axum.any_service` or `axum.fallback_service`:
+
+```bifrost
+axum.router()
+    |> axum.route("/", axum.get_service(axum.serve_file("index.html")))
+    |> axum.route("/favicon.ico", axum.get_service(axum.serve_file("static/favicon.ico")))
+    |> axum.fallback_service(axum.serve_file("404.html"))
+```
+
+It answers GET and HEAD with the file, its type from its extension (`text/html`, `image/png`, ..., or `application/octet-stream`; `serve_file_with_mime` gives one), `Last-Modified` and `Accept-Ranges`. `If-Modified-Since` gets a 304 when the file has not changed and `If-Unmodified-Since` a 412 when it has; one `Range: bytes=...` gets a 206 of that part (a 416 past the end; several ranges get the whole file). A missing file is a 404, another method a 405. The path is relative to where the server runs, and the file is read on each request (whole, into memory), so a change shows at once. Layers wrap a service as they wrap handlers. To make a page from a file's text instead, read it with `std:fs` in a handler.
+
 ## Features
 
 As axum's, chosen where a project lists the package (`features: [ws]`, `default-features: false`):
@@ -199,7 +214,7 @@ h2o needs OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt inst
 
 ```bash
 cmake -B build -G Ninja && cmake --build build      # h2o (pinned), c/axum.c, and the features' libraries
-bfc package                                         # dist/axum-0.1.0-<target>.bifpkg
+bfc package                                         # dist/axum-0.2.0-<target>.bifpkg
 ```
 
 The C side is `c/axum.c` (routers, middleware, requests, responses, the server), `c/stream.c` (streamed bodies), `c/ws.c` and `c/multipart.c` (their features), and `c/features/` (one flag each for the features the C side reads). `tests/test_axum.py` drives a server built from all of it over HTTP.

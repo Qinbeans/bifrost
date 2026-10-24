@@ -220,6 +220,11 @@ let app = [
     axum.default_header,
     axum.extension,
     axum.with_state,
+    axum.get_service,
+    axum.any_service,
+    axum.fallback_service,
+    axum.serve_file,
+    axum.serve_file_with_mime,
     api,
     extra,
     hit,
@@ -263,6 +268,11 @@ let app = [
     return open
         |> axum.route("/chat", axum.get(chat))
         |> axum.route("/upload", axum.post(upload))
+        |> axum.route("/page", axum.get_service(axum.serve_file("page.html")))
+        |> axum.route("/logo", axum.get_service(axum.serve_file("logo.png")))
+        |> axum.route("/notes", axum.any_service(axum.serve_file_with_mime("notes.md", "text/markdown; charset=utf-8")))
+        |> axum.route("/gone", axum.get_service(axum.serve_file("missing.txt")))
+        |> axum.nest("/docs", axum.router() |> axum.fallback_service(axum.serve_file("page.html")))
         |> axum.merge(private())
         |> axum.layer(axum.from_fn(around))
         |> axum.layer(axum.default_header("x-server", "bifrost"))
@@ -316,6 +326,10 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
+PAGE = "<!doctype html><h1>served</h1>\n"
+LOGO = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"  # bytes past a NUL: not text
+
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory: pytest.TempPathFactory):
     folder = tmp_path_factory.mktemp("axum")
@@ -330,7 +344,12 @@ def server(tmp_path_factory: pytest.TempPathFactory):
     unit = lower_file(project, folder / "src" / "axum_test" / "main.bif", root=source_root(folder))
     with unit.errors():
         executable = project.build()
-    process = subprocess.Popen([executable], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # noqa: S603
+    (folder / "page.html").write_text(PAGE)
+    (folder / "notes.md").write_text("# notes\n")
+    (folder / "logo.png").write_bytes(LOGO)
+    process = subprocess.Popen(  # noqa: S603 - served files are read from where it runs
+        [executable], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=folder
+    )
     for _ in range(100):
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
@@ -497,6 +516,57 @@ def test_websocket(server) -> None:  # noqa: ANN001
     conn.close()
     status, _, text = _request(port, "GET", "/chat")
     assert (status, text) == (400, "Connection header did not include 'upgrade'")
+
+
+def _raw(port: int, method: str, path: str, headers: dict[str, str] | None = None):  # noqa: ANN202
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    connection.request(method, path, headers=headers or {})
+    answer = connection.getresponse()
+    body = answer.read()
+    connection.close()
+    return answer.status, {name.lower(): value for name, value in answer.getheaders()}, body
+
+
+def test_serve_file(server) -> None:  # noqa: ANN001
+    port = server[0]
+    status, headers, body = _raw(port, "GET", "/page")
+    assert (status, body.decode()) == (200, PAGE)
+    assert headers["content-type"] == "text/html"
+    assert headers["accept-ranges"] == "bytes"
+    assert headers["x-server"] == "bifrost"  # the router's layers wrap a service too
+    modified = headers["last-modified"]
+    assert modified.endswith(" GMT")
+    assert _raw(port, "GET", "/logo") == (200, _raw(port, "GET", "/logo")[1], LOGO)
+    assert _raw(port, "GET", "/logo")[1]["content-type"] == "image/png"
+    assert _raw(port, "GET", "/notes")[1]["content-type"] == "text/markdown; charset=utf-8"
+    assert _raw(port, "GET", "/docs/anything")[2].decode() == PAGE  # fallback_service
+    assert _raw(port, "GET", "/gone")[0] == 404
+
+
+def test_serve_file_conditions_and_ranges(server) -> None:  # noqa: ANN001
+    port = server[0]
+    modified = _raw(port, "GET", "/page")[1]["last-modified"]
+    assert _raw(port, "GET", "/page", {"if-modified-since": modified})[::2] == (304, b"")
+    old = "Sun, 06 Nov 1994 08:49:37 GMT"
+    assert _raw(port, "GET", "/page", {"if-modified-since": old})[0] == 200
+    assert _raw(port, "GET", "/page", {"if-unmodified-since": old})[0] == 412
+    status, headers, body = _raw(port, "GET", "/page", {"range": "bytes=2-8"})
+    assert (status, body, headers["content-range"]) == (206, PAGE.encode()[2:9], f"bytes 2-8/{len(PAGE)}")
+    assert _raw(port, "GET", "/page", {"range": "bytes=-6"})[2] == PAGE.encode()[-6:]
+    assert _raw(port, "GET", "/page", {"range": "bytes=10-"})[2] == PAGE.encode()[10:]
+    status, headers, _ = _raw(port, "GET", "/page", {"range": "bytes=9999-"})
+    assert (status, headers["content-range"]) == (416, f"bytes */{len(PAGE)}")
+    assert _raw(port, "GET", "/page", {"range": "bytes=0-1,4-5"})[::2] == (200, PAGE.encode())  # several: all
+
+
+def test_serve_file_methods(server) -> None:  # noqa: ANN001
+    port = server[0]
+    status, headers, body = _raw(port, "HEAD", "/page")
+    assert (status, body) == (200, b"")
+    assert headers["content-type"] == "text/html"
+    assert _raw(port, "POST", "/page")[0] == 405  # get_service: the router's 405
+    status, headers, _ = _raw(port, "POST", "/notes")  # any_service: the file's own
+    assert (status, headers["allow"]) == (405, "GET,HEAD")
 
 
 def test_graceful_shutdown(server) -> None:  # noqa: ANN001

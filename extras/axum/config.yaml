@@ -4,7 +4,7 @@
 # and the compiler writes what extracts its parameters and makes its response.
 package:
   name: axum
-  version: 0.1.0
+  version: 0.2.0
   build: library
   description: 'axum for Bifrost: routers of handlers that take extractors, middleware, and a server on h2o (HTTP/1.1, HTTP/2,
     HTTP/3)'
@@ -95,6 +95,11 @@ externs:
     fields:
       raw: ptr
     doc: 'Middleware: axum.from_fn(f), axum.map_request(f), axum.map_response(f), axum.body_limit(n), ...'
+  - name: Service
+    type: struct
+    fields:
+      raw: ptr
+    doc: 'A service written in C, routed with axum.get_service(s), axum.any_service(s) or axum.fallback_service: axum.serve_file(path).'
   - name: Request
     type: struct
     fields:
@@ -151,6 +156,43 @@ externs:
       methods: axum_MethodRouter
     return: axum_Router
     doc: Route a path ("/users/{id}", "/files/{*rest}") to a method router. The same path again merges them.
+  - name: axum_serve_file
+    as: serve_file
+    type: function
+    parameters:
+      path: cstr
+    return: axum_Service
+    doc: 'tower-http''s ServeFile: the file at path (from where the server runs), with its type, Last-Modified, 304s and ranges.'
+  - name: axum_serve_file_with_mime
+    as: serve_file_with_mime
+    type: function
+    parameters:
+      path: cstr
+      mime: cstr
+    return: axum_Service
+    doc: The file at path, served as type mime ("text/markdown; charset=utf-8").
+  - name: axum_on_service
+    as: on_service
+    type: function
+    parameters:
+      filter: cstr
+      service: axum_Service
+    return: axum_MethodRouter
+    doc: 'A service for the methods filter names: axum.on_service("GET,POST", s).'
+  - name: axum_get_service
+    as: get_service
+    type: function
+    parameters:
+      service: axum_Service
+    return: axum_MethodRouter
+    doc: 'A service for GET (and HEAD): axum.route("/", axum.get_service(axum.serve_file("index.html"))).'
+  - name: axum_any_service
+    as: any_service
+    type: function
+    parameters:
+      service: axum_Service
+    return: axum_MethodRouter
+    doc: A service for every method.
   - name: axum_route_service
     as: route_service
     type: function
@@ -210,6 +252,14 @@ externs:
       handler: handler(axum_Request) => axum_Response
     return: axum_Router
     doc: What answers paths no route matches (a 404 otherwise).
+  - name: axum_fallback_service
+    as: fallback_service
+    type: function
+    parameters:
+      router: axum_Router
+      service: axum_Service
+    return: axum_Router
+    doc: 'A service answers paths no route matches: axum.fallback_service(axum.serve_file("404.html")).'
   - name: axum_reset_fallback
     as: reset_fallback
     type: function

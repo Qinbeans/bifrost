@@ -131,6 +131,21 @@ def _line(node: Node) -> int:
     return node.start_point[0] + 1
 
 
+def arm_values(match: Node) -> list[Node]:
+    """Return the values a ``match`` used as a value makes, one per arm: each arm's single expression.
+
+    Empty when an arm holds more than one (a block of statements, or a ``return``).
+    """
+    values = []
+    for arm in _named(match)[1:]:
+        body = _named(arm)[-1]
+        items = _named(body) if body.type == "block_expression" else [body]
+        if len(items) != 1 or items[0].type != "expression":
+            return []
+        values.append(_unwrap(items[0]))
+    return values
+
+
 def _call_parts(node: Node) -> Node | None:
     """For a call expression (``f(x)``, ``a.f(x)``), return the ``user_function_call`` with its arguments."""
     call = node
@@ -488,6 +503,9 @@ class _Checker:
             return True  # a slice: a new list
         if core.type == "try_expression":
             return self.oracle.owned_value(core)  # the value taken out of a new Result
+        if core.type == "match_expression":  # new when every arm makes a new one
+            values = arm_values(core)
+            return bool(values) and all(self.fresh(value) for value in values)
         # `await f()` has the type of what it waits for.
         return _call_arguments(core) is not None and self.oracle.owned_value(_unwrap(node))
 
@@ -501,6 +519,11 @@ class _Checker:
         if core.type == "identifier" and _text(core) in state.alive:
             self.move(core, state, core)
             return
+        if core.type == "match_expression" and arm_values(core):  # each arm's value is kept
+            self.expression(_named(core)[0], state)
+            for value in arm_values(core):
+                self.keep(value, state)
+            return
         if core.type == "literal" and _named(core)[0].type in {"list", "record"}:
             self.literal(_named(core)[0], state)
             return
@@ -508,14 +531,13 @@ class _Checker:
             self.expression(core, state)
             return
         arguments = _call_arguments(core)
-        if arguments is not None and self.oracle.constructs(core):
+        if arguments is None:
+            raise OwnershipError(core, self.borrowed(core, state))
+        if self.oracle.constructs(core):
             for argument in [*arguments, *_named_values(core)]:
                 self.part(argument, state)
-            return
-        if arguments is not None:
+        else:
             self.expression(node, state, owned=True)  # a call making a new one; its arguments are lent
-            return
-        raise OwnershipError(core, self.borrowed(core, state))
 
     def literal(self, inner: Node, state: _State) -> None:
         """Check a ``#[...]`` or ``#{...}`` that is kept: its items or fields move in."""
@@ -774,4 +796,4 @@ def check(
     return checker.plan
 
 
-__all__ = ["Oracle", "OwnershipError", "Plan", "check"]
+__all__ = ["Oracle", "OwnershipError", "Plan", "arm_values", "check"]

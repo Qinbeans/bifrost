@@ -691,6 +691,8 @@ class SourceUnit:
         module = self._unescape(_children(arguments[0])[0])
         if module in _STD_MODULES:
             return SimpleNamespace(**_STD_MODULES[module])
+        if module == f"{std.PREFIX}fs":
+            return SimpleNamespace(**self.project.files.functions())
         if ":" in module and not module.startswith(std.PREFIX):
             return self._import_file_module(module, arguments[0])
         extern = self._find_module(module, arguments[0])
@@ -3199,10 +3201,7 @@ class SourceUnit:
         arguments = [argument for argument in _children(call) if argument.type == "expression"]
         for index in moved:
             if index < len(arguments):
-                core = _unwrap(arguments[index])
-                self._owning.add(core.id)
-                if core.type == "await_expression" and core.child_by_field_name("value") is not None:
-                    self._owning.add(_unwrap(core.child_by_field_name("value")).id)
+                self._keep(_unwrap(arguments[index]))
 
     def _expect_arguments(self, call: Node, built: ScalarType | None, callee: object) -> None:
         """Give the lists written as arguments (``Board(scores: #[])``) the types of what they fill."""
@@ -3446,13 +3445,19 @@ class SourceUnit:
 
     def _owned_expression(self, node: Node) -> ast.expr:
         """Lower an expression whose value is kept (bound, returned, or put in another): what it holds moves in."""
-        core = _unwrap(node)
+        self._keep(_unwrap(node))
+        return self._expression(node)
+
+    def _keep(self, core: Node) -> None:
+        """Mark an expression kept, and what makes its value: the call awaited, or each arm of a match."""
         self._owning.add(core.id)
         if core.type == "await_expression":
             awaited = core.child_by_field_name("value")
             if awaited is not None:
                 self._owning.add(_unwrap(awaited).id)
-        return self._expression(node)
+        elif core.type == "match_expression":  # `let page = match r { ok(t): html(200, t), err(e): html(500, e) }`
+            for value in ownership.arm_values(core):
+                self._keep(value)
 
     def _fresh(self, node: Node) -> bool:
         """Whether an expression makes a new list, or a new record or object holding one (see ``ownership``)."""
@@ -3467,6 +3472,9 @@ class SourceUnit:
             return True
         if core.type == "try_expression":
             return owns(self._static_type(core))  # the value taken out of a Result
+        if core.type == "match_expression":  # new when every arm makes a new one
+            values = ownership.arm_values(core)
+            return bool(values) and all(self._fresh(value) for value in values)
         if core.type == "local_function_definition" or self._is_function_value(core):
             return True  # a new closure
         is_call = core.type == "function_call" or (
@@ -3605,6 +3613,26 @@ class SourceUnit:
         value = node.child_by_field_name("value")
         kind = self._static_type(value) if value is not None else None
         return results.parts(kind)[0] if kind is not None and results.is_result(kind) else None
+
+    def _match_type(self, node: Node) -> ScalarType | None:
+        """Return the type of a match used as a value: its arms' values' (``ok(v): v`` is the Result's value's)."""
+        scrutinee = _children(node)[0]
+        subject = self._static_type(scrutinee)
+        for arm, value in zip(_children(node)[1:], ownership.arm_values(node), strict=False):
+            pattern = results.pattern(_children(arm)[0])
+            bound = pattern[1] if pattern is not None else None
+            if bound is not None and value.type == "identifier" and _text(value) == _text(bound):
+                if subject is None or not results.is_result(subject):
+                    continue
+                kind = results.parts(subject)[0 if pattern[0] == results.OK else 1]
+            else:
+                try:
+                    kind = self._static_type(value)
+                except BifrostError:
+                    kind = None  # a name the arm binds: reported where it is lowered
+            if kind is not None:
+                return kind
+        return None
 
     def _is_conversion(self, name: str) -> bool:
         """Whether ``name(...)`` converts a number (``i32(x)``): nothing else of that name is in scope."""
@@ -4953,18 +4981,84 @@ class SourceUnit:
         return self._at(ast.IfExp(self._expression(condition), self._single(body), orelse), node)
 
     def _match_expression(self, node: Node) -> ast.expr:
+        """Lower a match used as a value: each arm's value, computed only when the arm matches.
+
+        An arm whose value needs statements first (``fmt.format``, a temporary) makes the match
+        an ``if`` chain of statements assigning one variable; otherwise it is a conditional
+        expression. A match whose arms all make new values owns what it gives (see ``_fresh``).
+        """
+        assert self._scope is not None
         scrutinee, *arms = _children(node)
         self._owned_result_subject(scrutinee)
         subject = self._expression(scrutinee)
         if not isinstance(subject, (ast.Name, ast.Constant)):
             raise self.error(scrutinee, "a match used as a value needs a name to match on")
-        branches, default = self._match_arms(arms, subject, self._single, self._static_type(scrutinee))
+        kind = self._static_type(node)
+        fresh = owns(kind) and self._fresh(node)
+        if fresh:
+            for value in ownership.arm_values(node):
+                self._keep(value)  # each arm's new value is the match's
+        steps: dict[int, tuple[list[ast.stmt], list[ast.stmt]]] = {}
+
+        def single(body: Node) -> ast.expr:
+            assert self._scope is not None
+            before, after = self._scope.before, self._scope.after
+            self._scope.before, self._scope.after = [], []
+            try:
+                value = self._single(body)
+                steps[id(value)] = (self._scope.before, self._scope.after)
+            finally:
+                self._scope.before, self._scope.after = before, after
+            return value
+
+        branches, default = self._match_arms(arms, subject, single, self._static_type(scrutinee))
         if default is None:
             raise self.error(node, "a match used as a value needs a '_' arm")
-        value = default
-        for test, body, arm in reversed(branches):
-            value = self._at(ast.IfExp(test, body, value), arm)
+        if not any(before or after for before, after in steps.values()):
+            value = default
+            for test, body, arm in reversed(branches):
+                value = self._at(ast.IfExp(test, body, value), arm)
+        else:
+            cases = [*branches, (None, default, node)]
+            value = self._match_statements(node, kind, cases, steps, fresh=fresh)
+        if fresh and node.id not in self._owning:
+            assert kind is not None
+            return self._temporary(value, kind, node)  # only lent: freed after the statement
         return value
+
+    def _match_statements(
+        self,
+        node: Node,
+        kind: ScalarType | None,
+        cases: list[tuple[ast.expr | None, ast.expr, Node]],
+        steps: dict[int, tuple[list[ast.stmt], list[ast.stmt]]],
+        *,
+        fresh: bool,
+    ) -> ast.Name:
+        """Lower a match used as a value to statements: ``if`` an arm (``cases``: test, value) matches, its steps."""
+        assert self._scope is not None
+        if kind is None:
+            raise self.error(node, "cannot tell the type of this match; name each arm's value first")
+        if not fresh and any(after for _, after in steps.values()):
+            msg = "an arm of this match lends from a value freed when the arm ends; name that value before the match"
+            raise self.error(node, msg)
+        self._scope.temporaries += 1
+        name = f"__bifrost_match_{self._scope.temporaries}"
+
+        def arm(value: ast.expr, at: Node) -> list[ast.stmt]:
+            before, after = steps.get(id(value), ([], []))
+            assign = self._at(ast.Assign([self._at(ast.Name(name, ast.Store()), at)], value), at)
+            return [*before, assign, *after]  # what the arm made for its value is freed once it is taken
+
+        *branches, (_, default, _) = cases  # the last is the `_` arm
+        chain: list[ast.stmt] = arm(default, node)
+        for test, body, at in reversed(branches):
+            assert test is not None
+            chain = [self._at(ast.If(test, arm(body, at), chain), at)]
+        zero = self._at(ast.Call(self._global(self.project.drops.zero(kind), "zero"), [], []), node)
+        self._scope.before.append(self._at(ast.Assign([self._at(ast.Name(name, ast.Store()), node)], zero), node))
+        self._scope.before.extend(chain)
+        return self._at(ast.Name(name, ast.Load()), node)
 
     def _single(self, node: Node) -> ast.expr:
         """Lower the one expression a value-producing branch holds."""
@@ -5396,6 +5490,7 @@ _STATIC_TYPES: dict[str, Callable[[SourceUnit, Node], ScalarType | None]] = {
     "unary_expression": SourceUnit._unary_type,
     "await_expression": SourceUnit._await_type,
     "try_expression": SourceUnit._try_type,
+    "match_expression": SourceUnit._match_type,
     "local_function_definition": SourceUnit._lambda_type,
     pipes.LAMBDA_CALL: SourceUnit._pipe_lambda_type,
     "get_expression": lambda unit, node: (

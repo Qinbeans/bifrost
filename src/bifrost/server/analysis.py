@@ -6,7 +6,7 @@ the Language Server Protocol counts them.
 """
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -27,7 +27,7 @@ from bifrost.naming import extern_name, is_constant_case, is_pascal_case, is_sna
 from bifrost.owned import is_list
 from bifrost.packages import PackageError
 from bifrost.project import Project
-from bifrost.std import fmt, form, json, mem, tasks
+from bifrost.std import fmt, form, fs, json, mem, tasks
 from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
@@ -1630,16 +1630,10 @@ class Document:
 
     @staticmethod
     def _standard_summary(name: str) -> str:
-        if name == "mem":
-            return "memory containers: " + ", ".join(mem.CONTAINERS)
-        if name == "fmt":
-            return "formatting into owned strings: " + ", ".join(fmt.FUNCTIONS)
-        if name == "json":
-            return "values as JSON text: " + ", ".join(json.FUNCTIONS)
-        if name == "tasks":
-            return "running async functions at the same time: " + ", ".join(tasks.FUNCTIONS)
-        if name == "form":
-            return "values as forms (a=1&b=x): " + ", ".join(form.FUNCTIONS)
+        builtin = _BUILTIN_SUMMARIES.get(name)
+        if builtin is not None:
+            what, members = builtin
+            return f"{what}: " + ", ".join(members)
         return std.load(name).description
 
     def _fields(self, struct: Node) -> list[Completion]:
@@ -2032,6 +2026,18 @@ _BUILTIN_FUNCTIONS = {
     f"{std.PREFIX}json": json.FUNCTIONS,
     f"{std.PREFIX}form": form.FUNCTIONS,
     f"{std.PREFIX}tasks": tasks.FUNCTIONS,
+    f"{std.PREFIX}fs": fs.FUNCTIONS,
+}
+
+
+# What each standard module built into the compiler is for, and what it holds (shown in the editor).
+_BUILTIN_SUMMARIES: dict[str, tuple[str, Iterable[str]]] = {
+    "mem": ("memory containers", mem.CONTAINERS),
+    "fmt": ("formatting into owned strings", fmt.FUNCTIONS),
+    "json": ("values as JSON text", json.FUNCTIONS),
+    "tasks": ("running async functions at the same time", tasks.FUNCTIONS),
+    "form": ("values as forms (a=1&b=x)", form.FUNCTIONS),
+    "fs": ("reading and writing whole files", fs.FUNCTIONS),
 }
 
 

@@ -18,11 +18,18 @@ typedef struct { void *raw; } AxumLayer;
 typedef struct { void *raw; } AxumNext;
 typedef struct { void *raw; } AxumListener;
 typedef struct { void *raw; } AxumStream;
+typedef struct { void *raw; } AxumService;
 
 /* What the compiler writes for a handler: extracts, calls it, puts its response in *out; a token of when it is done. */
 typedef void *(*AxumHandler)(AxumRequest request, void *state, AxumResponse *out);
 /* An async function of no arguments, as C starts it (a graceful shutdown's signal). */
 typedef void *(*AxumTask)(void);
+
+/* A service written in C (axum.serve_file): a handler, and what it serves, given to it as its state. */
+typedef struct {
+    AxumHandler handler;
+    void *data;
+} Service;
 
 typedef struct {
     char *name; /* lower case */
@@ -69,8 +76,10 @@ typedef struct {
 /* A route's handlers by method, each with the layers MethodRouter::layer gave it. */
 typedef struct {
     AxumHandler handlers[9]; /* GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, TRACE, CONNECT */
+    void *data[9];           /* a service's (get_service): its handler's state, instead of the router's */
     Layers layers[9];
     AxumHandler any;
+    void *any_data;
     Layers any_layers;
     AxumHandler fallback;
     Layers fallback_layers;
@@ -80,6 +89,7 @@ typedef struct {
 typedef struct {
     MethodRouter *methods;
     AxumHandler service;
+    void *service_data; /* a C service's (fallback_service): its state, instead of the router's */
     Layers layers;
     void **state;      /* the state slot of the router it was added to */
     char *nest_prefix; /* nested: the prefix its handlers do not see */

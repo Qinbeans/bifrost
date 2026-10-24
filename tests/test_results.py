@@ -1,5 +1,6 @@
 """``Result[T, E]``: ``ok(x)`` and ``err(e)``, ``r?``, and ``match r { ok(v): ..., err(e): ... }``."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -273,3 +274,62 @@ def test_decoding(tmp_path: Path) -> None:
         "42",
     ]
     assert leaked == 0
+
+
+MATCHED = r"""
+let io = import("std:stdio")
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+
+let parse = [] (n: i64) => Result[i64, str] {
+    if n < 0 {
+        return err("negative")
+    }
+    return ok(n)
+}
+
+let made = [fmt.format, io.printf] (what: str, n: i64) => mem.Unique[str] {
+    io.printf("making %s\n", what)
+    return fmt.format("%s %d", what, n)
+}
+
+let shown = [parse, made] (n: i64) => mem.Unique[str] {
+    let r = parse(n)
+    let answer = match r { ok(v): made("ok", v), err(e): made(e, n) }
+    return answer
+}
+
+let main = [io.printf, io.puts, fmt.format, parse, made, shown] () => null {
+    let a = shown(4)
+    let b = shown(-1)
+    io.printf("%s / %s\n", a, b)
+    let r = parse(5)
+    let here = match r { ok(v): fmt.format("here %d", v), err(e): fmt.format("not %s", e) }
+    io.puts(here)
+    let lent = parse(-6)
+    io.puts(match lent { ok(v): made("lent", v), err(e): made("lent err", 6) })
+}
+"""
+
+
+def test_a_match_making_new_values(tmp_path: Path) -> None:
+    # Each arm's new value is the match's: only the arm that matches makes one, and it is freed
+    # once, where the match's value is (returned, a local's, or after the statement it is lent to).
+    lines, leaked = _run(tmp_path, MATCHED)
+    assert lines == [
+        "making ok",
+        "making negative",
+        "ok 4 / negative -1",
+        "here 5",
+        "making lent err",
+        "lent err 6",
+    ]
+    assert leaked == 0
+
+
+@pytest.mark.skipif(shutil.which("valgrind") is None, reason="needs valgrind")
+def test_a_match_making_new_values_frees_them_once(tmp_path: Path) -> None:
+    executable = _compile(tmp_path, MATCHED).build()
+    command = ["valgrind", "-q", "--error-exitcode=9", executable]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603
+    assert result.returncode == 0, result.stderr

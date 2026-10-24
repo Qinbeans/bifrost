@@ -1,6 +1,6 @@
 # Builds the C side of axum into build/lib, which config.yaml links:
 #   libh2o-evloop.a          h2o (HTTP/1.1, HTTP/2, HTTP/3), fetched at a pinned commit
-#   libbifrost_axum.a        c/axum.c, c/stream.c and c/defaults.c: routers, middleware, requests, responses, the server
+#   libbifrost_axum.a        c/axum.c, c/stream.c, c/fs.c and c/defaults.c: routers, middleware, requests, responses, files, the server
 #   libaxum_ws.a, libaxum_multipart.a   c/ws.c and c/multipart.c, for the ws and multipart features
 #   axum_feature_<name>.o    one per feature the C side reads (http1, http2, tracing, matched_path,
 #                            original_uri): linked only when that feature is on (see config.yaml)
@@ -47,7 +47,7 @@ set(H2O_INCLUDES
   ${h2o_BINARY_DIR}
 )
 
-add_library(bifrost_axum STATIC c/axum.c c/stream.c c/defaults.c)
+add_library(bifrost_axum STATIC c/axum.c c/stream.c c/fs.c c/defaults.c)
 add_dependencies(bifrost_axum libh2o-evloop)
 target_compile_definitions(bifrost_axum PRIVATE _GNU_SOURCE H2O_USE_LIBUV=0)
 target_compile_options(bifrost_axum PRIVATE -Wall -Wextra -Wshadow)
