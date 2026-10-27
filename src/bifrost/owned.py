@@ -22,6 +22,7 @@ from mlir_python.lang._types import FnType, ScalarType, StructType, function_typ
 from bifrost.results import is_result
 from bifrost.results import parts as result_parts
 from bifrost.std import list_runtime
+from bifrost.unions import TAG, slot, union
 
 _LIST = "List["
 
@@ -160,6 +161,8 @@ class Drops:
                 make = self._handle
             elif is_result(kind):
                 make = self._result
+            elif union(kind) is not None:
+                make = self._union
             else:
                 make = self._list if is_list(kind) else self._closure if is_closure(kind) else self._struct
             self._functions[key] = make(action, kind)
@@ -222,6 +225,49 @@ class Drops:
             f"    return Value({', '.join(when_err)})",
         ]
         return self.function(lines, names, {"value": kind, "return": kind})
+
+    def _union(self, action: str, kind: ScalarType) -> Any:  # noqa: ANN401
+        """Free or copy a union: only the object its tag names (the others are zero)."""
+        found = union(kind)
+        assert found is not None
+        assert isinstance(kind, StructType)
+        names: dict[str, object] = {"Value": kind.python}
+        for index, (_, held) in enumerate(found.variants):
+            if owns(held):
+                names[f"{action}_{index}"] = self._get(action, held)
+            if action == "clone":
+                names[f"zero_{index}"] = self.zero(held)
+        count = len(found.variants)
+        if action == "drop":
+            return self.function(self._union_drop(count, names), names, {"value": kind, "return": None})
+        return self.function(self._union_clone(count, names), names, {"value": kind, "return": kind})
+
+    @staticmethod
+    def _union_drop(count: int, names: dict[str, object]) -> list[str]:
+        """Write the drop of a union of ``count`` objects: the one its tag names, if it owns anything."""
+        lines = ["def {name}(value):"]
+        for index in range(count):
+            if f"drop_{index}" in names:
+                lines += [f"    if value.{TAG} == {index}:", f"        drop_{index}(value.{slot(index)})"]
+        return lines if len(lines) > 1 else [*lines, "    pass"]
+
+    @staticmethod
+    def _union_clone(count: int, names: dict[str, object]) -> list[str]:
+        """Write the copy of a union of ``count`` objects: a copy of the one its tag names, the others zero."""
+        lines = ["def {name}(value):"]
+        for index in range(count):
+            fields = [f"{TAG}=value.{TAG}"]
+            for other in range(count):
+                if other != index:
+                    fields.append(f"{slot(other)}=zero_{other}()")
+                elif f"clone_{index}" in names:
+                    fields.append(f"{slot(index)}=clone_{index}(value.{slot(index)})")
+                else:
+                    fields.append(f"{slot(index)}=value.{slot(index)}")
+            built = f"return Value({', '.join(fields)})"
+            # The last object is what no tag before it named.
+            lines += [f"    {built}"] if index == count - 1 else [f"    if value.{TAG} == {index}:", f"        {built}"]
+        return lines
 
     def _closure(self, action: str, kind: ScalarType) -> Any:  # noqa: ANN401
         """Free or copy a closure: what it captured knows how (see ``environment``)."""

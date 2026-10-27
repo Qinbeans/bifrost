@@ -9,7 +9,9 @@ integer at 12, near '"x"}'``). What it made before it failed is freed.
 A decoder makes what it reads: strings are new ones, so a type decoded holds
 ``mem.Unique[str]``, never ``str`` (which would be lent from somewhere). JSON
 decodes numbers, bools, owned strings, lists, records and objects, nested;
-unknown fields are skipped. A form (``a=1&b=x+y``: a query, a form body, a
+unknown fields are skipped. An object's literal field (``let type: "employee"``)
+must hold its text, and a union's object is the one whose literal field (the
+union's ``on``) holds the text given, wherever it is in the JSON object. A form (``a=1&b=x+y``: a query, a form body, a
 path's parameters) decodes a record or object of numbers, bools and owned
 strings, or one such value alone (a path with one parameter).
 """
@@ -22,9 +24,11 @@ from typing import Any
 from mlir_python.lang import Program, cstr, f64, i64, ptr
 from mlir_python.lang._types import ScalarType, StructType, scalar_type
 
+from bifrost.literals import literals
 from bifrost.owned import OWNED_STRING, Drops, is_closure, is_list, owns
 from bifrost.results import is_result, result_of
 from bifrost.std import list_runtime
+from bifrost.unions import Union, slot, union
 
 
 class DecodeError(Exception):
@@ -51,6 +55,10 @@ _RUNTIME: dict[str, tuple[list[object], object]] = {
     "json_skip": ([ptr], None),
     "json_array": ([ptr], bool),
     "json_more": ([ptr], bool),
+    "json_peek": ([ptr, cstr], None),
+    "peeked_is": ([ptr, cstr], bool),
+    "unknown": ([ptr, cstr], None),
+    "json_literal": ([ptr, cstr], None),
     "form_field": ([ptr, cstr], bool),
     "form_single": ([ptr], None),
     "form_int": ([ptr], i64),
@@ -128,6 +136,9 @@ class Decoders:
             return
         if is_closure(kind) or is_result(kind):
             raise DecodeError(f"{shown} has no {how} form")
+        if union(kind) is not None:
+            self._check_union(how, kind, shown)
+            return
         if is_list(kind):
             if how == FORM:
                 raise DecodeError(f"a form holds no lists ({shown})")
@@ -135,23 +146,52 @@ class Decoders:
             self.check(how, kind.element, f"an item of {shown}")
             return
         if isinstance(kind, StructType):
-            for field, held in kind.fields:
-                inner = scalar_type(held)
-                assert inner is not None
-                if how == FORM and (isinstance(inner, StructType) or is_list(inner)):
-                    raise DecodeError(f"a form holds numbers, bools and strings, not {field}'s")
-                self.check(how, inner, f"field {field}")
+            self._check_fields(how, kind)
             return
         raise DecodeError(f"{shown} has no {how} form")
+
+    def _check_fields(self, how: str, kind: StructType) -> None:
+        """Reject a record or object with a field that cannot be decoded (its literal ones are checked, not decoded).
+
+        Raises:
+            DecodeError: If one cannot.
+
+        """
+        fixed = literals(kind)
+        for field, held in kind.fields:
+            if field in fixed:
+                continue
+            inner = scalar_type(held)
+            assert inner is not None
+            if how == FORM and (isinstance(inner, StructType) or is_list(inner)):
+                raise DecodeError(f"a form holds numbers, bools and strings, not {field}'s")
+            self.check(how, inner, f"field {field}")
+
+    def _check_union(self, how: str, kind: ScalarType, shown: str) -> None:
+        """Reject a union that cannot be decoded: one in a form, or one with an object that cannot be.
+
+        Raises:
+            DecodeError: If it cannot.
+
+        """
+        found = union(kind)
+        assert found is not None
+        if how == FORM:
+            raise DecodeError(f"a form holds no unions ({shown})")
+        for written, held in found.variants:
+            self.check(how, held, written)
 
     def reader(self, how: str, kind: ScalarType) -> Any:  # noqa: ANN401
         """Return the function reading one ``kind`` value from a reader (the runtime's), as ``how`` writes it."""
         key = (how, kind)
         if key not in self._readers:
+            found = union(kind)
             if how == FORM and isinstance(kind, StructType):
                 self._readers[key] = self._form_fields(kind)
             elif how == FORM:
                 self._readers[key] = self._form_single(kind)
+            elif found is not None:
+                self._readers[key] = self._json_union(kind, found)
             elif isinstance(kind, StructType):
                 self._readers[key] = self._json_object(kind)
             elif is_list(kind):
@@ -188,7 +228,11 @@ class Decoders:
             "missing": self.runtime("missing"),
         }
         lines = ["def {name}(p):"]
+        fixed = literals(kind)  # its literal fields hold their text, given or not
         for index, (field, held) in enumerate(kind.fields):
+            if field in fixed:
+                lines.append(f"    f_{index} = {fixed[field]!r}")
+                continue
             inner = scalar_type(held)
             assert inner is not None
             names[f"get_{index}"] = self._scalar(FORM, inner)
@@ -216,7 +260,13 @@ class Decoders:
             "duplicate": self.runtime("duplicate"),
         }
         lines = ["def {name}(p):"]
-        for index, (_, held) in enumerate(kind.fields):
+        fixed = literals(kind)  # its literal fields: read to check they hold their text
+        if fixed:
+            names["literal"] = self.runtime("json_literal")
+        for index, (field, held) in enumerate(kind.fields):
+            if field in fixed:
+                lines += [f"    f_{index} = {fixed[field]!r}", f"    seen_{index} = False"]
+                continue
             inner = scalar_type(held)
             assert inner is not None
             names[f"get_{index}"] = self.reader(JSON, inner)
@@ -227,6 +277,9 @@ class Decoders:
             branch = "if" if index == 0 else "elif"
             lines += [f'            {branch} key_is(p, "{field}"):']
             lines += [f"                if seen_{index}:", f'                    duplicate(p, "{field}")']
+            if field in fixed:
+                lines += [f"                literal(p, {fixed[field]!r})", f"                seen_{index} = True"]
+                continue
             if owns(held):  # a duplicate's first value is freed, not lost
                 names[f"drop_{index}"] = self.drops.drop(scalar_type(held))
                 lines.append(f"                drop_{index}(f_{index})")
@@ -236,6 +289,32 @@ class Decoders:
             lines += [f"    if not seen_{index}:", f'        missing(p, "{field}")']
         arguments = ", ".join(f"{field}=f_{index}" for index, (field, _) in enumerate(kind.fields))
         lines.append(f"    return Value({arguments})")
+        return self.function(lines, names, {"p": ptr, "return": kind})
+
+    def _json_union(self, kind: ScalarType, found: Union) -> Any:  # noqa: ANN401
+        """Read a union from a JSON object: the object of it whose literal field (its ``on``) holds the text given."""
+        names: dict[str, object] = {
+            "Value": getattr(kind, "python", kind),
+            "peek": self.runtime("json_peek"),
+            "peeked_is": self.runtime("peeked_is"),
+            "unknown": self.runtime("unknown"),
+            "skip": self.runtime("json_skip"),
+        }
+        lines = ["def {name}(p):", f'    peek(p, "{found.discriminator}")']
+        for index, (_, held) in enumerate(found.variants):
+            names[f"get_{index}"] = self.reader(JSON, held)
+            names[f"zero_{index}"] = self.drops.zero(held)
+
+        def build(index: int | None) -> str:
+            slots = ", ".join(
+                f"{slot(other)}=" + (f"get_{other}(p)" if other == index else f"zero_{other}()")
+                for other in range(len(found.variants))
+            )
+            return f"Value(tag={index or 0}, {slots})"
+
+        for index, value in enumerate(found.values):
+            lines += [f"    if peeked_is(p, {value!r}):", f"        return {build(index)}"]
+        lines += [f'    unknown(p, "{found.discriminator}")', "    skip(p)", f"    return {build(None)}"]
         return self.function(lines, names, {"p": ptr, "return": kind})
 
     def _json_list(self, kind: ScalarType) -> Any:  # noqa: ANN401

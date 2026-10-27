@@ -29,7 +29,8 @@ A package listed only by version comes from the index named ``default``, or else
 
 ``bfc add`` writes these entries (see ``add``). Packages from an index or a
 ``.bifpkg`` are unpacked into ``build/pkg/<name>/`` by ``bfc sync`` (``sync``),
-``bfc build`` and ``bfc add``.
+``bfc build`` and ``bfc add``. A package used by path whose C libraries are not
+built yet is built there first, with its ``CMakeLists.txt`` (see ``_build_c``).
 Their externs and libraries join the project's, and ``import("a.b:module")``
 looks in their sources after the project's own.
 """
@@ -38,6 +39,7 @@ import hashlib
 import platform
 import re
 import shutil
+import subprocess
 import tarfile
 import urllib.parse
 import urllib.request
@@ -49,6 +51,7 @@ from typing import Any
 
 import yaml
 
+from bifrost import log
 from bifrost.configs import features
 from bifrost.configs.schema import DEFAULT_INDEX, Config, _PackageSource, source_root
 
@@ -113,6 +116,7 @@ def build(project: Path, output: Path | None = None) -> Path:
     triple = host_triple() if any(key.startswith("lib/") for key in files) else ANY
     archive = (output or project / "dist") / archive_name(name, version, triple)
     archive.parent.mkdir(parents=True, exist_ok=True)
+    log.step("Packaging", f"{name} {version}: {len(files)} files into {archive}")
     staged = archive.with_suffix(".yaml")
     staged.write_text(yaml.safe_dump(raw, sort_keys=False))
     try:
@@ -178,13 +182,16 @@ def resolve(config: Config, folder: Path, *, install: bool) -> Config:
     """
     resolver = _Resolver(folder, install=install)
     resolver.resolve_all(config.packages, folder, config.index)
-    return _merge(config, resolver.ordered(), resolver.requests)
+    return _merge(config, resolver.ordered(), resolver.requests, build=install)
 
 
-def _merge(config: Config, found: Iterable[Package], requests: dict[str, tuple[set[str], bool]]) -> Config:
+def _merge(
+    config: Config, found: Iterable[Package], requests: dict[str, tuple[set[str], bool]], *, build: bool = False
+) -> Config:
     """Add the externs, libraries and sources of the packages ``found`` to ``config``, with the features asked for.
 
     ``requests``: for each package, the features its users ask for, and whether any wants its defaults.
+    ``build``: build the C libraries of a package used by path that are missing (see ``_build_c``).
 
     Raises:
         PackageError: If two declare one module, or a feature asked for does not exist.
@@ -207,12 +214,49 @@ def _merge(config: Config, found: Iterable[Package], requests: dict[str, tuple[s
             modules.add(extern.module)
             config.externs.append(extern)
             config.declared_in[extern.module] = package.root / "config.yaml"
+        if build:
+            _build_c(package, [*package.config.libraries, *libraries])
         for library in [*package.config.libraries, *libraries]:
             if library not in config.libraries:
                 config.libraries.append(library)
         config.sources.append(source_root(package.root))
         config.gated.update(gated)
     return config
+
+
+def _build_c(package: Package, libraries: list[Any]) -> None:
+    """Build the C libraries of a package used by path, with its ``CMakeLists.txt``, when one of them is missing.
+
+    A package from an index or a ``.bifpkg`` has them built already; so does a folder
+    whose libraries are all there (rebuilding them after a change is CMake's, by hand).
+
+    Raises:
+        PackageError: If one is missing and the package cannot build it, or CMake fails.
+
+    """
+    missing = [library for library in libraries if isinstance(library, Path) and not library.exists()]
+    if not missing or (package.root / _MARKER).is_file():
+        return
+    shown = ", ".join(library.name for library in missing)
+    if not (package.root / "CMakeLists.txt").is_file():
+        raise PackageError(f"package {package.name} links {shown}, which is not built (and it has no CMakeLists.txt)")
+    if shutil.which("cmake") is None:
+        raise PackageError(f"package {package.name} links {shown}, which is not built; building it needs CMake")
+    log.step("Building", f"{package.name} {package.config.package.version}'s C libraries ({package.root})")
+    build = package.root / "build"
+    configure = ["cmake", "-S", str(package.root), "-B", str(build)]
+    if not (build / "CMakeCache.txt").is_file() and shutil.which("ninja") is not None:
+        configure += ["-G", "Ninja"]
+    for command in (configure, ["cmake", "--build", str(build)]):
+        log.note(" ".join(command))
+        result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603 - CMake, on its folder
+        if result.returncode != 0:
+            output = (result.stdout + result.stderr).strip().splitlines()[-30:]
+            msg = f"building package {package.name} failed: {' '.join(command)}\n" + "\n".join(output)
+            raise PackageError(msg)
+    still = [library.name for library in missing if not library.exists()]
+    if still:
+        raise PackageError(f"package {package.name} was built, but {', '.join(still)} is still missing")
 
 
 @dataclass(frozen=True)
@@ -239,7 +283,7 @@ def sync(config_path: Path) -> Synced:
     config = ConfigBuilder(config_path, resolve=False).build()
     resolver = _Resolver(folder, install=True)
     resolver.resolve_all(config.packages, folder, config.index)
-    _merge(config, resolver.ordered(), resolver.requests)  # checks that they fit together
+    _merge(config, resolver.ordered(), resolver.requests, build=True)  # checks that they fit together
     installed = folder / "build" / "pkg"
     removed = []
     for path in sorted(installed.iterdir()) if installed.is_dir() else []:
@@ -312,6 +356,9 @@ class _Resolver:
         if wanted is not None and config.package.version != wanted:
             raise PackageError(f"package {name} is version {config.package.version}, not {wanted}")
         self.found[name] = Package(name, root, config)
+        where = f"path {root}" if not (root / _MARKER).is_file() else (root / _MARKER).read_text()
+        if self.install:  # building (not the editor, which only reads them)
+            log.step("Using", f"{name} {config.package.version} ({where})")
         self.uses[name] = list(config.packages)
         for inner, inner_source in config.packages.items():  # what it uses
             self.queue.append((inner, inner_source, root, config.index))
@@ -353,6 +400,7 @@ class _Resolver:
             return target
         if not self.install:
             raise PackageError(f"package {name} is not installed; run `bfc sync` to unpack {archive.name}")
+        log.step("Unpacking", f"{archive.name} into {target}")
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True)
         with tarfile.open(archive, "r:gz") as tar:
@@ -391,6 +439,7 @@ def _from_index(name: str, version: str, folder: Path, index: str, *, install: b
             return cache / file
     if not install:
         raise PackageError(f"package {name} {version} is not installed; run `bfc sync` to fetch it")
+    log.step("Fetching", f"the index {index} for {name} {version}")
     links = _links(index)
     for file in wanted:
         if file in links:
@@ -407,6 +456,7 @@ def _download(url: str, target: Path) -> Path:
     """
     address, _, fragment = url.partition("#")
     expected = fragment.removeprefix("sha256=") if fragment.startswith("sha256=") else None
+    log.step("Downloading", f"{target.name} from {address}")
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + ".part")
     digest = hashlib.sha256()

@@ -31,7 +31,7 @@ from mlir_python.lang import (
     u64,
 )
 
-from bifrost import std
+from bifrost import log, std
 from bifrost.configs import Config
 from bifrost.configs.schema import Declaration, _Extern, _Function
 from bifrost.decoding import Decoders
@@ -335,12 +335,16 @@ class Project:
         runtimes = [self._c_runtime("decode_runtime")] if self.decoders.used else []
         if self.files.used:
             runtimes.append(self._c_runtime("fs_runtime"))
+        async_runtime = self._async_runtime() if self.pausing or self._returns_tokens() else None
+        output = self.config.path / self.config.package.name
+        level = self.config.flags.optimization
+        log.step("Linking", f"{output} (-O{getattr(level, 'value', level)}, {len(self.config.libraries)} libraries)")
         return self.program.build_executable(
-            self.config.path / self.config.package.name,
-            opt_level=self.config.flags.optimization,
+            output,
+            opt_level=level,
             libraries=[*self.config.libraries, *runtimes],
             linker=self.config.flags.linker,
-            async_runtime=self._async_runtime() if self.pausing or self._returns_tokens() else None,
+            async_runtime=async_runtime,
         )
 
     def _returns_tokens(self) -> bool:
@@ -363,6 +367,7 @@ class Project:
         """
         source = Path(std.__file__).parent / f"{name}.c"
         output = self.config.path / (output_name or f"bifrost_{name}.o")
+        log.step("Compiling", f"{source.name} (Bifrost's runtime)")
         command = [self.config.flags.linker, "-c", "-O2", "-fPIC", str(source), "-o", str(output)]
         result = subprocess.run(command, capture_output=True, text=True, check=False)  # noqa: S603
         if result.returncode != 0:

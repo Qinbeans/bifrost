@@ -164,14 +164,14 @@ class _Formatter:
 
     def bracketed(
         self,
-        node: Node,
+        node: Node | list[Node],
         depth: int,
         brackets: tuple[str, str],
         prefix_width: int,
         spaced: bool,
     ) -> str:
-        """Format a comma-separated, bracketed list inline or one entry per line."""
-        children = list(node.named_children)
+        """Format a comma-separated, bracketed list (``node``'s children, or the nodes given) inline or one per line."""
+        children = list(node.named_children) if isinstance(node, Node) else node
         entries = self.entries(children, depth + 1, self.format)
         opening, closing = brackets
         one_line = self.inline(entries)
@@ -255,18 +255,30 @@ class _Formatter:
     # -- structs ------------------------------------------------------------------
 
     def _struct_assignment(self, node: Node, depth: int) -> str:
-        return "struct " + self.bracketed(node, depth, ("{", "}"), len(INDENT * depth) + 20, spaced=True)
+        members = [child for child in node.named_children if child.type != "base"]
+        built_on = "".join(f" & {_text(base)}" for base in node.children_by_field_name("base"))
+        body = self.bracketed(members, depth, ("{", "}"), len(INDENT * depth) + 20, spaced=True)
+        return f"struct {body}{built_on}"
 
     def _struct_field(self, node: Node, depth: int) -> str:
         parts = _named(node)
         modifier = "static " if node.child_by_field_name("modifier") is not None else ""
         text = f"{modifier}let {_text(parts[0])}"
         for part in parts[1:]:
-            if part.type == "type_or_object":
+            if part.type in {"type_or_object", "literal_type"}:
                 text += f": {self.format(part, depth)}"
             else:
                 text += " = " + self.function(part, depth, len(text) + 3)
         return text
+
+    def _union_definition(self, node: Node, depth: int) -> str:
+        members = self.format(node.child_by_field_name("members"), depth)
+        head = f"{members} on {_text(node.child_by_field_name('discriminator'))}"
+        functions = [child for child in node.named_children if child.type in {"struct_field", "comment"}]
+        if not functions:
+            return head
+        body = self.bracketed(functions, depth, ("{", "}"), len(INDENT * depth + head) + 20, spaced=True)
+        return f"{head} {body}"
 
     def _module(self, node: Node, depth: int) -> str:
         name = _text(node.child_by_field_name("name"))

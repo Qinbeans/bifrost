@@ -81,6 +81,10 @@ class Oracle:
     # Called at each `let` (and `forall`) before what follows is checked, so that
     # the types of later expressions, which the checks above ask about, are known.
     bind: Callable[[str, Node], None] = lambda _name, _node: None
+    # A match arm's condition as a pattern: ``ok(v)`` or ``Employee(e)``, and the name it binds (``None`` if none).
+    pattern: Callable[[Node], tuple[str, Node | None] | None] = results.pattern
+    # Whether a match's arms (their conditions) cover every value it may match, with no `_`.
+    exhaustive: Callable[[list[Node]], bool] = results.exhaustive
 
 
 @dataclass
@@ -92,6 +96,8 @@ class Plan:
     # A `let` (by node id) giving a new value to an owner whose old value is still alive:
     # the lowering frees the old one (or grows it in place, for `let xs = #[...xs, x]`).
     replaced: dict[int, str] = field(default_factory=dict)
+    # Where an owner moves (the ids of the names moved): an Employee moving into a Person frees the rest of it there.
+    moves: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -144,6 +150,42 @@ def arm_values(match: Node) -> list[Node]:
             return []
         values.append(_unwrap(items[0]))
     return values
+
+
+def branch_values(node: Node) -> list[Node]:
+    """Return the values an ``if`` used as a value makes, one per branch (an ``else if``'s in turn).
+
+    Empty when it has no ``else``, or a branch holds more than one expression.
+    """
+    _, body, *rest = _named(node)
+    if not rest:
+        return []
+    values = []
+    for branch in (body, rest[0]):
+        if branch.type == "if":
+            inner = branch_values(branch)
+            if not inner:
+                return []
+            values += inner
+            continue
+        items = _named(branch) if branch.type == "block_expression" else [branch]
+        if len(items) != 1 or items[0].type != "expression":
+            return []
+        values.append(_unwrap(items[0]))
+    return values
+
+
+def values(node: Node) -> list[Node]:
+    """Return the values a ``match`` (each arm's) or an ``if`` (each branch's) used as a value makes."""
+    if node.type == "match_expression":
+        return arm_values(node)
+    return branch_values(node) if node.type == "if" else []
+
+
+def _conditions(node: Node) -> list[Node]:
+    """Return what an ``if`` used as a value tests: its condition, and each ``else if``'s."""
+    condition, _, *rest = _named(node)
+    return [condition, *(_conditions(rest[0]) if rest and rest[0].type == "if" else [])]
 
 
 def _call_parts(node: Node) -> Node | None:
@@ -447,17 +489,17 @@ class _Checker:
         scrutinee, *arms = _named(node)
         self.expression(scrutinee, state)
         paths: list[tuple[_State | None, str]] = []
-        has_default = results.exhaustive([_named(arm)[0] for arm in arms])  # `ok(v)` and `err(e)`
+        has_default = self.oracle.exhaustive([_named(arm)[0] for arm in arms])  # `ok(v)` and `err(e)`
         for arm in arms:
             condition, body = _named(arm)
-            pattern = results.pattern(condition)
+            pattern = self.oracle.pattern(condition)
             if _unwrap(condition).type == "default_var":
                 has_default = True
             elif pattern is None:
                 self.expression(condition, state)
             label = f"in the `{' '.join(_text(condition).split())}` arm (line {_line(arm)})"
             branch = state.copy()
-            if pattern is not None and pattern[1] is not None:  # `ok(v)`: v reads the Result's value
+            if pattern is not None and pattern[1] is not None:  # `ok(v)`: v reads the Result's value (or a union's)
                 self.oracle.bind(_text(pattern[1]), arm)
                 block = body if body.type == "block_expression" else arm
                 self.view(_text(pattern[1]), scrutinee, arm, block, branch)
@@ -503,11 +545,18 @@ class _Checker:
             return True  # a slice: a new list
         if core.type == "try_expression":
             return self.oracle.owned_value(core)  # the value taken out of a new Result
-        if core.type == "match_expression":  # new when every arm makes a new one
-            values = arm_values(core)
-            return bool(values) and all(self.fresh(value) for value in values)
+        if core.type in {"match_expression", "if"}:  # new when every arm (or branch) makes a new one
+            made = values(core)
+            return bool(made) and all(self.fresh(value) for value in made)
         # `await f()` has the type of what it waits for.
         return _call_arguments(core) is not None and self.oracle.owned_value(_unwrap(node))
+
+    def keep_each(self, node: Node, state: _State) -> None:
+        """Check a match (or ``if``) used as a value that is kept: what it tests is read, and each value kept."""
+        for tested in [_named(node)[0]] if node.type == "match_expression" else _conditions(node):
+            self.expression(tested, state)
+        for value in values(node):
+            self.keep(value, state)
 
     def keep(self, node: Node, state: _State) -> None:
         """Check a list, record or object that is kept (bound, returned, or put in another): what it holds moves in."""
@@ -519,10 +568,8 @@ class _Checker:
         if core.type == "identifier" and _text(core) in state.alive:
             self.move(core, state, core)
             return
-        if core.type == "match_expression" and arm_values(core):  # each arm's value is kept
-            self.expression(_named(core)[0], state)
-            for value in arm_values(core):
-                self.keep(value, state)
+        if core.type in {"match_expression", "if"} and values(core):
+            self.keep_each(core, state)
             return
         if core.type == "literal" and _named(core)[0].type in {"list", "record"}:
             self.literal(_named(core)[0], state)
@@ -601,6 +648,7 @@ class _Checker:
         self.unused(name, state, where, "moved")
         del state.alive[name]
         state.moved[name] = where
+        self.plan.moves.add(value.id)
 
     def expression(self, node: Node | None, state: _State, *, owned: bool = False) -> None:
         """Check the names ``node`` reads; ``owned``: it may be a call returning an owned value."""
@@ -796,4 +844,4 @@ def check(
     return checker.plan
 
 
-__all__ = ["Oracle", "OwnershipError", "Plan", "arm_values", "check"]
+__all__ = ["Oracle", "OwnershipError", "Plan", "arm_values", "branch_values", "check", "values"]

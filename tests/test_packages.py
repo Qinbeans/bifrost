@@ -4,6 +4,7 @@ import functools
 import hashlib
 import importlib.util
 import re
+import shutil
 import subprocess
 import tarfile
 import threading
@@ -329,10 +330,11 @@ def test_add_errors(tmp_path: Path, arguments: list[str], message: str) -> None:
 
 
 def _sync(app: Path) -> list[str]:
-    """Run ``bfc sync`` in ``app``; return its output's lines."""
+    """Run ``bfc sync`` in ``app``; return its output's lines (but the steps it says as it goes)."""
     result = CliRunner().invoke(cli, ["sync", "--config", str(app / "config.yaml")])
     assert result.exit_code == 0, result.output
-    return [" ".join(line.split()) for line in result.output.splitlines()]
+    lines = [" ".join(line.split()) for line in result.output.splitlines()]
+    return [line for line in lines if line.split()[0] not in {"Using", "Unpacking"}]
 
 
 def test_sync(tmp_path: Path) -> None:
@@ -367,3 +369,32 @@ def test_the_editor_does_not_install(tmp_path: Path) -> None:
     assert "package greeting is not installed; run `bfc sync` to unpack greeting-0.2.0-any.bifpkg" in messages
     _sync(app)  # installs it
     assert [d.message for d in Document.open(main, main.read_text()).diagnostics()] == []
+
+
+CMAKE = """\
+cmake_minimum_required(VERSION 3.16)
+project(shout C)
+add_library(shout STATIC shout.c)
+set_target_properties(shout PROPERTIES ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+"""
+
+
+@pytest.mark.skipif(shutil.which("cmake") is None, reason="needs CMake to build the package")
+def test_a_package_by_path_is_built(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A package used by path whose C library is missing is built first, with its CMakeLists.txt;
+    # `bfc build` says each step: the packages it uses, what it builds and compiles, the link.
+    library = _project(tmp_path / "shout", "shout", "libraries: [./build/lib/libshout.a]\n")
+    (library / "CMakeLists.txt").write_text(CMAKE)
+    (library / "shout.c").write_text("int shout(void) { return 1; }\n")
+    app = _project(
+        tmp_path / "app", "app", "packages:\n  shout:\n    path: ../shout\n", source=APP.replace("greeting", "shout")
+    )
+    monkeypatch.chdir(app)
+    result = CliRunner().invoke(cli, ["build"])
+    assert result.exit_code == 0, result.output
+    assert (library / "build" / "lib" / "libshout.a").is_file()
+    steps = [line.split()[0] for line in result.output.splitlines() if line.startswith(" ")]
+    assert steps[:5] == ["Using", "Building", "cmake", "cmake", "Compiling"]
+    assert "Linking" in steps
+    again = CliRunner().invoke(cli, ["build"])  # built: not again
+    assert "Building" not in again.output

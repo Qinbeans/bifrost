@@ -19,7 +19,7 @@ from mlir_python.codegen import OptLevel
 from mlir_python.lang import CompileError
 from tree_sitter import Language, Node, Parser
 
-from bifrost import generics, list_methods, pipes, std
+from bifrost import generics, list_methods, pipes, results, std, unions
 from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.configs.schema import Declaration, _Extern
 from bifrost.lowering import RECORD, BifrostError, display_types, lower_file
@@ -56,6 +56,7 @@ class Severity(Enum):
 class SymbolKind(Enum):
     FUNCTION = "function"
     STRUCT = "struct"
+    UNION = "union"
     MODULE = "module"
     CONSTANT = "constant"
 
@@ -252,9 +253,44 @@ def _module_description(module: Node) -> str | None:
 
 
 def _name_of(node: Node) -> Node | None:
-    """Return the identifier a ``let``, parameter or assignment binds, if it has one."""
+    """Return the identifier a ``let``, parameter or assignment binds, if it has one.
+
+    For a match arm, the one its pattern binds: ``v`` of ``ok(v)``, ``e`` of ``Employee(e)``.
+    """
+    if node.type == "match_arm":
+        found = _arm_pattern(node)
+        return found[1] if found is not None else None
     parts = _named(node)
     return parts[0] if parts and parts[0].type == "identifier" else None
+
+
+def _arm_pattern(arm: Node) -> tuple[str, Node | None] | None:
+    """For a match arm written as a pattern (``ok(v)``, ``Employee(e)``), what it names and the name it binds.
+
+    Whether ``Employee`` is an object (so that the arm is a pattern) is for the caller to check.
+    """
+    condition = _named(arm)[0] if _named(arm) else None
+    if condition is None:
+        return None
+    return results.pattern(condition) or unions.pattern(condition)
+
+
+def _union_members(value: Node) -> list[Node] | None:
+    """For a top-level ``let``'s value written ``Employee | Service on "type"``, its objects' names; else ``None``."""
+    if value.type != "union_definition":
+        return None
+    members: list[Node] = []
+    pending = [value.child_by_field_name("members")]
+    while pending:
+        current = _unwrap(pending.pop())
+        operator = current.child_by_field_name("operator") if current.type == "binary_expression" else None
+        if operator is not None and _text(operator) == "|":
+            pending += [current.child_by_field_name("right"), current.child_by_field_name("left")]
+        elif current.type in {"identifier", "child_annotation"}:
+            members.append(current)
+        else:
+            return None
+    return members if len(members) > 1 else None
 
 
 @dataclass
@@ -502,6 +538,10 @@ class Document:
             return SymbolKind.FUNCTION, self._signature(value)
         if value.type == "struct_assignment":
             return SymbolKind.STRUCT, "struct"
+        members = _union_members(value)
+        if members is not None:
+            shown = " | ".join(" ".join(_text(member).split()) for member in members)
+            return SymbolKind.UNION, f"{shown} on {_text(value.child_by_field_name('discriminator'))}"
         if _text(value).startswith("import("):
             return SymbolKind.MODULE, _text(value)
         return SymbolKind.CONSTANT, _text(value)
@@ -531,6 +571,9 @@ class Document:
         function = self._enclosing_function(node)
         if function is None:
             return None
+        arm = self._binding_arm(name, node, function)
+        if arm is not None:
+            return arm
         for parameter in function.named_children:
             if parameter.type == "parameter_list":
                 for candidate in _named(parameter):
@@ -544,6 +587,57 @@ class Document:
         if self._captures(function, name) and function.parent is not None:
             return self._local(name, function.parent)
         return None
+
+    def _binding_arm(self, name: str, node: Node, function: Node) -> Node | None:
+        """Return the match arm around ``node`` (in ``function``) whose pattern binds ``name``: ``Employee(e)``."""
+        current: Node | None = node
+        while current is not None and current != function:
+            if current.type == "match_arm":
+                identifier = _name_of(current)
+                if identifier is not None and _text(identifier) == name and self._is_pattern(current):
+                    return current
+            current = current.parent
+        return None
+
+    def _is_pattern(self, arm: Node) -> bool:
+        """Whether a match arm is a pattern: ``ok(v)``, ``err(e)``, or an object's name, ``Employee(e)``."""
+        found = _arm_pattern(arm)
+        if found is None:
+            return False
+        return (
+            found[0] in {results.OK, results.ERR}
+            or self._struct_named(found[0]) is not None
+            or (self._module_struct(found[0]) is not None)
+        )
+
+    def _module_struct(self, written: str) -> Node | None:
+        """Find ``zoo.Cat``, an object declared in a module of this file."""
+        module, _, member = written.partition(".")
+        found = next(
+            (item for item in _named(self.root) if item.type == "module" and _text(_name_of(item) or item) == module),
+            None,
+        )
+        if found is None or not member or "." in member:
+            return None
+        for assignment in found.children_by_field_name("member"):
+            parts = _named(assignment)
+            if parts and _text(parts[0]) == member and parts[-1].type == "struct_assignment":
+                return parts[-1]
+        return None
+
+    def _arm_type(self, arm: Node) -> str | None:
+        """Return the type of what a match arm's pattern binds: the object it names, or a Result's value or error."""
+        found = _arm_pattern(arm)
+        if found is None:
+            return None
+        written, _ = found
+        if written not in {results.OK, results.ERR}:
+            return written  # `Employee(e)`: an Employee
+        match = arm.parent
+        subject = _unwrap(_named(match)[0]) if match is not None and _named(match) else None
+        kind = self._type_of_value(subject, arm) if subject is not None else None
+        sides = _result_sides(kind) if kind is not None else None
+        return sides[0 if written == results.OK else 1] if sides is not None else None
 
     @staticmethod
     def _captures(function: Node, name: str) -> bool:
@@ -559,6 +653,8 @@ class Document:
         """``let guard: Guard[Context] <- ctx``: a local's binding, with its type when it is known."""
         if local.type == "parameter":
             return " ".join(_text(local).split())
+        if local.type == "match_arm":
+            return self._describe_arm(local)
         identifier = _name_of(local)
         first_line = _text(local).split("\n")[0]
         kind = self._type_of_binding(local)
@@ -567,6 +663,22 @@ class Document:
         name = _text(identifier)
         rest = first_line[first_line.index(name) + len(name) :]  # ` <- ctx`, ` = Context.new()`
         return f"let {name}: {kind}{rest}"
+
+    def _describe_arm(self, arm: Node) -> str:
+        """``e: Employee`` and what it is, for the name a match arm's pattern binds (``Employee(e)``)."""
+        found = _arm_pattern(arm)
+        identifier = _name_of(arm)
+        assert found is not None
+        assert identifier is not None
+        match = arm.parent
+        subject = " ".join(_text(_named(match)[0]).split()) if match is not None and _named(match) else "it"
+        kind = self._arm_type(arm)
+        written = f"{_text(identifier)}: {kind}" if kind is not None else _text(identifier)
+        if found[0] == results.OK:
+            return f"{written}\n// the value {subject} holds"
+        if found[0] == results.ERR:
+            return f"{written}\n// the error {subject} holds"
+        return f"{written}\n// the {found[0]} {subject} holds"
 
     def type_of(self, name: str, node: Node) -> str | None:
         """Return the type of local ``name`` where ``node`` is, when known: ``Context``, ``Guard[Context]``.
@@ -605,6 +717,8 @@ class Document:
         )
 
     def _type_of_binding(self, local: Node) -> str | None:
+        if local.type == "match_arm":
+            return self._arm_type(local)
         parts = _named(local)
         if local.type == "parameter" and len(parts) > 1:
             return " ".join(_text(parts[1]).split())
@@ -866,6 +980,8 @@ class Document:
         Not for an argument that already says it (``ctx`` for ``ctx``, ``s.hits``
         for ``hits``), a named one, or one of a variadic function's extra arguments.
         """
+        if self._pattern_call(call):
+            return []  # `Employee(e)` names what a match arm binds; it fills nothing
         called = self._called(call)
         names = self._parameter_names(*called, call) if called is not None else None
         if names and pipes.takes_piped(call):  # `3 |> add(4)`: 3 is the first argument
@@ -877,6 +993,14 @@ class Document:
             if written != name:
                 hints.append(InlayHint(self.position(argument.start_point), f"{name}:", parameter=True))
         return hints
+
+    def _pattern_call(self, call: Node) -> bool:
+        """Whether a ``user_function_call`` is a match arm's pattern, ``ok(v)`` or ``Employee(e)``, not a call."""
+        current = call.parent
+        while current is not None and current.type in {"function_call", "expression", "child_annotation"}:
+            current = current.parent
+        arm = current.parent if current is not None and current.type == "condition" else None
+        return arm is not None and arm.type == "match_arm" and self._is_pattern(arm)
 
     def _called(self, call: Node) -> tuple[list[str], str] | None:
         """For a ``user_function_call``, return what it calls: ``(["http"], "text")`` for ``http.text(...)``."""
@@ -940,7 +1064,25 @@ class Document:
             if callee.type != "function":
                 return None
             return [to_snake_case(parameter) for parameter in callee.parameters]
+        if callee is not None and callee[1].type == "struct_assignment":
+            return callee[0]._constructor_names(callee[1])
         return _parameter_names(callee[1]) if callee is not None else None
+
+    def _constructor_names(self, struct: Node) -> list[str]:
+        """Return the fields building an object takes, in order: its own, then each base's (``& Person``)."""
+        names = _parameter_names(struct) or []
+        for document, base in self._base_structs(struct):
+            names += [name for name in document._constructor_names(base) if name not in names]
+        return names
+
+    def _base_structs(self, struct: Node) -> "list[tuple[Document, Node]]":
+        """Return the objects a ``struct`` is built on (``& Person``), with the documents declaring them."""
+        found = []
+        for base in struct.children_by_field_name("base"):
+            named = self._struct_named(_text(base))
+            if named is not None:
+                found.append((named[0], named[1]))
+        return found
 
     def _argument_target(self, node: Node) -> "tuple[str, Location | None, str] | None":
         """For the name of a named argument, describe what it names, where that is declared, and its type.
@@ -1393,7 +1535,7 @@ class Document:
                 return None
             document, struct, _ = found
             member = next((m for m in _named(struct) if m.type == "struct_field" and _declares(m, wanted)), None)
-            declared = next((c for c in _named(member) if c.type == "type_or_object"), None) if member else None
+            declared = next((c for c in _named(member) if c.type in _TYPES), None) if member else None
             if declared is None:
                 return None
             written = " ".join(_text(declared).split())
@@ -1472,7 +1614,10 @@ class Document:
             return [] if piped else self._members(module)
         if owner in self.bindings():
             return [] if piped else self._static_members(owner)
-        where = self.root.named_descendant_for_point_range(point, point)
+        # Where the owner is written: the point after `e.` may be past the node it is in (a match arm).
+        before = (point[0], max(point[1] - 2, 0))
+        where = self.root.named_descendant_for_point_range(before, before)
+        where = where or self.root.named_descendant_for_point_range(point, point)
         found = self._struct_of(owner, where) if where is not None and "." not in owner else None
         if found is not None:
             fields = self._fields(found[1])
@@ -1486,7 +1631,9 @@ class Document:
         stack = [function]
         while stack:
             current = stack.pop()
-            if current.type in {"parameter", "local_assignment", "lock"}:
+            if current.type in {"parameter", "local_assignment", "lock"} or (
+                current.type == "match_arm" and self._is_pattern(current)
+            ):
                 identifier = _name_of(current)
                 if identifier is not None:
                     found.append(_text(identifier))
@@ -1579,7 +1726,8 @@ class Document:
             return described
         if len(parts) > 1 and parts[-1].type == "struct_assignment":
             members = [self._member_signature(m) for m in _named(parts[-1]) if m.type == "struct_field"]
-            return f"let {name} = struct {{\n" + "".join(f"    {member}\n" for member in members) + "}"
+            built_on = "".join(f" & {_text(base)}" for base in parts[-1].children_by_field_name("base"))
+            return f"let {name} = struct {{\n" + "".join(f"    {member}\n" for member in members) + "}" + built_on
         return " ".join(_text(assignment).split())
 
     def _file_modules(self) -> list[tuple[str, str]]:
@@ -1637,7 +1785,35 @@ class Document:
         return std.load(name).description
 
     def _fields(self, struct: Node) -> list[Completion]:
-        """Offer an object's stored fields and methods (not its static functions) after ``value.``."""
+        """Offer an object's stored fields and methods (not its static functions) after ``value.``: a base's too."""
+        found = self._own_fields(struct)
+        for document, base in self._base_structs(struct) if struct.type == "struct_assignment" else []:
+            found += [entry for entry in document._fields(base) if all(entry.label != c.label for c in found)]
+        return found
+
+    def _union_completions(self, found: unions.Union) -> list[Completion]:
+        """Offer what a union reads: the fields each of its objects has alike, its own methods, and theirs alike."""
+        first = found.variants[0][1]
+        entries = [
+            Completion(field, "field", f"{field}: {_type_name(held)}")
+            for field, held in first.fields
+            if found.shared(field) is not None
+        ]
+        binding = self.bindings().get(found.name)
+        if binding is not None and binding[1].type == "union_definition":
+            entries += [entry for entry in self._own_fields(binding[1]) if entry.kind == "method"]
+        alike: list[Completion] | None = None
+        for written, _ in found.variants:
+            named = self._struct_named(written)
+            methods = [entry for entry in named[0]._fields(named[1]) if entry.kind == "method"] if named else []
+            alike = (
+                methods if alike is None else [entry for entry in alike if any(m.label == entry.label for m in methods)]
+            )
+        entries += [entry for entry in alike or [] if all(entry.label != e.label for e in entries)]
+        return entries
+
+    def _own_fields(self, struct: Node) -> list[Completion]:
+        """Offer the fields and methods an object (or a union) declares itself."""
         found = []
         for member in struct.named_children:
             identifier = _name_of(member) if member.type == "struct_field" else None
@@ -1671,11 +1847,16 @@ class Document:
         if local is None:
             return []
         kind = _field_type(self._compiled_type(local), fields)
+        found_union = unions.union(kind) if kind is not None else None
+        if found_union is not None:
+            return self._union_completions(found_union)
+        written = self._path_type(name, fields, where) if fields else self.type_of(name, where)
+        declared = self._struct_named(written) if written is not None else None
+        if declared is not None:  # as written: with its methods (and its bases')
+            return declared[0]._fields(declared[1])
         if kind is not None and kind.kind == "struct":
             return [Completion(field, "field", f"{field}: {_type_name(held)}") for field, held in kind.fields]
-        written = self._path_type(name, fields, where) if fields else None
-        found = self._struct_named(written) if written is not None else None
-        return self._fields(found[1]) if found is not None else self._written_fields(local, fields)
+        return self._written_fields(local, fields)
 
     def _written_fields(self, local: Node, path: list[str]) -> list[Completion]:
         """Offer the fields of a record a ``let`` holds as written, for when the file does not compile.
@@ -1786,9 +1967,11 @@ class Document:
         ]
 
 
+_TYPES = {"type_or_object", "literal_type"}  # a field's type: `let type: "employee"` holds only that text
 _BINDING_KINDS = {"parameter": "parameter", "struct_field": "field", "lock": "guard", "module": "module"}
 _VALUE_KINDS = {
     "struct_assignment": "object",
+    "union_definition": "object",
     "function_definition": "function",
     "local_function_definition": "function",
 }
@@ -1985,6 +2168,19 @@ def _doc_text(comment: str) -> str:
     """Strip a block comment to its text: ``/* Draw the frame`` / `` * using ctx */`` is two lines of text."""
     lines = comment.removeprefix("/*").removesuffix("*/").splitlines()
     return "\n".join(line.strip().removeprefix("*").strip() for line in lines).strip()
+
+
+def _result_sides(kind: str) -> tuple[str, str] | None:
+    """Split ``Result[i64, Box[a, b]]`` into its value's and error's types; ``None`` for another type."""
+    if not (kind.startswith(f"{results.NAME}[") and kind.endswith("]")):
+        return None
+    inner = kind[len(results.NAME) + 1 : -1]
+    depth = 0
+    for index, character in enumerate(inner):
+        depth += {"[": 1, "(": 1, "{": 1, "]": -1, ")": -1, "}": -1}.get(character, 0)
+        if character == "," and depth == 0:
+            return inner[:index].strip(), inner[index + 1 :].strip()
+    return None
 
 
 def _is_constant(binding: Node) -> bool:

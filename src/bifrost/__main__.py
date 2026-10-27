@@ -10,7 +10,7 @@ from rich import print  # noqa: A004
 from rich.markup import escape
 from typer import Typer
 
-from bifrost import packages, scaffold, versioning
+from bifrost import log, packages, scaffold, versioning
 from bifrost.configs import Config, ConfigBuilder, source_root
 from bifrost.configs.features import FeatureError
 from bifrost.configs.schema import DEFAULT_INDEX
@@ -68,6 +68,7 @@ def build(
     ] = False,
 ) -> None:
     """Compile a Bifrost source file (by default, the project's entry) into the configured executable."""
+    log.enable()
     config_path = config
     wanted = {feature.strip() for feature in features.split(",") if feature.strip()}
     try:
@@ -98,6 +99,7 @@ def build(
     config.path = path or project_folder / "build"
     config.path.mkdir(parents=True, exist_ok=True)
     project = Project(config)
+    log.step("Compiling", f"{config.package.name} {config.package.version} ({source})")
     try:
         unit = lower_file(project, source, root=source_root(project_folder))
         with unit.errors():
@@ -124,6 +126,7 @@ def package(
     ] = None,
 ) -> None:
     """Package the project for others to use: its sources, config.yaml and built C libraries, as a .bifpkg."""
+    log.enable()
     if not config.is_file():
         print(f"[bold red]✘ ERROR[/bold red]: no {escape(str(config))}; package a project folder", file=sys.stderr)
         raise typer.Exit(1)
@@ -153,6 +156,7 @@ def add(
     config: Annotated[Path, typer.Option("--config", "-c", help="Project configuration.")] = Path("config.yaml"),
 ) -> None:
     """Add a package to the project's config.yaml, and install it."""
+    log.enable()
     if not config.is_file():
         print(
             f"[bold red]✘ ERROR[/bold red]: no {escape(str(config))}; create a project with `bfc init <name>`",
@@ -179,6 +183,7 @@ def sync(
     config: Annotated[Path, typer.Option("--config", "-c", help="Project configuration.")] = Path("config.yaml"),
 ) -> None:
     """Install the packages config.yaml lists into build/pkg/ (for the editor, say), without building."""
+    log.enable()
     if not config.is_file():
         print(
             f"[bold red]✘ ERROR[/bold red]: no {escape(str(config))}; create a project with `bfc init <name>`",

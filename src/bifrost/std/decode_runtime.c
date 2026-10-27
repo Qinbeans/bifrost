@@ -23,6 +23,7 @@ typedef struct {
     char *error;       /* the first error, malloc'd; NULL while all is well */
     char *key;         /* the object key or form field being read */
     size_t key_size;
+    char *peeked;      /* JSON: the text of the field an object was looked ahead into for (a union's) */
     /* forms: the pairs, decoded */
     char **names;
     char **values;
@@ -49,6 +50,7 @@ static Reader *new_reader(const char *text)
     r->error = NULL;
     r->key = NULL;
     r->key_size = 0;
+    r->peeked = NULL;
     r->names = NULL;
     r->values = NULL;
     r->count = 0;
@@ -89,6 +91,7 @@ void bifrost_decode_free(void *reader)
     Reader *r = reader;
     free(r->error);
     free(r->key);
+    free(r->peeked);
     for (size_t i = 0; i < r->count; i++) {
         free(r->names[i]);
         free(r->values[i]);
@@ -400,6 +403,75 @@ bool bifrost_decode_key_is(void *reader, const char *name)
 {
     Reader *r = reader;
     return r->error == NULL && r->key != NULL && strcmp(r->key, name) == 0;
+}
+
+/* A union's object: look ahead into the object about to be read for its field `field`, a string,
+ * without reading it (its fields may come in any order); bifrost_decode_peeked_is asks what it was. */
+void bifrost_decode_json_peek(void *reader, const char *field)
+{
+    Reader *r = reader;
+    free(r->peeked);
+    r->peeked = NULL;
+    if (r->error != NULL || !expect(r, '{', "expected an object"))
+        return;
+    size_t start = r->at - 1;
+    space(r);
+    bool more = r->text[r->at] != '}';
+    while (more && r->error == NULL && r->peeked == NULL) {
+        char *key = json_string(r);
+        if (key != NULL && expect(r, ':', "expected ':'")) {
+            if (strcmp(key, field) == 0)
+                r->peeked = json_string(r);
+            else
+                skip(r, 1);
+        }
+        free(key);
+        space(r);
+        more = r->text[r->at] == ',';
+        r->at += more ? 1 : 0;
+        space(r);
+    }
+    if (r->error == NULL && r->peeked == NULL)
+        fail(r, "missing field `%s`", field);
+    r->at = start;
+}
+
+bool bifrost_decode_peeked_is(void *reader, const char *text)
+{
+    Reader *r = reader;
+    return r->error == NULL && r->peeked != NULL && strcmp(r->peeked, text) == 0;
+}
+
+/* After no object of a union had the text looked ahead for. */
+void bifrost_decode_unknown(void *reader, const char *field)
+{
+    Reader *r = reader;
+    if (r->error != NULL || r->peeked == NULL)
+        return;
+    size_t size = strlen(field) + strlen(r->peeked) + 64;
+    char *message = malloc(size);
+    snprintf(message, size, "no object has `%s` \"%s\"", field, r->peeked);
+    fail(r, "%s", message);
+    free(message);
+}
+
+/* A literal field (`let type: "employee"`): its value must be that text. */
+void bifrost_decode_json_literal(void *reader, const char *text)
+{
+    Reader *r = reader;
+    if (r->error != NULL)
+        return;
+    size_t at = (space(r), r->at);
+    char *found = json_string(r);
+    if (found != NULL && strcmp(found, text) != 0) {
+        r->at = at;
+        size_t size = strlen(text) + 16;
+        char *expected = malloc(size);
+        snprintf(expected, size, "expected \"%s\"", text);
+        fail_at(r, expected);
+        free(expected);
+    }
+    free(found);
 }
 
 /* Skip the value of a key no field has. */

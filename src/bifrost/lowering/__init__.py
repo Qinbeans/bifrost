@@ -5,6 +5,7 @@ Every top-level ``let`` becomes a binding in one shared namespace:
 - ``let m = import("raylib")``: a namespace of the configured externs of that
   module (``m.InitWindow``, ``m.Color``).
 - ``let P = struct { let x: i32, ... }``: an ``mlir_python.lang.struct``.
+- ``let U = P | Q on "kind"``: a union of objects told apart by a literal field (see ``unions``), itself a struct.
 - ``let n = 42``: a compile-time constant.
 - ``let f = (a: i32) => i32 ...``: a Python ``ast.FunctionDef`` registered with
   ``program.function`` (or ``program.main`` for ``main``), so the
@@ -66,7 +67,21 @@ from mlir_python.lang._types import scalar_type
 from mlir_python.lang.types import FnType, ScalarType, StructType
 from tree_sitter import Language, Node, Parser
 
-from bifrost import decoding, formats, generics, guards, list_methods, ownership, pipes, results, std
+from bifrost import (
+    bases,
+    decoding,
+    formats,
+    generics,
+    guards,
+    list_methods,
+    literals,
+    log,
+    ownership,
+    pipes,
+    results,
+    std,
+    unions,
+)
 from bifrost.configs.schema import _Extern
 from bifrost.naming import extern_name
 from bifrost.owned import (
@@ -281,28 +296,29 @@ def _type_label(kind: object) -> str:
     return getattr(kind, "__name__", None) or (found.name if found is not None else repr(kind))
 
 
-def _returns(node: Node) -> bool:
+def _returns(node: Node, exhaustive: Callable[[list[Node]], bool] = results.exhaustive) -> bool:
     """Whether a statement (or block) returns on every path, so that nothing runs after it.
 
     A ``return``; an ``if`` whose branches, ``else`` included, all return; a
-    ``match`` with a ``_`` arm whose arms all return; a block with such a
-    statement; or ``while true`` (only ``return`` leaves it).
+    ``match`` with a ``_`` arm (or arms that cover every value, as ``exhaustive``
+    tells) whose arms all return; a block with such a statement; or ``while true``
+    (only ``return`` leaves it).
     """
     node = _unwrap(node)
     match node.type:
         case "return_statement":
             return True
         case "block_expression":
-            return any(_returns(statement) for statement in _children(node))
+            return any(_returns(statement, exhaustive) for statement in _children(node))
         case "if":
             branches = _children(node)[1:]  # after the condition: `then`, and `else` if there is one
-            return len(branches) == 2 and all(_returns(branch) for branch in branches)  # noqa: PLR2004
+            return len(branches) == 2 and all(_returns(branch, exhaustive) for branch in branches)  # noqa: PLR2004
         case "match_expression":
             arms = [arm for arm in _children(node) if arm.type == "match_arm"]
-            default = any(_text(_children(arm)[0]) == "_" for arm in arms) or results.exhaustive(
+            default = any(_text(_children(arm)[0]) == "_" for arm in arms) or exhaustive(
                 [_children(arm)[0] for arm in arms]
             )
-            return default and all(_returns(_children(arm)[-1]) for arm in arms)
+            return default and all(_returns(_children(arm)[-1], exhaustive) for arm in arms)
         case "while":
             condition = _unwrap(_children(node)[0])
             return _text(condition) == "true"
@@ -461,6 +477,7 @@ class SourceUnit:
         self._patterns: set[int] = set()  # printf patterns (literals) that interpolate: written by `_checked_format`
         self._thunks: dict[str, str] = {}  # function -> the symbol of its function value's function (see `_thunk`)
         self._owning: set[int] = set()  # ids of the expressions that are kept: what they hold moves in
+        self._shared_fields: dict[tuple[int, str], Any] = {}  # a union's field each object has: its reader
         self._expected: dict[int, ScalarType] = {}  # list literals (by id) whose type is written where they go
         self._functions: set[str] = set()  # top-level functions, bound after lowering
         self._type_env: dict[str, object] = {}  # while compiling a generic: its type parameters -> their types
@@ -598,8 +615,12 @@ class SourceUnit:
         match value.type:
             case "function_definition":
                 return [_PendingFunction(qualified, symbol, value, owner, module)]
-            case "struct_assignment":
-                scope[name], members = self._struct(name, value)
+            case "struct_assignment" | "union_definition":
+                if value.type == "struct_assignment":
+                    scope[name], members = self._struct(name, value)
+                else:
+                    scope[name] = self._union(name, value, {function.name for function in functions})
+                    members = self._union_functions(name, value)
                 methods = self.project.methods.setdefault(scope[name], {})
                 statics = self.project.statics.setdefault(id(scope[name]), {})
                 for member, definition, method in members:
@@ -619,10 +640,37 @@ class SourceUnit:
                     for member, definition, method in members
                 ]
             case "expression":
-                scope[name] = self._constant(_unwrap(value))
+                scope[name] = self._top_value(name, value)
                 return []
             case _:
                 raise self._unsupported(value, "a top-level block")
+
+    def _union_functions(self, name: str, node: Node) -> list[tuple[str, Node, bool]]:
+        """Collect a union's own functions (``on "type" { let f = [super] ... }``): methods, or ``static``.
+
+        A union holds no fields of its own: its objects hold them.
+        """
+        found: list[tuple[str, Node, bool]] = []
+        for member in _children(node):
+            if member.type != "struct_field":
+                continue
+            parts = _children(member)
+            member_name = self._identifier(parts[0])
+            function = next((part for part in parts if part.type == "local_function_definition"), None)
+            if function is None:
+                msg = f"{name} holds no fields of its own, but its objects do; give '{member_name}' to each of them"
+                raise self.error(member, msg)
+            if any(member_name == other for other, _, _ in found):
+                raise self.error(parts[0], f"{name} already has a member named '{member_name}'")
+            found.append((member_name, function, member.child_by_field_name("modifier") is None))
+        return found
+
+    def _top_value(self, name: str, value: Node) -> object:
+        """Return what a top-level ``let`` of a value binds: a constant (a union without ``on`` is an error)."""
+        if self._declares_union(_unwrap(value)):
+            msg = f'a union names the literal field telling its objects apart: let {name} = {_text(value)} on "type"'
+            raise self.error(value, msg)
+        return self._constant(_unwrap(value))
 
     def _qualify(self, name: str) -> str:
         """Inside a module, a member's bare name means the member: ``greet`` is ``helper.greet``."""
@@ -725,6 +773,7 @@ class SourceUnit:
             raise self.error(node, f"import cycle: {cycle}")
         unit = self.project.units.get(resolved)
         if unit is None:
+            log.step("Compiling", _display(path, self.root))
             unit = SourceUnit(self.project, path, root=root, is_root=False)
             try:
                 unit.lower()
@@ -785,11 +834,15 @@ class SourceUnit:
 
         ``let x: T`` members are stored fields, laid out as a C struct.
         ``static let f = (...) => ...`` members are functions called on the type
-        (``Context.new()``); they take no space in the object.
+        (``Context.new()``); they take no space in the object. ``& Person`` adds
+        Person's fields after its own (see ``bases``).
         """
         annotations: dict[str, object] = {}
+        fixed: dict[str, str] = {}  # its literal fields, `let type: "employee"`, and their text
         statics: list[tuple[str, Node, bool]] = []  # functions, and whether each is a method
         for member in _children(node):
+            if member.type == "base":
+                continue
             parts = _children(member)
             member_name = self._identifier(parts[0])
             is_static = member.child_by_field_name("modifier") is not None
@@ -800,13 +853,101 @@ class SourceUnit:
                 statics.append((member_name, function, not is_static))  # without `static`: a method
             elif is_static:
                 raise self.error(member, f"static data is not supported; '{member_name}' must be a field or a function")
+            elif parts[1].type == "literal_type":
+                fixed[member_name] = self._unescape(_children(parts[1])[0])
+                annotations[member_name] = cstr
             else:
                 annotations[member_name] = self._field_type(parts[1])
+        taken = set(annotations) | {other for other, _, _ in statics}
+        built_on = self._bases(name, node, annotations, fixed, taken)
         if not annotations:
             raise self.error(node, f"struct {name} declares no fields")
         try:
-            return struct(type(name, (), {"__annotations__": annotations})), statics
+            made = struct(type(name, (), {"__annotations__": annotations}))
         except TypeError as error:
+            raise self.error(node, str(error)) from error
+        literals.fix(made, fixed)
+        bases.build_on(made, built_on)
+        return made, statics
+
+    def _bases(
+        self, name: str, node: Node, annotations: dict[str, object], fixed: dict[str, str], taken: set[str]
+    ) -> list[StructType]:
+        """Add the fields of the objects ``name`` is built on (``& Person``) after its own; return those objects.
+
+        ``fixed`` takes their literal fields; ``taken`` are its own members' names, which a base's may not have.
+        """
+        built_on = [self._base(name, base) for base in node.children_by_field_name("base")]
+        for base in built_on:
+            for field, held in base.fields:
+                if field in annotations or field in taken:
+                    raise self.error(node, f"{name} and {base.name} both have a member named '{field}'")
+                annotations[field] = held.python if isinstance(held, StructType) else held
+            fixed |= literals.literals(base)
+        return built_on
+
+    def _base(self, name: str, node: Node) -> StructType:
+        """Return the object ``name`` is built on (``& Person``): one declared before it, of fields."""
+        written = _text(node)
+        found = self._static(node)
+        if isinstance(found, generics.Generic):
+            raise self._unsupported(node, f"building on a generic object ({written})")
+        kind = scalar_type(found) if isinstance(found, type) and hasattr(found, "__lang_struct__") else None
+        if not isinstance(kind, StructType) or kind.name == "record":
+            raise self.error(node, f"{name} is built on objects, and '{written}' is not one: struct {{ ... }} & Person")
+        if unions.is_union(kind) or results.is_result(kind):
+            what = "a union" if unions.is_union(kind) else "a Result"
+            raise self.error(node, f"{name} cannot be built on {what} ({written}); build it on one of its objects")
+        return kind
+
+    @staticmethod
+    def _union_members(node: Node) -> list[Node]:
+        """Return the operands of a chain of ``|``, left to right: ``A``, ``B`` and ``C`` of ``A | B | C``."""
+        members: list[Node] = []
+        pending = [node]
+        while pending:
+            current = _unwrap(pending.pop())
+            operator = current.child_by_field_name("operator") if current.type == "binary_expression" else None
+            if operator is not None and _text(operator) == "|":
+                pending += [current.child_by_field_name("right"), current.child_by_field_name("left")]
+            else:
+                members.append(current)
+        return members
+
+    def _declares_union(self, node: Node) -> bool:
+        """Whether a top-level ``let``'s value is a union, ``Employee | Service``: names joined by ``|``."""
+        operator = node.child_by_field_name("operator") if node.type == "binary_expression" else None
+        return (
+            operator is not None
+            and _text(operator) == "|"
+            and all(member.type in {"identifier", "child_annotation"} for member in self._union_members(node))
+        )
+
+    def _union(self, name: str, node: Node, functions: set[str]) -> type:
+        """``let Actor = Employee | Service on "type"``: a value that is one of these objects (see ``unions``).
+
+        ``functions`` are the functions bound so far, which are not objects.
+        """
+        members = _unwrap(node.child_by_field_name("members"))
+        discriminator = self._unescape(node.child_by_field_name("discriminator"))
+        if not self._declares_union(members):
+            raise self.error(members, f'a union is of objects joined by |: let {name} = A | B on "{discriminator}"')
+        variants: list[tuple[str, StructType]] = []
+        for member in self._union_members(members):
+            written = " ".join(_text(member).split())
+            found = None if self._qualify(written) in functions else self._static(member)
+            if isinstance(found, generics.Generic) and found.kind == generics.OBJECT:
+                raise self._unsupported(member, f"a generic object in a union ({written})")
+            kind = scalar_type(found) if isinstance(found, type) and hasattr(found, "__lang_struct__") else None
+            if not isinstance(kind, StructType):
+                raise self.error(member, f"a union is of objects, and '{written}' is not one: let {name} = A | B")
+            if unions.is_union(kind) or results.is_result(kind):
+                shown = "a union" if unions.is_union(kind) else "a Result"
+                raise self._unsupported(member, f"a union holding {shown} ({written})")
+            variants.append((written, kind))
+        try:
+            return unions.union_of(name, variants, discriminator)
+        except ValueError as error:
             raise self.error(node, str(error)) from error
 
     def _stored_type(self, type_node: Node) -> object:
@@ -1363,7 +1504,7 @@ class SourceUnit:
         fields = [
             (_text(_children(member)[0]), _children(member)[1])
             for member in _children(generic.node)
-            if member.type == "struct_field"
+            if member.type == "struct_field" and _children(member)[1].type != "literal_type"
         ]
         pairs = []
         for index, argument in enumerate(arguments):
@@ -1401,6 +1542,11 @@ class SourceUnit:
             return
         earlier = scalar_type(bound[0])
         if earlier == concrete:
+            return
+        if (found_union := unions.union(earlier)) is not None and found_union.of(concrete) is not None:
+            return  # an object of the union T is: it joins one
+        if (found_union := unions.union(concrete)) is not None and found_union.of(earlier) is not None:
+            bindings[name] = (value, argument)  # T is the union an object found before is of
             return
         numbers = earlier is not None and {earlier.kind, concrete.kind} <= {"int", "float"}
         if numbers and _unwrap(argument).type == "literal":
@@ -1464,7 +1610,8 @@ class SourceUnit:
                 kind = scalar_type(self._type(found[1] if found is not None else type_node))
             except BifrostError:
                 continue  # reported where the let is lowered
-            if kind is not None:
+            self._expect_union(_unwrap(_children(let)[-1]), kind)
+            if kind is not None and not unions.is_union(kind):
                 self._expected_values[_unwrap(_children(let)[-1]).id] = kind
         kind = scalar_type(result) if result not in (None, type(None), _INFERRED) else None
         if kind is None:
@@ -1475,7 +1622,9 @@ class SourceUnit:
         if body.type != "block_expression":
             returned.append(body)  # an expression body: `=> T value`
         for value in returned:
-            self._expected_values[_unwrap(value).id] = kind
+            self._expect_union(_unwrap(value), kind)
+            if not unions.is_union(kind):
+                self._expected_values[_unwrap(value).id] = kind
 
     def _generic_call(self, node: Node, generic: generics.Generic, written: str) -> ast.expr:
         """Call a generic function, compiled for its arguments' types; or build a generic object."""
@@ -1574,7 +1723,7 @@ class SourceUnit:
             | {
                 _text(found[1])
                 for arm in self._descendants(body, "match_arm")
-                if (found := results.pattern(_children(arm)[0])) is not None and found[1] is not None
+                if (found := self._arm_pattern(_children(arm)[0])) is not None and found[1] is not None
             }
         )
         for parameter in owned_parameters:  # a mem.Unique[str] parameter: a string it owns
@@ -1660,6 +1809,8 @@ class SourceUnit:
                 pauses=lambda call: self._pauses(self._callee(call)),
                 values=values,
                 lends=lambda name, method: name in held and self._changes(scalar_type(held[name][1]), method),
+                pattern=self._arm_pattern,
+                exhaustive=self._exhaustive,
             )
         except guards.GuardError as error:
             raise self.error(error.node, error.message) from None
@@ -1800,6 +1951,8 @@ class SourceUnit:
             function_value=lambda node: node.type == "local_function_definition" or self._is_function_value(node),
             lent_arguments=self._lent_arguments,
             bind=self._bind_local,
+            pattern=self._arm_pattern,
+            exhaustive=self._exhaustive,
         )
 
     @staticmethod
@@ -2094,14 +2247,38 @@ class SourceUnit:
     def _expect(self, value: Node, kind: object) -> None:
         """Note the type written where a list literal goes (``let xs: f64[] = #[1, 2]``), which it takes.
 
-        Also a ``Result``'s, which ``ok(x)`` and ``err(e)`` make there.
+        Also a ``Result``'s, which ``ok(x)`` and ``err(e)`` make there, and a union's, which an object put there joins.
         """
         literal = _unwrap(value)
         if results.is_result(kind):
             self._expected_values[literal.id] = scalar_type(kind)
+        self._expect_union(literal, kind)
         if literal.type == "literal" and _children(literal)[0].type == "list" and is_list(kind):
             assert isinstance(kind, ScalarType)
             self._expected[_children(literal)[0].id] = kind
+
+    def _expect_union(self, value: Node, kind: object) -> None:
+        """Note whether a union goes where ``value`` is: an object there joins it.
+
+        Or an object others are built on (``Person``, of ``struct {...} & Person``): one of them there
+        becomes one (see ``_into_base``). So does each arm's value of a match, and each branch's of an ``if``.
+
+        Where something else goes, a union noted before is forgotten: a generic's body is lowered once for
+        each set of types, and only some of them may put a union there.
+        """
+        found = scalar_type(kind) if kind is not None else None
+        if found is not None and _converts(found):
+            self._expected_values[value.id] = found
+        elif (stale := self._expected_values.get(value.id)) is not None and _converts(stale):
+            del self._expected_values[value.id]
+        if value.type == "match_expression":
+            for arm in ownership.arm_values(value):
+                self._expect_union(arm, found)
+        elif value.type == "if":
+            for branch in _children(value)[1:]:  # after the condition: `then`, and `else` (or an `else if`)
+                items = _children(branch) if branch.type == "block_expression" else [branch]
+                if len(items) == 1 and items[0].type in {"expression", "if"}:
+                    self._expect_union(_unwrap(items[0]), found)
 
     @staticmethod
     def _grows(name: str, value: Node) -> bool:
@@ -2124,8 +2301,20 @@ class SourceUnit:
         """``x.f = v``; a list (or a value holding one) it replaces is freed after the new one is made."""
         assert self._scope is not None
         target_node, value_node = item.child_by_field_name("target"), item.child_by_field_name("value")
+        if target_node.type == "child_annotation":  # `guard.actor.tag = 1`: a union's parts are its own
+            parts = _children(target_node)
+            for index in range(1, len(parts)):
+                if parts[index].type == "simple_identifier":
+                    self._check_not_union(self._parts_type(parts[:index]), parts[index])
+            owner, field = self._parts_type(parts[:-1]), _text(parts[-1])
+            fixed = literals.literals(owner) if owner is not None else {}
+            if field in fixed:  # `let type: "employee"` only ever holds that
+                raise self.error(
+                    target_node, f'{_shown(owner)}\'s {field} is always "{fixed[field]}"; it cannot change'
+                )
         target = self._field_target(target_node)
         stored = self._static_type(target_node)
+        self._expect_union(_unwrap(value_node), stored)  # an object stored where a union goes joins it
         kind = stored if owns(stored) else self._static_type(value_node)  # an owned part takes only owned values
         self._check_string(value_node, stored, f"{' '.join(_text(target_node).split())} is")
         if not owns(kind):
@@ -2365,12 +2554,21 @@ class SourceUnit:
         if kind is not None and results.is_result(kind) and owns(kind) and inner.type != "identifier":
             text = " ".join(_text(scrutinee).split())
             raise self.error(scrutinee, f"name this Result first, since it owns what it holds: let r = {text}")
+        if kind is not None and unions.is_union(kind) and owns(kind) and inner.type != "identifier":
+            text = " ".join(_text(scrutinee).split())
+            raise self.error(scrutinee, f"name this {_shown(kind)} first, since it owns what it holds: let a = {text}")
 
     def _pattern_type(self, arm: Node) -> ScalarType | None:
         """Return the type of what a match arm's ``ok(v)`` (the Result's value) or ``err(e)`` (its error) binds."""
         match = arm.parent
-        found = results.pattern(_children(arm)[0])
         kind = self._static_type(_children(match)[0]) if match is not None else None
+        if kind is not None and unions.is_union(kind):
+            variant = unions.pattern(_children(arm)[0])
+            found_union = unions.union(kind)
+            assert found_union is not None
+            index = self._variant_arm(_children(arm)[0], found_union)[0] if variant is not None else None
+            return found_union.variants[index][1] if index is not None else None
+        found = results.pattern(_children(arm)[0])
         if found is None or kind is None or not results.is_result(kind):
             return None
         value, error = results.parts(kind)
@@ -2419,11 +2617,108 @@ class SourceUnit:
             default = branches.pop()[1]  # ok and err cover every Result: the last arm is what remains
         return branches, default
 
+    def _union_arms[T](
+        self, arms: list[Node], subject: ast.expr, lower: Callable[[Node], T], kind: ScalarType
+    ) -> tuple[list[tuple[ast.expr, T, Node]], T | None]:
+        """Arms of a match on a union: ``Employee(e)`` (e is the Employee it holds), and ``_``."""
+        assert self._scope is not None
+        found = unions.union(kind)
+        assert found is not None
+        branches: list[tuple[ast.expr, T, Node]] = []
+        default: T | None = None
+        seen: set[int] = set()
+        for arm in arms:
+            condition, body = _children(arm)
+            if default is not None:
+                raise self.error(arm, "this arm is unreachable: '_' already matched")
+            if _unwrap(condition).type == "default_var":
+                default = lower(body)
+                continue
+            index, binding = self._variant_arm(condition, found)
+            if index in seen:
+                raise self.error(condition, f"this match already has a {found.variants[index][0]}(...) arm")
+            seen.add(index)
+            tag = self._at(ast.Attribute(_copy_tree(subject), unions.TAG, ast.Load()), condition)
+            test = self._at(ast.Compare(tag, [ast.Eq()], [self._at(ast.Constant(index), condition)]), condition)
+            if binding is None:
+                branches.append((test, lower(body), arm))
+                continue
+            name = self._identifier(binding)
+            held = self._at(ast.Attribute(_copy_tree(subject), unions.slot(index), ast.Load()), binding)
+            self._scope.aliases[name] = held
+            self._scope.types[name] = found.variants[index][1]
+            try:
+                branches.append((test, lower(body), arm))
+            finally:
+                del self._scope.aliases[name]
+        if default is None and len(seen) == len(found.variants):
+            default = branches.pop()[1]  # every object has an arm: the last is what remains
+        return branches, default
+
+    def _variant_arm(self, condition: Node, found: unions.Union) -> tuple[int, Node | None]:
+        """For an arm of a match on a union, ``Employee(e)``: the place of its object, and what it binds."""
+        pattern = unions.pattern(condition)
+        arms = ", ".join(f"{written}(...)" for written, _ in found.variants)
+        if pattern is None:
+            raise self.error(condition, f"a match on {found.name} has the arms {arms}, and _")
+        written, binding = pattern
+        index = found.index(written)
+        if index is None:  # the same object, written another way (through another module's name)
+            index = found.of(self._variant_named(written))
+        if index is None:
+            raise self.error(condition, f"{found.name} is {found.shown()}; {written} is not one of them")
+        return index, binding
+
+    def _variant_named(self, written: str) -> StructType | None:
+        """Return the object type the dotted name ``written`` names, if it is one of some union's objects."""
+        first, _, rest = written.partition(".")
+        target = self._reach([*self._qualify(first).split("."), *(rest.split(".") if rest else [])])
+        kind = scalar_type(target) if isinstance(target, type) and hasattr(target, "__lang_struct__") else None
+        return kind if isinstance(kind, StructType) and unions.is_variant(kind) else None
+
+    def _arm_pattern(self, condition: Node) -> tuple[str, Node | None] | None:
+        """Read a match arm's condition as a pattern, and the name it binds: ``ok(v)``, ``err(e)``, or ``Employee(e)``.
+
+        ``Employee(e)`` is one when ``Employee`` is an object of a union; ``None`` for other conditions.
+        """
+        found = results.pattern(condition)
+        if found is not None:
+            return found
+        found = unions.pattern(condition)
+        return found if found is not None and self._variant_named(found[0]) is not None else None
+
+    def _exhaustive(self, conditions: list[Node]) -> bool:
+        """Whether a match's arms (their conditions) cover every value: ``ok`` and ``err``, or each object of a union.
+
+        The union is the type of what the match is on, or, before that is known, the one its arms name.
+        """
+        if results.exhaustive(conditions):
+            return True
+        named: set[int] = set()
+        for condition in conditions:
+            pattern = unions.pattern(condition)
+            kind = self._variant_named(pattern[0]) if pattern is not None else None
+            if kind is None:
+                return False
+            named.add(id(kind))
+        arm = conditions[0].parent if conditions else None
+        match = arm.parent if arm is not None else None
+        try:
+            subject = self._static_type(_children(match)[0]) if match is not None and self._scope else None
+        except BifrostError:
+            subject = None
+        found = unions.union(subject) if subject is not None else None
+        if found is not None:
+            return {id(kind) for _, kind in found.variants} <= named
+        return bool(named) and unions.covers(named)
+
     def _match_arms[T](
         self, arms: list[Node], subject: ast.expr, lower: Callable[[Node], T], kind: ScalarType | None = None
     ) -> tuple[list[tuple[ast.expr, T, Node]], T | None]:
         if kind is not None and results.is_result(kind):
             return self._result_arms(arms, subject, lower, kind)
+        if kind is not None and unions.is_union(kind):
+            return self._union_arms(arms, subject, lower, kind)
         branches: list[tuple[ast.expr, T, Node]] = []
         default: T | None = None
         for arm in arms:
@@ -2447,7 +2742,80 @@ class SourceUnit:
         lower = _EXPRESSIONS.get(node.type)
         if lower is None:
             raise self._unsupported(node)
-        return lower(self, node)
+        lowered = lower(self, node)
+        expected = self._expected_values.get(node.id)
+        if expected is not None and unions.is_union(expected):
+            return self._into_union(lowered, node, expected)
+        if expected is not None and bases.is_base(expected):
+            return self._into_base(lowered, node, expected)
+        return lowered
+
+    def _into_union(self, lowered: ast.expr, node: Node, kind: ScalarType) -> ast.expr:
+        """Put an object where a union of it goes: ``let a: Actor = Employee(...)`` holds the Employee.
+
+        A match's arms (and an ``if``'s branches) are put in it one by one; a value that is the union already stays
+        as it is.
+        """
+        found = unions.union(kind)
+        assert found is not None
+        if node.type in {"match_expression", "if"}:
+            return lowered
+        given = self._static_type(node)
+        if given is None or given == kind:
+            return lowered
+        index = found.of(given)
+        if index is None:  # built on one of its objects: it goes in as that one
+            index = next((place for place, (_, held) in enumerate(found.variants) if bases.derives(given, held)), None)
+            if index is not None:
+                lowered = self._into_base(lowered, node, found.variants[index][1])
+        if index is None:
+            raise self.error(node, f"{found.name} is {found.shown()}, but this is {_shown(given)}")
+        fields = [self._at(ast.keyword(unions.TAG, self._at(ast.Constant(index), node)), node)]
+        for other, (_, held) in enumerate(found.variants):
+            if other == index:
+                value = lowered
+            else:
+                zero = self._at(self._global(self.project.drops.zero(held), "zero"), node)
+                value = self._at(ast.Call(zero, [], []), node)
+            fields.append(self._at(ast.keyword(unions.slot(other), value), node))
+        assert isinstance(kind, StructType)
+        return self._at(ast.Call(self._at(self._global(kind.python, "type"), node), [], fields), node)
+
+    def _into_base(self, lowered: ast.expr, node: Node, kind: ScalarType) -> ast.expr:
+        """Put an object where one it is built on goes: an Employee (``& Person``) where a Person does.
+
+        It is lent as one (its Person fields, read in place); when it moves there (it is kept),
+        its own fields are freed, and the Person takes the rest.
+        """
+        given = self._static_type(node)
+        if node.type in {"match_expression", "if"} or given is None or given == kind or not bases.derives(given, kind):
+            return lowered
+        assert self._scope is not None
+        assert isinstance(kind, StructType)
+        assert isinstance(given, StructType)
+        temporary = isinstance(lowered, ast.Name) and lowered.id.startswith("__bifrost_temporary_")
+        if node.type == "identifier":
+            moves = node.id in self._scope.plan.moves
+        else:
+            moves = not temporary and self._makes_new(node)
+        held = lowered
+        if not isinstance(lowered, ast.Name):  # read once
+            self._scope.temporaries += 1
+            name = f"__bifrost_base_{self._scope.temporaries}"
+            self._scope.before.append(
+                self._at(ast.Assign([self._at(ast.Name(name, ast.Store()), node)], lowered), node)
+            )
+            held = self._at(ast.Name(name, ast.Load()), node)
+        kept = {field for field, _ in kind.fields}
+        for field, field_kind in given.fields if moves else []:  # what only an Employee has goes
+            if field not in kept and owns(field_kind):
+                part = self._at(ast.Attribute(_copy_tree(held), field, ast.Load()), node)
+                self._scope.before.append(self._drop(part, scalar_type(field_kind), node))
+        fields = [
+            self._at(ast.keyword(field, self._at(ast.Attribute(_copy_tree(held), field, ast.Load()), node)), node)
+            for field, _ in kind.fields
+        ]
+        return self._at(ast.Call(self._at(self._global(kind.python, "type"), node), [], fields), node)
 
     def _unary(self, node: Node) -> ast.expr:
         operator = _UNARY_OPERATORS[_text(node.child_by_field_name("operator"))]
@@ -2621,6 +2989,7 @@ class SourceUnit:
                 )
             return "spread", self._expression(spread)
         self._check_string(item, element, "this list's strings are")
+        self._expect_union(_unwrap(item), element)  # an object in a list of unions joins one
         value = self._owned_expression(item) if owning and owns(element) else self._expression(item)
         return "item", value
 
@@ -2986,7 +3355,7 @@ class SourceUnit:
                 if value is None:
                     value = self._guarded(part) or self._load(part)
                 else:
-                    value = self._at(ast.Attribute(value, _text(part), ast.Load()), part)
+                    value = self._field_read(value, self._parts_type(parts[:index]) if local else None, part)
                 path.append(_text(part))
             else:
                 value = self._call(_children(part)[0], value, path)
@@ -3007,6 +3376,9 @@ class SourceUnit:
         if called is None or kind is None:
             return None
         name = _text(called)
+        if self._method(kind, name) is not None:
+            return called  # an object's own, a base's, or each of a union's objects'
+        self._check_not_union(kind, called)
         if results.is_result(kind):
             if name not in _RESULT_METHODS:
                 raise self.error(called, "a Result's methods are is_ok and is_err; read what it holds with match")
@@ -3021,6 +3393,44 @@ class SourceUnit:
         if isinstance(kind, StructType) and kind.field(name) is None:  # neither a method nor a function field
             raise self.error(called, f"{display_types(kind.name)} has no method {name}")
         return None
+
+    def _field_read(self, value: ast.expr, kind: ScalarType | None, part: Node) -> ast.expr:
+        """Read the field ``part`` of ``value`` (of type ``kind``, when known): of a union, from what it holds."""
+        found = unions.union(kind) if kind is not None else None
+        name = _text(part)
+        if found is None or found.shared(name) is None:
+            self._check_not_union(kind, part)
+            return self._at(ast.Attribute(value, name, ast.Load()), part)
+        key = (id(found), name)
+        if key not in self._shared_fields:
+            held = found.shared(name)
+            lines = ["def {name}(super):"]
+            for index in range(len(found.variants) - 1):
+                lines += [f"    if super.{unions.TAG} == {index}:", f"        return super.{unions.slot(index)}.{name}"]
+            lines.append(f"    return super.{unions.slot(len(found.variants) - 1)}.{name}")
+            annotations = {"super": getattr(kind, "python", kind), "return": getattr(held, "python", held)}
+            self._shared_fields[key] = self.project.drops.function(lines, {}, annotations)
+        return self._at(ast.Call(self._global(self._shared_fields[key], "field"), [value], []), part)
+
+    def _check_not_union(self, kind: ScalarType | None, part: Node) -> None:
+        """Reject reaching into a union for what not each of its objects has alike: read that with ``match``."""
+        found = unions.union(kind) if kind is not None else None
+        if found is None:
+            return
+        name = _text(part)
+        arms = ", ".join(f"{written}(x): ..." for written, _ in found.variants)
+        held = [(written, variant.field(name)) for written, variant in found.variants]
+        shapes = [self._method_shape(variant, name) for _, variant in found.variants]
+        if all(not (isinstance(shape, str) and shape.endswith(f" has no {name}")) for shape in shapes):
+            why = next((shape for shape in shapes if isinstance(shape, str)), "they take or give different things")
+            msg = f"{found.name} calls {name} only when each of its objects has one taking and giving the same ({why})"
+            raise self.error(part, f'{msg}; give {found.name} its own: on "..." {{ let {name} = [super] ... }}')
+        if all(field is not None for _, field in held):  # each has one, of different types
+            types = ", ".join(f"{written}'s is {_shown(scalar_type(field[1]))}" for written, field in held if field)
+            msg = f"{found.name} reads only what each of its objects has alike, and their {name}s differ ({types})"
+        else:
+            msg = f"{found.name} is {found.shown()}, so it has no '{name}'"
+        raise self.error(part, f"{msg}; read what it holds with match: {arms}")
 
     def _depend_on_value(self, path: list[str], node: Node) -> None:
         """``helper.greet`` or ``http.text`` used as a value: a function, so a dependency."""
@@ -3134,19 +3544,42 @@ class SourceUnit:
         self._check_record_arguments(node, target if owner is not None else callee_name, dotted)
         owning = self._call_expression(node).id in self._owning
         result = self._call_result(dotted, name)
-        self._expect_arguments(
-            node, result if self._builds(dotted) else None, target if owner is not None else callee_name
-        )
+        built = result if isinstance(result, StructType) and self._builds(dotted) else None  # an object it builds
+        self._expect_arguments(node, built, target if owner is not None else callee_name)
         # An object built holds what fills it, also one built only to be lent (freed after the statement).
-        keeping = isinstance(result, StructType) and self._builds(dotted) and (owning or owns(result))
+        keeping = built is not None and (owning or owns(built))
         self._mark_pattern(node, formats.PATTERNS.get(target.name) if isinstance(target, Function) else None)
         self._give_away(node, target if owner is not None else callee_name)
-        positional, named = self._arguments(node, pointees, keeping=keeping)
+        positional, named = self._fill_literals(node, built, self._arguments(node, pointees, keeping=keeping))
         if isinstance(target, Function) and target.kind == "extern" and target.name in formats.PATTERNS:
             positional = self._checked_format(node, formats.PATTERNS[target.name], positional)
         callee, positional = self._through_closure(name, owner, path, (callee, positional), node)
         call = self._at(ast.Call(callee, positional, named), node)
         return self._finish_call(call, node, dotted, (pauses, owning, result))
+
+    def _fill_literals(
+        self, call: Node, kind: StructType | None, arguments: tuple[list[ast.expr], list[ast.keyword]]
+    ) -> tuple[list[ast.expr], list[ast.keyword]]:
+        """Build an object with literal fields (``let type: "employee"``): the compiler fills them in, never the call.
+
+        Its positional arguments fill the other fields, in order. ``kind`` is the object a call
+        builds; ``None`` for other calls, whose arguments are as they are.
+        """
+        fixed = literals.literals(kind) if kind is not None else {}
+        if kind is None or not fixed:
+            return arguments
+        for argument in _children(call):
+            field = _text(argument.child_by_field_name("name")) if argument.type == "named_argument" else None
+            if field in fixed:
+                raise self.error(argument, f'{kind.name}\'s {field} is always "{fixed[field]}"; leave it out')
+        positional, named = arguments
+        given = literals.given(kind)
+        if len(positional) > len(given):
+            msg = f"{kind.name} takes {len(given)} values ({', '.join(given)}), got {len(positional)}"
+            raise self.error(call, msg)
+        filled = [ast.keyword(field, value) for field, value in zip(given, positional, strict=False)]
+        filled += [ast.keyword(field, self._at(ast.Constant(text), call)) for field, text in fixed.items()]
+        return [], [*filled, *named]
 
     def _finish_call(
         self, call: ast.Call, node: Node, written: str, how: tuple[bool, bool, ScalarType | None]
@@ -3208,12 +3641,13 @@ class SourceUnit:
         arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
         if isinstance(built, StructType):
             fields = dict(built.fields)
+            given = literals.given(built)  # what positional arguments fill
             for index, argument in enumerate(arguments):
                 if argument.type == "named_argument":
                     name = _text(argument.child_by_field_name("name"))
                     value, kind = argument.child_by_field_name("value"), fields.get(name)
-                elif index < len(built.fields):
-                    name, (value, kind) = built.fields[index][0], (argument, built.fields[index][1])
+                elif index < len(given):
+                    name, (value, kind) = given[index], (argument, fields[given[index]])
                 else:
                     continue
                 self._expect(value, kind)
@@ -3231,9 +3665,93 @@ class SourceUnit:
                 self._expect(argument, scalar_type(kind))
 
     def _method(self, kind: ScalarType | None, name: str) -> tuple[str, str] | None:
-        """Return the method ``name`` of an object of type ``kind`` (its Bifrost name and symbol), if it has one."""
+        """Return the method ``name`` of an object of type ``kind`` (its Bifrost name and symbol), if it has one.
+
+        Its own, or one it has from what it is made of: a base's (``& Person``), or, for a union,
+        the one each of its objects has (see ``_derived_method``).
+        """
         cls = kind.python if isinstance(kind, StructType) else None
-        return self.project.methods.get(cls, {}).get(name) if cls is not None else None
+        found = self.project.methods.get(cls, {}).get(name) if cls is not None else None
+        if found is not None or not isinstance(kind, StructType):
+            return found
+        return self._derived_method(kind, name)
+
+    def _method_shape(self, kind: StructType, name: str) -> tuple[list[object], object] | str:
+        """Return the parameter types (after ``super``) and result of ``kind``'s method ``name``.
+
+        A string, saying why, for one that cannot be called for another object (on its behalf):
+        one that changes its object, pauses, or takes what it is given.
+        """
+        found = self._method(kind, name)
+        if found is None:
+            return f"{kind.name} has no {name}"
+        qualified, symbol = found
+        if symbol in self.project.changing:
+            return f"{kind.name}'s {name} changes its object"
+        if qualified in self._pausing or symbol in self.project.pausing:
+            return f"{kind.name}'s {name} pauses"
+        if qualified in self._function_nodes:  # of this file
+            node = self._function_nodes[qualified]
+            moved = self._owned_signatures.get(qualified, (False, set()))[1]
+            parameters, result = list(self._annotations(node).values()), self._returns(qualified)
+        else:
+            compiled = getattr(kind.python, name, None)
+            if not isinstance(compiled, Function):
+                return f"{kind.name}'s {name} is not known yet"
+            moved = self.project.owned_signatures.get(compiled.name, (False, set()))[1]
+            annotations = dict(getattr(compiled.python, "__annotations__", {}))
+            result = scalar_type(annotations.pop("return", None))
+            parameters = [kind for parameter, kind in annotations.items() if parameter != "super"]
+        if moved or any(pointee is not None for pointee in self.project.pointer_params.get(symbol, [])):
+            return f"{kind.name}'s {name} takes what it is given"
+        return parameters, result
+
+    def _derived_method(self, kind: StructType, name: str) -> tuple[str, str] | None:
+        """Make the method ``name`` an object has from what it is made of; ``None`` when it has none.
+
+        An object built on Person (``& Person``) has Person's, called with its Person part;
+        a union has one when each of its objects has it, taking the same and giving the same:
+        it calls the one of the object the union holds.
+        """
+        found = unions.union(kind)
+        if found is not None:
+            sources = [(index, variant) for index, (_, variant) in enumerate(found.variants)]
+        else:
+            owner = next((base for base in bases.bases(kind) if self._method(base, name) is not None), None)
+            sources = [(None, owner)] if owner is not None else []
+        shapes = [self._method_shape(variant, name) for _, variant in sources]
+        if not shapes or any(isinstance(shape, str) for shape in shapes):
+            return None
+        first = shapes[0]
+        assert not isinstance(first, str)
+        if any(shape != first for shape in shapes):
+            return None
+        parameters, result = first
+        arguments = "".join(f", a{index}" for index in range(len(parameters)))
+        names: dict[str, object] = {}
+        lines = [f"def {{name}}(super{arguments}):"]
+        for place, (index, variant) in enumerate(sources):
+            names[f"V{place}"] = variant.python
+            if index is None:  # its base's, given its base's fields (read in place)
+                fields = ", ".join(f"{field}=super.{field}" for field, _ in variant.fields)
+                held, indent = f"V{place}({fields})", "    "
+            else:
+                held = f"super.{unions.slot(index)}"
+                last = place == len(sources) - 1
+                indent = "    " if last else "        "
+                if not last:
+                    lines.append(f"    if super.{unions.TAG} == {index}:")
+            call = f"V{place}.{name}({held}{arguments})"
+            lines += [f"{indent}return {call}"] if result is not None else [f"{indent}{call}", f"{indent}return"]
+        annotations: dict[str, object] = {"super": kind.python}
+        annotations |= {f"a{index}": parameter for index, parameter in enumerate(parameters)}
+        annotations["return"] = (result.python if isinstance(result, StructType) else result) or type(None)
+        compiled = self.project.drops.function(lines, names, annotations)
+        setattr(kind.python, name, compiled)
+        symbol = f"{self.prefix}{kind.name}_{name}"
+        self.project.methods.setdefault(kind.python, {})[name] = (f"{kind.name}.{name}", symbol)
+        self.project.method_results[symbol] = result
+        return self.project.methods[kind.python][name]
 
     def _method_result(self, kind: ScalarType, name: str) -> ScalarType | None:
         """Return what calling the method ``name`` on a ``kind`` gives."""
@@ -3449,18 +3967,29 @@ class SourceUnit:
         return self._expression(node)
 
     def _keep(self, core: Node) -> None:
-        """Mark an expression kept, and what makes its value: the call awaited, or each arm of a match."""
+        """Mark an expression kept, and what makes its value: the call awaited, or each arm of a match (or an if)."""
         self._owning.add(core.id)
         if core.type == "await_expression":
             awaited = core.child_by_field_name("value")
             if awaited is not None:
                 self._owning.add(_unwrap(awaited).id)
-        elif core.type == "match_expression":  # `let page = match r { ok(t): html(200, t), err(e): html(500, e) }`
-            for value in ownership.arm_values(core):
+        elif core.type in {"match_expression", "if"}:  # `let page = match r { ok(t): html(200, t), ... }`
+            for value in ownership.values(core):
                 self._keep(value)
 
     def _fresh(self, node: Node) -> bool:
-        """Whether an expression makes a new list, or a new record or object holding one (see ``ownership``)."""
+        """Whether an expression makes a new list, or a new record or object holding one (see ``ownership``).
+
+        An object owning nothing, put in a union, makes a new union (which frees nothing of it).
+        """
+        core = _unwrap(node)
+        expected = self._expected_values.get(core.id)
+        if expected is not None and unions.is_union(expected) and not owns(self._static_type(core)):
+            return owns(expected)
+        return self._makes_new(node)
+
+    def _makes_new(self, node: Node) -> bool:
+        """Whether an expression makes a new value that owns memory, whatever it is put in (see ``_fresh``)."""
         whole = core = _unwrap(node)  # an `await f()` has the type of what it waits for
         if core.type == "await_expression":
             awaited = core.child_by_field_name("value")
@@ -3472,8 +4001,8 @@ class SourceUnit:
             return True
         if core.type == "try_expression":
             return owns(self._static_type(core))  # the value taken out of a Result
-        if core.type == "match_expression":  # new when every arm makes a new one
-            values = ownership.arm_values(core)
+        if core.type in {"match_expression", "if"}:  # new when every arm (or branch) makes a new one
+            values = ownership.values(core)
             return bool(values) and all(self._fresh(value) for value in values)
         if core.type == "local_function_definition" or self._is_function_value(core):
             return True  # a new closure
@@ -3616,20 +4145,41 @@ class SourceUnit:
 
     def _match_type(self, node: Node) -> ScalarType | None:
         """Return the type of a match used as a value: its arms' values' (``ok(v): v`` is the Result's value's)."""
+        expected = self._expected_values.get(node.id)
+        if expected is not None and _converts(expected):
+            return expected  # each arm's value is put in the union (or object) it goes to
         scrutinee = _children(node)[0]
         subject = self._static_type(scrutinee)
         for arm, value in zip(_children(node)[1:], ownership.arm_values(node), strict=False):
-            pattern = results.pattern(_children(arm)[0])
+            pattern = self._arm_pattern(_children(arm)[0])
             bound = pattern[1] if pattern is not None else None
-            if bound is not None and value.type == "identifier" and _text(value) == _text(bound):
-                if subject is None or not results.is_result(subject):
+            binds = pattern is not None and bound is not None
+            if binds and value.type == "identifier" and _text(value) == _text(bound):
+                if subject is not None and unions.is_union(subject):
+                    kind = self._pattern_type(arm)
+                elif subject is None or not results.is_result(subject):
                     continue
-                kind = results.parts(subject)[0 if pattern[0] == results.OK else 1]
+                else:
+                    kind = results.parts(subject)[0 if pattern[0] == results.OK else 1]
             else:
                 try:
                     kind = self._static_type(value)
                 except BifrostError:
                     kind = None  # a name the arm binds: reported where it is lowered
+            if kind is not None:
+                return kind
+        return None
+
+    def _if_type(self, node: Node) -> ScalarType | None:
+        """Return the type of an ``if`` used as a value: its branches' values' (the first one known)."""
+        expected = self._expected_values.get(node.id)
+        if expected is not None and _converts(expected):
+            return expected  # each branch's value is put in the union (or object) it goes to
+        for value in ownership.branch_values(node):
+            try:
+                kind = self._static_type(value)
+            except BifrostError:
+                kind = None  # reported where it is lowered
             if kind is not None:
                 return kind
         return None
@@ -3870,7 +4420,7 @@ class SourceUnit:
 
     def _check_returns(self, name: str, return_node: Node, body: Node, result: object) -> None:
         """Require a function with a result to return it on every path, before anything else is checked in it."""
-        if result is type(None) or body.type != "block_expression" or _returns(body):
+        if result is type(None) or body.type != "block_expression" or _returns(body, self._exhaustive):
             return
         written = " ".join(_text(return_node).split())
         msg = f"{name} must return {written}, but its body can end without a `return`; return a {written} at the end"
@@ -4580,7 +5130,10 @@ class SourceUnit:
 
     @staticmethod
     def _field_kind(kind: ScalarType, name: str) -> ScalarType | None:
-        """Return the type of ``kind``'s field ``name``, if it is an object with one."""
+        """Return the type of ``kind``'s field ``name``, if it is an object with one (or a union whose objects do)."""
+        found_union = unions.union(kind)
+        if found_union is not None:
+            return found_union.shared(name)
         found = kind.field(name) if isinstance(kind, StructType) else None
         return scalar_type(found[1]) if found else None
 
@@ -4593,8 +5146,7 @@ class SourceUnit:
         if first and name in (self._scope.names | set(self._scope.guards)):
             return self._name_type(name)
         if kind is not None:
-            found = kind.field(name) if isinstance(kind, StructType) else None
-            return found[1] if found else None
+            return self._field_kind(kind, name)
         path.append(name)  # a module or object, the path to a function
         return None
 
@@ -4796,6 +5348,13 @@ class SourceUnit:
 
     def _object_text(self, value: Node, kind: StructType, lowered: ast.expr) -> ast.expr:
         """Return the text ``%v`` prints for an object: what its ``to_string`` returns (freed after, if owned)."""
+        found = unions.union(kind)
+        if found is not None and self._method(kind, "to_string") is None:
+            msg = (
+                f"%v prints a union with its to_string: give each of {found.shown()} one returning a string "
+                f"(or {found.name} its own)"
+            )
+            raise self.error(value, msg)
         if self._method(kind, "to_string") is None:
             msg = (
                 f"%v prints an object with its to_string, which {kind.name} does not have; add one: "
@@ -4973,12 +5532,52 @@ class SourceUnit:
         return name_node(slot, ast.Load())
 
     def _if_expression(self, node: Node) -> ast.expr:
-        """``if c { a } else { b }`` as a value, when each branch is one expression."""
-        condition, body, *rest = _children(node)
-        if not rest:
-            raise self.error(node, "an if used as a value needs an else")
-        orelse = self._if_expression(rest[0]) if rest[0].type == "if" else self._single(rest[0])
-        return self._at(ast.IfExp(self._expression(condition), self._single(body), orelse), node)
+        """``if c { a } else { b }`` as a value, when each branch is one expression: only the one taken is made.
+
+        A branch whose value needs statements first (``fmt.format``, a temporary) makes it an
+        ``if`` of statements assigning one variable (as a match's arms do); otherwise it is a
+        conditional expression. One whose branches all make new values owns what it gives.
+        """
+        assert self._scope is not None
+        kind = self._static_type(node)
+        fresh = owns(kind) and self._fresh(node)
+        if fresh:
+            for value in ownership.values(node):
+                self._keep(value)  # each branch's new value is the if's
+        steps: dict[int, tuple[list[ast.stmt], list[ast.stmt]]] = {}
+
+        def single(body: Node) -> ast.expr:
+            assert self._scope is not None
+            before, after = self._scope.before, self._scope.after
+            self._scope.before, self._scope.after = [], []
+            try:
+                value = self._single(body)
+                steps[id(value)] = (self._scope.before, self._scope.after)
+            finally:
+                self._scope.before, self._scope.after = before, after
+            return value
+
+        cases: list[tuple[ast.expr | None, ast.expr, Node]] = []
+        branch: Node | None = node
+        while branch is not None and branch.type == "if":
+            condition, body, *rest = _children(branch)
+            if not rest:
+                raise self.error(branch, "an if used as a value needs an else")
+            cases.append((self._expression(condition), single(body), branch))
+            branch = rest[0]
+        assert branch is not None
+        cases.append((None, single(branch), branch))
+        if not any(before or after for before, after in steps.values()):
+            value = cases[-1][1]
+            for test, body, at in reversed(cases[:-1]):
+                assert test is not None
+                value = self._at(ast.IfExp(test, body, value), at)
+        else:
+            value = self._match_statements(node, kind, cases, steps, fresh=fresh)
+        if fresh and node.id not in self._owning:
+            assert kind is not None
+            return self._temporary(value, kind, node)  # only lent: freed after the statement
+        return value
 
     def _match_expression(self, node: Node) -> ast.expr:
         """Lower a match used as a value: each arm's value, computed only when the arm matches.
@@ -5040,7 +5639,8 @@ class SourceUnit:
         if kind is None:
             raise self.error(node, "cannot tell the type of this match; name each arm's value first")
         if not fresh and any(after for _, after in steps.values()):
-            msg = "an arm of this match lends from a value freed when the arm ends; name that value before the match"
+            what, part = ("match", "an arm") if node.type == "match_expression" else ("if", "a branch")
+            msg = f"{part} of this {what} lends from a value freed when it ends; name that value before the {what}"
             raise self.error(node, msg)
         self._scope.temporaries += 1
         name = f"__bifrost_match_{self._scope.temporaries}"
@@ -5118,6 +5718,10 @@ class _JsonWriter:
 
     def write(self, expression: ast.expr, kind: ScalarType) -> None:
         """Append ``expression``, of type ``kind``: an object field by field, or a scalar."""
+        found = unions.union(kind)
+        if found is not None and not self.printing:  # %v prints a union as an object: with its to_string
+            self.write_union(expression, kind, found)
+            return
         if isinstance(kind, StructType):
             self.write_object(expression, kind)
             return
@@ -5169,6 +5773,34 @@ class _JsonWriter:
         )
         self.statements.append(unit._at(loop, self.node))
         self.pending.append("]")
+
+    def write_union(self, expression: ast.expr, kind: ScalarType, found: unions.Union) -> None:
+        """Append the object a union holds (its literal field, written with it, says which one it is)."""
+        unit = self.unit
+        assert unit._scope is not None
+        self.flush()
+        unit._scope.temporaries += 1
+        holder = f"__bifrost_json_union_{unit._scope.temporaries}"
+
+        def name(context: ast.expr_context | None = None) -> ast.Name:
+            return unit._at(ast.Name(holder, context or ast.Load()), self.node)
+
+        self.statements.append(unit._at(ast.Assign([name(ast.Store())], expression), self.node))
+        branches: list[ast.stmt] = []
+        for index in reversed(range(len(found.variants))):
+            held = _JsonWriter(unit, self.node, self.buffer)
+            held.write(
+                unit._at(ast.Attribute(name(), unions.slot(index), ast.Load()), self.node),
+                unions.variant_type(kind, index),
+            )
+            held.flush()
+            if not branches:  # the last one: whatever the others are not
+                branches = held.statements
+                continue
+            tag = unit._at(ast.Attribute(name(), unions.TAG, ast.Load()), self.node)
+            test = unit._at(ast.Compare(tag, [ast.Eq()], [ast.Constant(index)]), self.node)
+            branches = [unit._at(ast.If(test, held.statements, branches), self.node)]
+        self.statements += branches
 
     def write_object(self, expression: ast.expr, kind: StructType) -> None:
         unit = self.unit
@@ -5491,6 +6123,7 @@ _STATIC_TYPES: dict[str, Callable[[SourceUnit, Node], ScalarType | None]] = {
     "await_expression": SourceUnit._await_type,
     "try_expression": SourceUnit._try_type,
     "match_expression": SourceUnit._match_type,
+    "if": SourceUnit._if_type,
     "local_function_definition": SourceUnit._lambda_type,
     pipes.LAMBDA_CALL: SourceUnit._pipe_lambda_type,
     "get_expression": lambda unit, node: (
@@ -5520,6 +6153,11 @@ _EXPRESSIONS: dict[str, Callable[[SourceUnit, Node], ast.expr]] = {
     "pipe_expression": SourceUnit._pipe,
     pipes.LAMBDA_CALL: SourceUnit._pipe_lambda,
 }
+
+
+def _converts(kind: object) -> bool:
+    """Whether a value put where ``kind`` goes may become one: a union (of it), or an object others are built on."""
+    return unions.is_union(kind) or bases.is_base(kind)
 
 
 def lower_file(project: Project, path: Path, source: bytes | None = None, root: Path | None = None) -> SourceUnit:

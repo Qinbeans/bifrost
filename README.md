@@ -179,6 +179,27 @@ let main = [] () => null {
 
 A copy cannot call one, since no one would see the change: a parameter (take it as a `mem.Weak[Counter]` instead), the item a `forall` reads, or `super` in a method that does not lock it.
 
+An object can be built on others with `&`: it has their fields (after its own) and their methods, and it is one of them wherever one goes:
+
+```bifrost
+let Person = struct {
+    let name: mem.Unique[str],
+    let age: i64,
+    let greet = [super, fmt.format] () => mem.Unique[str] fmt.format("hi %s", super.name)
+}
+let Employee = struct { let employee_id: mem.Unique[str] } & Person
+let Manager = struct { let reports: i64[] } & Employee     // a Person too
+
+let describe = [io.printf] (p: Person) => null { io.printf("%s is %d\n", p.name, p.age) }
+
+let e = Employee(fmt.format("e1"), fmt.format("ada"), 36)   // its own fields, then Person's
+e.greet()                       // Person's method, given e's Person part
+describe(e)                     // lent as a Person: its Person fields, read in place
+let p: Person = e               // kept as one: e moves, and its own fields (employee_id) are freed
+```
+
+An Employee goes where a Person does: a parameter, a `let`'s type, a returned value, an object's field, a list's item, or a union that holds Persons. Lent (a parameter), it is read in place; kept, it moves, as any owned value does, and becomes the Person it holds. Its methods are its own: `describe` calls Person's, not an Employee's of the same name. A member of the same name as a base's (a field, or a field and a method) is an error, and a base is an object declared before it, not a union, a Result or a generic object.
+
 ### Owners, guards and shared values
 
 `std:mem` holds the containers that say how a value is held. A `mem.Unique[T]` local is the one owner of its value; a `mem.Weak[T]` parameter is that value lent to a call. Either is reached only through a guard, a lock that exists only at compile time. A plain `let` is owned by its function alone too, and is lent to a `mem.Weak` parameter the same way (as is a part of what a guard holds, like `g[i]`); `mem.Unique` also makes every use of it go through a guard.
@@ -359,6 +380,47 @@ let show = [io.printf] (r: Result[i64, str]) => null {
 `x?` is the value `x` holds; if it holds an error, the function returns it at once, freeing what is alive as `return` does, so its result must be a `Result` with the same error type (and no guard may be held). `Result[null, E]` says only whether something worked: `ok()`, and `check()?` as a statement. In a `match`, `ok(v)` binds the value and `err(e)` the error (`_` binds nothing); the two arms cover every Result. `r.is_ok()` and `r.is_err()` say which it holds. A Result owns what it holds, and frees only the side it holds; a `match` on one that owns names it first (`let r = find(id)`).
 
 A `match` is a value too: `let page = match r { ok(text): axum.html(200, text), err(e): axum.html(500, e) }`. Only the arm that matches runs. When every arm makes a new value (a call returning an owned string, a list, a handle), the match's value is new as well and owned by where it goes, like a call's; arms that give back what the Result holds (`ok(t): t`) lend it, and it stays the Result's.
+
+### Unions
+
+A union is a value that is one of several objects: `let Actor = Employee | Service on "type"`. Each object has the field named after `on` as a literal field, `let type: "employee"`, a field that only ever holds that text, a different one in each object. An object put where a union goes joins it (a `let`'s type, a parameter, a field, a list's item, a returned value, each arm of a `match`); `match` reads the one it holds, naming each object:
+
+```
+let Employee = struct { let type: "employee", let name: mem.Unique[str], let age: i64 }
+let Service = struct { let type: "service", let name: str }
+let Actor = Employee | Service on "type"
+
+let hire = [fmt.format] (n: i64) => Actor {
+    if n > 1 {
+        return Service("api")
+    }
+    return Employee(name: fmt.format("worker %d", n), age: 30)
+}
+
+let describe = [io.printf] (actor: Actor) => null {
+    match actor {
+        Employee(e): io.printf("%s, %d\n", e.name, e.age),
+        Service(s): io.printf("service %s\n", s.name)
+    }
+}
+```
+
+A literal field is filled in when its object is built, so it is left out of the call (`Service("api")` fills `name`), and nothing can change it: `Service(type: "x", ...)` and `g.type = "x"` are errors, and reading `s.type` always gives `"service"`. A union checks that each of its objects has the field, and that no two hold the same text.
+
+`Employee(e)` binds the Employee the union holds (`Employee(_)` binds nothing); arms naming every object cover the union, and `_` covers the rest. It owns what its objects own, and frees only the one it holds; a `match` on one that owns names it first (`let a = hire(1)`), and `e.name` stays the union's. A union is of objects declared before it (in this file, a module of it, or one it imports: `models.Employee`), not of generic objects or other unions. An object built on one of its objects (`& Employee`) goes in as that one.
+
+A union reads what each of its objects has alike, as TypeScript's do: `actor.type`, and `actor.name` when every object's `name` has one type (Employee's `mem.Unique[str]` and Service's `str` differ, so that one is read with `match`). It calls a method each of its objects has, taking and giving the same, on the one it holds: `%v` prints it with their `to_string`s, and an axum handler's error can be a union of objects with `into_response`. And it can have functions of its own, in braces after `on`, where `super` is the union:
+
+```
+let ApiError = NotFound | Invalid on "kind" {
+    let status = [super] () => i64 match super { NotFound(_): 404, Invalid(_): 422 },
+    static let missing = [] (what: str) => ApiError NotFound(what)
+}
+```
+
+Its own functions come first; a union holds no fields of its own (its objects do), and a method that changes its object, or pauses, is called through `match`.
+
+`json.encode` writes a union as the object it holds, with its literal field: `{"type": "employee", "name": "ada", "age": 30}`. `json.decode` reads that field first, wherever it is in the JSON object, to know which object to read (``no object has `type` "robot"`` when none holds that text), and decoding an object checks its literal fields hold their text. `form` cannot read a union.
 
 ### Files
 
@@ -719,7 +781,7 @@ index:                           # indexes by name: pages of links to .bifpkg fi
 
 A package given only a version comes from the index named `default`, or else from `https://qinbeans.github.io/bifrost/packages/`. `bfc add` writes these entries and installs the package: `bfc add raylib` (the newest version), `bfc add raylib@0.1.2`, `bfc add http_server --index extras` (an index `config.yaml` names; `--index extras=URL` adds it), or `bfc add --path ../greeting`. It changes only the entry's lines, and leaves `config.yaml` as it was if the package cannot be installed.
 
-`bfc sync` fetches what the project needs (into `~/.cache/bifrost/packages`) and unpacks it into `build/pkg/<name>/`, removing packages it no longer lists; `bfc build` and `bfc add` install what is missing too. A package's externs and libraries join the project's, and its modules import like the project's own: `import("http_server.handlers:handlers")` looks in the project's `src/`, then in each package's. The editor uses packages already unpacked, and says when one needs `bfc sync` first.
+`bfc sync` fetches what the project needs (into `~/.cache/bifrost/packages`) and unpacks it into `build/pkg/<name>/`, removing packages it no longer lists; `bfc build` and `bfc add` install what is missing too. A package used by `path:` is used as it is, but when a C library it links is missing, these build it first with its `CMakeLists.txt` (`cmake -S <package> -B <package>/build`, with Ninja when installed, then `cmake --build`); rebuilding one after changing its C code is still yours to run. A package's externs and libraries join the project's, and its modules import like the project's own: `import("http_server.handlers:handlers")` looks in the project's `src/`, then in each package's. The editor uses packages already unpacked, and says when one needs `bfc sync` first.
 
 The packages in `extras/` (each with `build: library`) are published to the default index for x86_64 and aarch64 Linux. Releasing one is bumping `package.version` in its `config.yaml`: on the push to `main`, CI (`.github/workflows/packages.yml`) builds its C libraries with CMake on each target, runs `bfc package`, and publishes the archives as release `<name>-v<version>`; the index (`tools/package_index.py`) links every release's `.bifpkg` with its SHA-256, which `bfc build` checks before using a download.
 
@@ -733,6 +795,10 @@ bifrost/
 │   ├── guards.py          # Checks locks and releases along every path
 │   ├── ownership.py       # Checks moves of owned values, and plans where they are freed
 │   ├── results.py         # Result[T, E]: its types, and its match patterns
+│   ├── unions.py          # Unions (`Employee | Service on "type"`): their types, and their match patterns
+│   ├── literals.py        # Literal fields (`let type: "employee"`): what each holds
+│   ├── bases.py           # Objects built on others (`struct { ... } & Person`)
+│   ├── log.py             # The steps `bfc build` says as it works
 │   ├── decoding.py        # The decoders json.decode and form.decode compile to
 │   ├── pipes.py           # Reads `x |> f(a)` as the call `f(x, a)`, for every check and the lowering
 │   ├── generics.py        # Generic functions and objects, and what each was compiled for
@@ -818,16 +884,27 @@ bfc version 1.0.0 --dry-run    # show the change without writing it
 bfc version --short            # 0.1.0
 ```
 
-The raylib example uses the raylib package, whose C library is built first:
+`bfc build`, `bfc sync`, `bfc add` and `bfc package` say each step on stderr, as Cargo does:
+
+```
+       Using raylib 0.1.2 (path ../../extras/raylib)
+    Building raylib 0.1.2's C libraries (../../extras/raylib)
+             cmake -S ../../extras/raylib -B ../../extras/raylib/build -G Ninja
+             cmake --build ../../extras/raylib/build
+   Compiling breakout 0.1.0 (src/breakout/main.bif)
+   Compiling breakout/world.bif
+     Linking build/breakout (-O2, 3 libraries)
+```
+
+(`Fetching` an index, `Downloading` and `Unpacking` a package, and `Packaging` one, likewise.) The raylib example uses the raylib package from the index, its C library built already:
 
 ```bash
-(cd extras/raylib && cmake -S . -B build && cmake --build build)   # builds extras/raylib/build/lib/libraylib.a
 cd examples/raylib
 bfc build
 ./build/hello_raylib
 ```
 
-Breakout uses the game engine and raylib by path, so raylib's C library is built first too (the engine is all Bifrost):
+Breakout uses the game engine and raylib by path (the engine is all Bifrost); the first `bfc build` builds raylib's C library:
 
 ```bash
 cd examples/breakout

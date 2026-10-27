@@ -21,7 +21,10 @@ let ApiError = struct {
     let into_response = [super, axum.json] () => axum.Response axum.json(super.status, #{error: super.message})
 }
 
-let root = [fs.read_to_string, axum.text] () => Result[response.Html[mem.Unique[str]], axum.Response] {
+let root = [
+    fs.read_to_string,
+    axum.text
+] () => Result[response.Html[mem.Unique[str]], axum.Response] {
     /* The page in index.html (read on each request: edit it and reload) */
     let page = fs.read_to_string("index.html")
     match page {

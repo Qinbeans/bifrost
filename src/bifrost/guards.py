@@ -109,6 +109,10 @@ class _Checker:
         self.pauses = pauses  # whether a call can pause
         self.values = values  # held names whose value is not an object: a guard on one is read as a value
         self.lends = lends  # whether calling a method (name, method) lends the held name: it changes its object
+        # A match arm's condition as a pattern (`ok(v)`, `Employee(e)`), which reads nothing; and whether a
+        # match's arms (their conditions) cover every value, with no `_`.
+        self.pattern: Callable[[Node], tuple[str, Node | None] | None] = results.pattern
+        self.exhaustive: Callable[[list[Node]], bool] = results.exhaustive
 
     # -- statements ---------------------------------------------------------------
 
@@ -282,12 +286,12 @@ class _Checker:
         scrutinee, *arms = _named(node)
         self.uses(scrutinee, state)
         paths: list[tuple[_State | None, str]] = []
-        has_default = results.exhaustive([_named(arm)[0] for arm in arms])  # `ok(v)` and `err(e)`
+        has_default = self.exhaustive([_named(arm)[0] for arm in arms])  # `ok(v)` and `err(e)`
         for arm in arms:
             condition, body = _named(arm)
             if _unwrap(condition).type == "default_var":
                 has_default = True
-            elif results.pattern(condition) is None:  # `ok(v)` binds v; it reads nothing
+            elif self.pattern(condition) is None:  # `ok(v)` binds v; it reads nothing
                 self.uses(condition, state)
             label = f"in the `{' '.join(_text(condition).split())}` arm (line {_line(arm)})"
             branch = state.copy()
@@ -464,24 +468,30 @@ class _Checker:
             raise GuardError(node, msg)
 
 
-def check(
+def check(  # noqa: PLR0913 - each is a question the check asks the compiler
     body: Node,
     held: dict[str, str],
     pauses: Callable[[Node], bool] = lambda _: False,
     values: frozenset[str] = frozenset(),
     lends: Callable[[str, str], bool] = lambda _name, _method: False,
+    *,
+    pattern: Callable[[Node], tuple[str, Node | None] | None] = results.pattern,
+    exhaustive: Callable[[list[Node]], bool] = results.exhaustive,
 ) -> None:
     """Check the guards in a function ``body``; ``held`` maps its ``mem`` parameters and locals to their container.
 
     ``pauses`` tells whether a call (a ``function_call`` or ``child_annotation``) can pause;
     ``values`` names the held values that are not objects, whose guards read and write them whole;
-    ``lends`` tells whether calling a method on a held name lends it (the method changes its object).
+    ``lends`` tells whether calling a method on a held name lends it (the method changes its object);
+    ``pattern`` reads a match arm's condition as a pattern (``ok(v)``, ``Employee(e)``), and
+    ``exhaustive`` tells whether a match's arms cover every value it may match.
 
     Raises:
         GuardError: At the first rule broken.
 
     """
     checker = _Checker(held, pauses, set(values), lends)
+    checker.pattern, checker.exhaustive = pattern, exhaustive
     state = _State({}, {})
     if body.type == "block_expression":
         checker.block(body, state)

@@ -726,3 +726,108 @@ def test_list_methods_in_the_editor(tmp_path: Path) -> None:
         "```bifrost\nlet filter = (f: (x: i64) => bool) => i64[]\n// a new list of copies of the items f keeps\n```"
     )
     assert ": i64[]" in [hint.label for hint in document.inlay_hints()]
+
+
+UNIONS = """\
+let io = import("std:stdio")
+let Employee = struct {
+    let type: "employee",
+    let name: str,
+    let age: i64
+}
+let Service = struct { let type: "service", let name: str }
+let Actor = Employee | Service on "type"
+let hire = [] (_n: i64) => Actor Service("api")
+let parse = [] (n: i64) => Result[i64, str] ok(n)
+let main = [io.printf, hire, parse] () => null {
+    let a = hire(1)
+    match a {
+        Employee(e): io.printf("%s %d\\n", e.name, e.age),
+        Service(s): io.printf("%s\\n", s.name)
+    }
+    let r = parse(2)
+    match r { ok(v): io.printf("%d\\n", v), err(x): io.printf("%s\\n", x) }
+}
+"""
+
+
+def test_unions_in_the_editor() -> None:
+    # A union is an object (PascalCase, in the outline); what a match arm's pattern binds has the
+    # type of the object it names (or the Result's value or error), and the fields of that object.
+    document = Document.open(EXAMPLES / "scratch.bif", UNIONS)
+    assert document.diagnostics() == []
+    assert ("Actor", SymbolKind.UNION, 'Employee | Service on "type"') in [
+        (s.name, s.kind, s.detail) for s in document.symbols()
+    ]
+    assert document.hover(_position(UNIONS, "e.name")) == "```bifrost\ne: Employee\n// the Employee a holds\n```"
+    assert document.hover(_position(UNIONS, "s.name")) == "```bifrost\ns: Service\n// the Service a holds\n```"
+    assert document.hover(_position(UNIONS, "v)", 1)) == "```bifrost\nv: i64\n// the value r holds\n```"
+    assert document.hover(_position(UNIONS, "x)", 1)) == "```bifrost\nx: str\n// the error r holds\n```"
+    definition = document.definition(_position(UNIONS, "e.name"))
+    assert definition is not None
+    assert definition.range == (_position(UNIONS, "e)"), (_position(UNIONS, "e)")[0], _position(UNIONS, "e)")[1] + 1))
+    hints = [(hint.label, hint.position) for hint in document.inlay_hints()]
+    assert (": Actor", (11, 9)) in hints
+    assert ("name:", (8, 41)) in hints  # `Service("api")` fills name: type is filled in, always "service"
+    assert sum(label == "name:" for label, _ in hints) == 1  # `Employee(e)` binds e; it fills no field
+    typing = UNIONS.replace('io.printf("%s %d\\n", e.name, e.age)', "e.")
+    line = typing.splitlines().index("        Employee(e): e.,")
+    completions = Document.open(EXAMPLES / "scratch.bif", typing).completions((line, len("        Employee(e): e.")))
+    assert [(c.label, c.kind) for c in completions] == [("type", "field"), ("name", "field"), ("age", "field")]
+    assert completions[0].detail == 'let type: "employee"'
+    typing = UNIONS.replace("    match a {", "    a.\n    match a {")
+    line = typing.splitlines().index("    a.")
+    offered = Document.open(EXAMPLES / "scratch.bif", typing).completions((line, len("    a.")))
+    assert [(c.label, c.kind) for c in offered] == [("type", "field"), ("name", "field")]  # what each has alike
+    lowered = UNIONS.replace("let Actor =", "let actor =").replace("=> Actor", "=> actor")
+    messages = [d.message for d in Document.open(EXAMPLES / "scratch.bif", lowered).naming()]
+    assert messages == ["object 'actor' should be PascalCase: 'Actor'"]
+
+
+COMPOSED = """\
+let fmt = import("std:fmt")
+let mem = import("std:mem")
+let Person = struct {
+    let name: str,
+    let age: i64,
+    let greet = [super, fmt.format] () => mem.Unique[str] fmt.format("hi %s", super.name)
+}
+let Employee = struct { let type: "employee", let id: str } & Person
+let Robot = struct {
+    let type: "robot",
+    let serial: i64,
+    let greet = [fmt.format] () => mem.Unique[str] fmt.format("beep")
+}
+let Actor = Employee | Robot on "type" {
+    let label = [super] () => i64 match super { Employee(_): 1, Robot(r): r.serial }
+}
+let main = [] () => null {
+    let e = Employee("e1", "ada", 3)
+    let a: Actor = e
+    let _n = a.label()
+}
+"""
+
+
+def test_objects_built_on_others_in_the_editor() -> None:
+    # An Employee (& Person) has Person's fields and methods; building one takes its own fields,
+    # then Person's. A union offers what each of its objects has alike, and its own functions.
+    document = Document.open(EXAMPLES / "scratch.bif", COMPOSED)
+    assert document.diagnostics() == []
+    hints = [hint.label for hint in document.inlay_hints()]
+    assert [label for label in hints if label in {"id:", "name:", "age:", "type:"}] == ["id:", "name:", "age:"]
+    assert document.hover(_position(COMPOSED, "Employee(")).endswith("} & Person\n```")
+    typing = COMPOSED.replace("    let a: Actor = e\n", "    let a: Actor = e\n    e.\n")
+    line = typing.splitlines().index("    e.")
+    offered = Document.open(EXAMPLES / "scratch.bif", typing).completions((line, len("    e.")))
+    assert [(c.label, c.kind) for c in offered] == [
+        ("type", "field"),
+        ("id", "field"),
+        ("name", "field"),
+        ("age", "field"),
+        ("greet", "method"),
+    ]
+    typing = COMPOSED.replace("    let a: Actor = e\n", "    let a: Actor = e\n    a.\n")
+    line = typing.splitlines().index("    a.")
+    offered = Document.open(EXAMPLES / "scratch.bif", typing).completions((line, len("    a.")))
+    assert [(c.label, c.kind) for c in offered] == [("type", "field"), ("label", "method"), ("greet", "method")]

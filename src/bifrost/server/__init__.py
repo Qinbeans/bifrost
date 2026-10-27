@@ -31,6 +31,7 @@ _SEVERITIES = {
 _SYMBOL_KINDS = {
     SymbolKind.FUNCTION: types.SymbolKind.Function,
     SymbolKind.STRUCT: types.SymbolKind.Struct,
+    SymbolKind.UNION: types.SymbolKind.Enum,
     SymbolKind.MODULE: types.SymbolKind.Module,
     SymbolKind.CONSTANT: types.SymbolKind.Constant,
 }
