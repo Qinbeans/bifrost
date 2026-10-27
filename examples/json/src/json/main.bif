@@ -1,0 +1,55 @@
+let stdio = import("std:stdio")
+let fmt = import("std:fmt")
+let json = import("std:json")
+
+let Car = struct {
+    let type: "car",
+    let make: str,
+    let model: str,
+    let get_info = [super, fmt.format] () => str fmt.format("[Car] Make: %s, Model: %s", super.make, super.model)
+}
+
+let Airplane = struct {
+    let type: "airplane",
+    let make: str,
+    let model: str,
+    let get_info = [super, fmt.format] () => str fmt.format("[Airplane] Make: %s, Model: %s", super.make, super.model)
+}
+
+let Vehicle = Car | Airplane on "type"
+
+let Person = struct {
+    let name: str,
+    let age: i64,
+    let owned_vehicles: Vehicle[],
+    let get_info = [super, fmt.format] () => str fmt.format("[Person] Name: %s, Age: %d", super.name, super.age)
+}
+let Employee = struct {
+    let employee_id: str,
+    let get_info = [super, fmt.format] () => str fmt.format("[Employee] Employee ID: %s, Name: %s, Age: %d", super.employee_id, super.name, super.age)
+} & Person
+
+let print_encoded_person = [stdio.printf, json.encode] (person: Person) => null {
+    stdio.printf("%s\n", json.encode(person))
+}
+
+let main = [stdio.printf, json.encode, print_encoded_person] () => null {
+    let car: Vehicle = Car(make: "Toyota", model: "Corolla")
+    let airplane: Vehicle = Airplane(make: "Boeing", model: "747")
+    let person = Person(name: "Alice", age: 30, owned_vehicles: #[car])
+    let employee = Employee(
+        employee_id: "E123",
+        name: "Bob",
+        age: 40,
+        owned_vehicles: #[airplane]
+    )
+    print_encoded_person(person)
+    print_encoded_person(employee)
+    stdio.printf("%s\n", person.get_info())
+    stdio.printf("%s\n", employee.get_info())
+
+    stdio.printf("%s\n", json.encode(car))
+    stdio.printf("%s\n", json.encode(airplane))
+    stdio.printf("%s\n", car.get_info())
+    stdio.printf("%s\n", airplane.get_info())
+}

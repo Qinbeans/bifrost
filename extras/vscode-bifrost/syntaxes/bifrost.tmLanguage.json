@@ -16,6 +16,9 @@
 			"include": "#function-definition"
 		},
 		{
+			"include": "#type-definition"
+		},
+		{
 			"include": "#variable-declaration"
 		},
 		{
@@ -335,6 +338,35 @@
 				},
 				"7": {
 					"name": "storage.type.struct.bifrost"
+				}
+			}
+		},
+		"type-definition": {
+			"comment": "let Name = Car | Airplane on \"type\", or any other PascalCase let that is not a function: objects are PascalCase, so the name is a type",
+			"match": "\\b(let)\\s+([A-Z][a-zA-Z0-9]*)(?:\\s*(\\[)([^\\]]*)(\\]))?\\s*(=)",
+			"captures": {
+				"1": {
+					"name": "storage.type.bifrost"
+				},
+				"2": {
+					"name": "entity.name.type.bifrost"
+				},
+				"3": {
+					"name": "punctuation.definition.type-parameters.begin.bifrost"
+				},
+				"4": {
+					"patterns": [
+						{
+							"name": "entity.name.type.parameter.bifrost",
+							"match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+						}
+					]
+				},
+				"5": {
+					"name": "punctuation.definition.type-parameters.end.bifrost"
+				},
+				"6": {
+					"name": "keyword.operator.assignment.bifrost"
 				}
 			}
 		},
