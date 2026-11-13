@@ -81,6 +81,13 @@ def _use(cell: str) -> str:
 
 INERT = "  %one = arith.constant 1 : i64\n  %v = llvm.load %a : !llvm.ptr -> i64\n  %w = arith.addi %v, %one : i64"
 
+# Between two cell operations, each of these could let another owner or thread see the gap. Even
+# empty, a branch or a loop is not inert: what is in it does not run once, in the order written.
+BRANCH = "  %true = arith.constant true\n  scf.if %true {\n  }"
+LOOP = "  %c0 = arith.constant 0 : index\n  %c1 = arith.constant 1 : index\n  scf.for %i = %c0 to %c1 step %c1 {\n  }"
+AWAITED = "  %t = builtin.unrealized_conversion_cast %b : !llvm.ptr to !async.token"  # as lowering makes one
+AWAIT = "  async.await %t : !async.token"  # other code runs meanwhile
+
 
 def test_calls_become_bifrost_operations_and_back() -> None:
     body = "\n".join(
@@ -129,14 +136,18 @@ def test_nested_pairs_cancel_out() -> None:
         (_unlock("%b", "atomic"), "an unlock lets another thread go on, and drop its owner"),
         (_lock("%b"), "a lock may wait"),
         ("  %v = llvm.load %a atomic acquire {alignment = 8 : i64} : !llvm.ptr -> i64", "an atomic load synchronizes"),
+        ("  %v = llvm.load volatile %a : !llvm.ptr -> i64", "a volatile load may be seen"),
         (
             "  %true = arith.constant true\n  scf.if %true {\n" + _use("%a") + "\n  }",
             "a branch, with a call in it",
         ),
+        (BRANCH, "a branch"),
+        (LOOP, "a loop"),
+        (AWAIT, "an await runs other code, which may drop its owner"),
     ],
 )
 def test_a_retain_and_a_release_with_anything_visible_between_are_kept(between: str, why: str) -> None:
-    text = _run("\n".join([_retain("%a"), between, _release("%a")]))
+    text = _run("\n".join([AWAITED, _retain("%a"), between, _release("%a")]))
     assert _calls(text, "retain") == 1, why
     assert _calls(text, "release") >= 1, why
 
@@ -175,11 +186,54 @@ def test_an_unlock_then_a_lock_of_the_same_cell_merge(kind: str) -> None:
         _retain("%a"),
         _lock("%b"),
         _unlock("%b"),
+        BRANCH,
+        LOOP,
+        AWAIT,  # a guard is not held across one: other code may lock the cell meanwhile
+        "  %v = llvm.load %b atomic acquire {alignment = 8 : i64} : !llvm.ptr -> i64",
     ],
 )
-def test_an_unlock_and_a_lock_with_anything_but_inert_operations_between_are_kept(between: str) -> None:
-    text = _run("\n".join([_lock("%a"), _unlock("%a"), between, _lock("%a"), _unlock("%a")]))
+@pytest.mark.parametrize("kind", ["shared", "atomic"])
+def test_an_unlock_and_a_lock_with_anything_but_inert_operations_between_are_kept(between: str, kind: str) -> None:
+    body = [AWAITED, _lock("%a", kind), _unlock("%a", kind), between, _lock("%a", kind), _unlock("%a", kind)]
+    text = _run("\n".join(body))
     assert _calls(text, "lock") >= 2
+
+
+@pytest.mark.parametrize("pause", ["", _use("%b")])
+@pytest.mark.parametrize("kind", ["shared", "atomic"])
+def test_a_guard_taken_again_by_a_loop_is_given_back_each_time(kind: str, pause: str) -> None:
+    # A polling loop: its unlock ends an iteration and its lock starts the next, with or without a
+    # call (a sleep) after the unlock. Each stays, so another thread can take the mutex between;
+    # merged, the loop would hold it from its first iteration on.
+    for_loop = "\n".join(
+        [
+            "  %c0 = arith.constant 0 : index",
+            "  %c9 = arith.constant 9 : index",
+            "  %c1 = arith.constant 1 : index",
+            "  scf.for %i = %c0 to %c9 step %c1 {",
+            _lock("%a", kind),
+            INERT,
+            _unlock("%a", kind),
+            pause,
+            "  }",
+        ]
+    )
+    branches = "\n".join(
+        [
+            "  cf.br ^poll",
+            "^poll:",
+            _lock("%a", kind),
+            INERT,
+            _unlock("%a", kind),
+            pause,
+            "  %again = llvm.load %b : !llvm.ptr -> i1",
+            "  cf.cond_br %again, ^poll, ^done",
+            "^done:",
+        ]
+    )
+    for body in (for_loop, branches):
+        text = _run(body)
+        assert _calls(text, "lock") == _calls(text, "unlock") == 1
 
 
 def test_a_lock_then_an_unlock_are_kept() -> None:

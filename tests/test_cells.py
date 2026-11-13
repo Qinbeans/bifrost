@@ -5,6 +5,7 @@ counts ``malloc`` and ``free``: every cell is freed once its last owner is gone.
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -150,12 +151,18 @@ def _project(tmp_path: Path) -> Project:
             }
         ),
     ]
+    sleep = _Function.model_validate(
+        {"name": "usleep", "as": "usleep", "type": "function", "parameters": {"microseconds": "u32"}, "return": "i32"}
+    )
     return Project(
         Config(
             path=tmp_path,
             package={"name": "cells", "version": "0", "description": ""},
             flags={"optimization": 0, "linker": "clang"},
-            externs=[_Extern(module="pthread", description="POSIX threads", declarations=declarations)],
+            externs=[
+                _Extern(module="pthread", description="POSIX threads", declarations=declarations),
+                _Extern(module="unistd", description="Sleeping", declarations=[sleep]),
+            ],
         )
     )
 
@@ -403,3 +410,69 @@ def test_guards_and_owners_with_calls_between_are_kept(tmp_path: Path) -> None:
     result = subprocess.run([executable], capture_output=True, text=True, check=True, env=_counting(tmp_path))  # noqa: S603
     assert result.stdout.splitlines() == ["6"]
     assert "live allocations: 1" in result.stderr
+
+
+# A thread counts to 1100 (the last 100 with a sleep after each guard) while main polls the count
+# until it gets there. Each loop gives the mutex back at the end of an iteration and takes it again
+# at the top of the next: merged, main would hold it from its first poll on, and the worker wait.
+POLLING = r"""
+let io = import("std:stdio")
+let mem = import("std:mem")
+let pthread = import("pthread")
+let unistd = import("unistd")
+
+let Counter = struct { let hits: i64, let polls: i64 }
+let Thread = struct { let id: u64 }
+
+let work = [unistd.usleep] (counter: mem.Atomic[Counter]) => null {
+    let i = 0
+    while i < 1000 {
+        let g <- counter
+        g.hits = g.hits + 1
+        g -> counter
+        let i = i + 1
+    }
+    let i = 0
+    while i < 100 {
+        let g <- counter
+        g.hits = g.hits + 1
+        g -> counter
+        unistd.usleep(10)
+        let i = i + 1
+    }
+}
+
+let main = [io.printf, pthread.create, pthread.join, work] () => null {
+    let counter: mem.Atomic[Counter] = Counter(hits: 0, polls: 0)
+    let worker: mem.Unique[Thread] = Thread(id: 0)
+    pthread.create(worker, 0, work, counter)
+    let seen = 0
+    while seen < 1100 {
+        let g <- counter
+        let seen = g.hits
+        g -> counter
+        let h <- counter
+        h.polls = h.polls + 1
+        h -> counter
+    }
+    let w <- worker
+    pthread.join(w.id, 0)
+    w -> worker
+    let g <- counter
+    io.printf("%lld %d\n", g.hits, g.polls > 0)
+    g -> counter
+}
+"""
+
+
+def test_a_polling_loop_gives_the_mutex_back_each_iteration(tmp_path: Path) -> None:
+    executable, mlir = _emitted(tmp_path, POLLING)
+    # One guard in each of work's loops; in main's, g and h are one (nothing between), and the last.
+    assert _cell_calls(mlir, "lock") == _cell_calls(mlir, "unlock") == 4
+    bodies = re.findall(r"(?:scf\.for [^\n]*|\} do) \{\n(.*?)\n    \}", mlir, re.DOTALL)  # main's and work's
+    assert len(bodies) == 3
+    for body in bodies:
+        assert _cell_calls(body, "lock") == _cell_calls(body, "unlock") == 1
+        assert body.index("_lock(") < body.index("_unlock(")
+    result = subprocess.run([executable], capture_output=True, text=True, check=True, timeout=60)  # noqa: S603
+    assert result.stdout.splitlines() == ["1100 1"]

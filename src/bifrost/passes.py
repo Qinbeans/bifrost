@@ -119,7 +119,9 @@ class OptimizeCells(passes.PythonPass):
       only rules out one interleaving (another thread taking the mutex in it),
       which the program cannot rely on; as nothing between waits, calls, or
       synchronizes, no deadlock or new wait is added. Removed only if nothing
-      but inert operations is between.
+      but inert operations is between. A loop's lock comes before its unlock
+      in its body's block, so a polling loop still gives the mutex back at the
+      end of each iteration, and another thread can take it.
 
     Operations between are only "inert" ones (``_INERT``, and plain loads and
     stores); the pass repeats until nothing more is removed, so pairs around
