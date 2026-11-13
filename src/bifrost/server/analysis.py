@@ -20,7 +20,7 @@ from mlir_python.lang import CompileError
 from tree_sitter import Language, Node, Parser
 
 from bifrost import generics, list_methods, pipes, results, std, unions
-from bifrost.configs import Config, ConfigBuilder, source_root
+from bifrost.configs import Config, ConfigBuilder, features, source_root
 from bifrost.configs.schema import Declaration, _Extern
 from bifrost.lowering import RECORD, BifrostError, display_types, lower_file
 from bifrost.naming import extern_name, is_constant_case, is_pascal_case, is_snake_case, to_pascal_case, to_snake_case
@@ -32,6 +32,7 @@ from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
 _MODULE_MEMBER = 2  # parts in ``module.Member``
+_MAX_DEPTH = 16  # how many type parameters a type is followed through (`T` is `U` is ...)
 # What a dependency list names of the language's own (see ``bifrost.lowering``): `copy`, `list.sorted`, `Result.is_ok`.
 _COPY = "copy"
 _COPY_SUMMARY = "a deep copy of x: a new owner of the lists, strings and function values it holds"
@@ -117,6 +118,68 @@ class InlayHint:
     label: str  # e.g. ": Guard[Context]", or "status:" before an argument
     parameter: bool = False  # names the parameter an argument fills, rather than a type
     tooltip: str = ""  # the whole type, where the label shortens it
+
+
+@dataclass
+class _Type:
+    """A type as written (``json.Json[User]``), in the document that wrote it.
+
+    ``bound``: what the type parameters in it stand for (``T`` -> ``User``, as main.bif wrote it).
+    """
+
+    document: "Document"
+    text: str
+    bound: "dict[str, _Type]" = field(default_factory=dict)
+
+
+@dataclass
+class _Object:
+    """An object or union (its ``struct_assignment`` or ``union_definition``), with its type parameters filled."""
+
+    document: "Document"
+    value: Node
+    name: str  # as the code reaching it wrote it: ``Context``, ``state.AppState``
+    bound: dict[str, _Type] = field(default_factory=dict)
+
+
+@dataclass
+class _CStruct:
+    """A C struct a ``config.yaml`` declares (``rl.Rectangle``): its fields are the declaration's."""
+
+    document: "Document"
+    module: str
+    declaration: Declaration
+
+
+@dataclass
+class _ModuleRef:
+    """What ``import(...)`` gives: a Bifrost file's module or a configured (C or standard) one."""
+
+    document: "Document"
+    spec: str
+
+
+@dataclass
+class _Record:
+    """A record as written: ``#{q: ...}``, ``await tasks.gather(user: f())``, or what a ``=> Record`` returns."""
+
+    document: "Document"
+    entries: list[tuple[str, Node]]  # each field's name, and the value written for it
+
+
+# What a name, or the names before a `.`, reaches: a value of a type, an object named itself
+# (`Context.new`), a C struct, a module, or a record.
+type _Owner = _Type | _Object | _CStruct | _ModuleRef | _Record
+
+
+@dataclass
+class _Member:
+    """What ``owner.name`` names: where it is declared, and what reading or calling it gives."""
+
+    location: Location
+    value: _Owner | None = None  # what reading it gives: its type (or the object, for `module.Object`)
+    result: _Owner | None = None  # what calling it gives
+    declared: "tuple[Document, Node, str] | None" = None  # an object's member: its ``struct_field``, and its owner
 
 
 @contextmanager
@@ -323,11 +386,14 @@ class Document:
     _lines: list[bytes] = field(init=False, repr=False)
     # The `=> Record` functions whose returns are being read (a record holding a call of itself stops there).
     _resolving: set[int] = field(init=False, repr=False)
+    # The locals whose types are being followed (`let x = x.next` stops there).
+    _following: set[int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Split the source into lines, for position conversions."""
         self._lines = self.source.split(b"\n")
         self._resolving = set()
+        self._following = set()
 
     @classmethod
     def open(cls, path: Path, text: str) -> "Document":
@@ -379,10 +445,26 @@ class Document:
             assert self.config_path is not None
             try:
                 self.config = ConfigBuilder(self.config_path).build()
+                gating = self._gating_features(self.config)
+                if gating:  # editing a file of a feature that is off (axum's ws.bif): it is on, for this file
+                    self.config = ConfigBuilder(self.config_path, features=gating).build()
             except PackageError as error:  # still usable without its packages; reported with the errors
                 self.package_error = str(error)
                 self.config = ConfigBuilder(self.config_path, resolve=False).build()
         return self.config
+
+    def _gating_features(self, config: Config) -> set[str]:
+        """Return the project's features that gate this file (``ws`` for ``src/axum/ws.bif``), if one is off."""
+        here = self.path.resolve()
+        if here not in config.gated or self.config_path is None:
+            return set()
+        sources = source_root(self.config_path.parent)
+        return {
+            name
+            for name, feature in features.defined(config).items()
+            for module in feature.modules
+            if sources.joinpath(*module.split(".")).with_suffix(".bif").resolve() == here
+        }
 
     # -- diagnostics ------------------------------------------------------------------
 
@@ -612,12 +694,19 @@ class Document:
         return None
 
     def _binding_arm(self, name: str, node: Node, function: Node) -> Node | None:
-        """Return the match arm around ``node`` (in ``function``) whose pattern binds ``name``: ``Employee(e)``."""
+        """Return the match arm or ``forall`` around ``node`` (in ``function``) binding ``name``.
+
+        ``e`` of ``Employee(e): ...``, ``i`` of ``forall i in xs { ... }``.
+        """
         current: Node | None = node
         while current is not None and current != function:
             if current.type == "match_arm":
                 identifier = _name_of(current)
                 if identifier is not None and _text(identifier) == name and self._is_pattern(current):
+                    return current
+            if current.type == "forall":  # `forall i in xs { ... }`: i, in its body
+                identifier = _name_of(current)
+                if identifier is not None and _text(identifier) == name:
                     return current
             current = current.parent
         return None
@@ -679,6 +768,8 @@ class Document:
         if local.type == "match_arm":
             return self._describe_arm(local)
         identifier = _name_of(local)
+        if local.type == "forall" and identifier is not None and _named(local)[1:]:
+            return f"forall {_text(identifier)} in {' '.join(_text(_named(local)[1]).split())}"
         first_line = _text(local).split("\n")[0]
         kind = self._type_of_binding(local)
         if identifier is None or kind is None or local.child_by_field_name("type") is not None:
@@ -715,13 +806,17 @@ class Document:
 
     def _receiver(self, node: Node) -> str | None:
         """Return the object a method is a member of, for ``super`` in it: ``Team``."""
+        name = self._receiver_name(node)
+        return _text(name) if name is not None else None
+
+    def _receiver_name(self, node: Node) -> Node | None:
+        """Return the name of the object a method is a member of, where it is declared (``Team`` of ``let Team``)."""
         function = self._enclosing_function(node)
         member = function.parent if function is not None else None
         if member is None or member.type != "struct_field" or member.child_by_field_name("modifier") is not None:
             return None
         owner = member.parent.parent if member.parent is not None else None  # struct_assignment, then its `let`
-        name = _name_of(owner) if owner is not None and owner.type == "assignment" else None
-        return _text(name) if name is not None else None
+        return _name_of(owner) if owner is not None and owner.type == "assignment" else None
 
     def _receiver_type(self, node: Node) -> str | None:
         """Return the type of ``super`` at ``node``: ``Team``, or ``mem.Weak[Team]`` in a method that changes it."""
@@ -1045,22 +1140,23 @@ class Document:
         A function or lambda (its definition), an object's static function, or an
         object whose constructor it is (its ``struct_assignment``).
         """
-        if len(owner) != 1:
-            return self._own_callee(name, where) if not owner else None
-        method = self._method_node(owner, name, where)
-        if method is not None:  # `team.greet(...)`: a method of the object a local holds
-            return self, method
-        binding = self.bindings().get(owner[0])
-        if binding is not None and binding[1].type == "struct_assignment":
-            member = next((m for m in _named(binding[1]) if m.type == "struct_field" and _declares(m, name)), None)
-            return (self, _named(member)[-1]) if member is not None else None
-        module = self._module_of(owner[0])
-        if module is None or module in _BUILTIN_FUNCTIONS:
+        if not owner:
+            return self._own_callee(name, where)
+        module = self._module_of(owner[0]) if len(owner) == 1 and self._local(owner[0], where) is None else None
+        if module is not None:
+            if module in _BUILTIN_FUNCTIONS:
+                return None
+            if _is_file_module(module):
+                found = self._file_member(module, name)
+                return (found[0], _named(found[1])[-1]) if found is not None else None
+            return self._declaration(module, name)
+        # `team.greet(...)`, `Context.new(...)`, `sse.Event.of(...)`: a method or static function of an object
+        member = self._member_of(self._path_owner(owner, where), name)
+        if member is None or member.declared is None:
             return None
-        if _is_file_module(module):
-            found = self._file_member(module, name)
-            return (found[0], _named(found[1])[-1]) if found is not None else None
-        return self._declaration(module, name)
+        document, declared, _ = member.declared
+        function = next((part for part in _named(declared) if part.type == "local_function_definition"), None)
+        return (document, function) if function is not None else None
 
     def _own_callee(self, name: str, where: Node) -> "tuple[Document, Node] | None":
         """Return what ``name(...)`` calls: a lambda a local holds, or a function or object of this file."""
@@ -1123,14 +1219,15 @@ class Document:
         name = _text(identifier)
         where = ".".join([*called[0], called[1]])
         if isinstance(callee, Declaration):
-            kind = next((k for p, k in callee.parameters.items() if to_snake_case(p) == name), None)
-            shown = _bifrost_type(kind) if kind else ""
-            return (f"{name}: {shown}\n// a parameter of {where}", None, shown) if kind else None
+            return self._extern_argument(callee, called[0], name)
         if callee is None:
             return None
         document, value = callee
-        if value.type == "struct_assignment":
-            declared = next((m for m in _named(value) if m.type == "struct_field" and _declares(m, name)), None)
+        if value.type == "struct_assignment":  # its own field, or a base's (`& Person`)
+            found = document._declared_member(value, name, where)
+            declared = found[1] if found is not None else None
+            if found is not None:
+                document = found[0]
             described = f"{document._member_signature(declared)}\n// a field of {where}" if declared else ""
         else:
             parameters = next((part for part in _named(value) if part.type == "parameter_list"), None)
@@ -1145,6 +1242,25 @@ class Document:
         if set(re.findall(r"\w+", shown)) & _type_parameters(value):
             shown = ""  # `Pair(left: 1)`: A is whatever fills it, not a type to show
         return described, Location(document.path, document.range(declared_name)), shown
+
+    def _extern_argument(
+        self, declaration: Declaration, owner: list[str], name: str
+    ) -> "tuple[str, Location | None, str] | None":
+        """For ``name`` in ``rl.Rectangle(x: 1)`` or ``rl.init_window(width: 800)``: a C struct's field or parameter.
+
+        Declared in the YAML that declares the module, under the declaration's ``fields:`` or ``parameters:``.
+        """
+        entries = declaration.fields if declaration.type == "struct" else declaration.parameters
+        written = next((entry for entry in entries if to_snake_case(entry) == name), None)
+        if written is None:
+            return None
+        shown = _bifrost_type(entries[written])
+        where = ".".join([*owner, extern_name(declaration)])
+        module = self._module_of(owner[0]) if len(owner) == 1 else None
+        location = self._config_location(module, extern_name(declaration), written) if module else None
+        if declaration.type == "struct":
+            return f"let {name}: {shown}\n// a field of {where}", location, shown
+        return f"{name}: {shown}\n// a parameter of {where}", location, shown
 
     def _named_argument_hint(self, argument: Node) -> list[InlayHint]:
         """Hint a named argument's type after its name, as for a record field: ``Context(width: i32: 800)``.
@@ -1188,6 +1304,14 @@ class Document:
 
         Also the document declaring it (another file's, for ``state.AppState``) and the object's name.
         """
+        found = self._direct_member(node)
+        if found is not None:
+            return found
+        member = self._member_target(node)  # `a.b.c`, `xs[i].c`, `found.value.q` of a generic, `super.x`
+        return member.declared if member is not None else None
+
+    def _direct_member(self, node: Node) -> "tuple[Document, Node, str] | None":
+        """``Object.member``, ``value.field`` and ``models.User.label``: the member right after a name."""
         access = self._member_access(node)
         if access is None:
             return self._module_type_member(node)
@@ -1280,6 +1404,283 @@ class Document:
             return None
         return _text(parts[0]), _text(node)
 
+    # -- what a name after a `.` names ------------------------------------------------------
+    #
+    # `a.b.c` is followed one name at a time: `a` reaches a value of some type (a local, a
+    # parameter, `super`, what a `forall` goes through), an object named itself, or a module;
+    # each name after it is a member of what the names before it reach, and gives what reading
+    # (or calling) that member gives. Generic objects carry what their type parameters stand for:
+    # `found.value.q`, with `found: query.Query[Search]`, is Search's `q`.
+
+    def _member_path(self, node: Node) -> tuple[list[Node], str] | None:
+        """For a name after a ``.`` (``c`` in ``a.b.c`` or ``a.b.c()``): the parts before it, and the name."""
+        part = node.parent if node.parent is not None and node.parent.type == "identifier" else node
+        call = part.parent
+        if call is not None and call.type == "user_function_call" and call.child_by_field_name("function") == part:
+            part = call.parent  # the function_call segment
+        chain = part.parent if part is not None else None
+        if part is None or chain is None or chain.type != "child_annotation":
+            return None
+        parts = _named(chain)
+        if part not in parts[1:]:
+            return None
+        return parts[: parts.index(part)], _text(node)
+
+    def _member_target(self, node: Node) -> _Member | None:
+        """Return what a name after a ``.`` names: ``y`` in ``bat.y``, ``of`` in ``sse.Event.of(...)``."""
+        path = self._member_path(node)
+        return self._member_of(self._owner_of_parts(path[0]), path[1]) if path is not None else None
+
+    def _path_owner(self, names: list[str], where: Node) -> _Owner | None:
+        """Return what ``a.b`` reaches, written as names: ``["sse", "Event"]``."""
+        owner = self._owner_of_name(names[0], where)
+        for name in names[1:]:
+            member = self._member_of(owner, name) if owner is not None else None
+            owner = member.value if member is not None else None
+        return owner
+
+    def _owner_of_parts(self, parts: list[Node]) -> _Owner | None:
+        """Return what the parts of ``a.b[0].f().c`` up to some name reach (``a``, ``b[0]``, ``f()``...)."""
+        first = parts[0]
+        owner = (
+            self._owner_of_name(_text(first), first)
+            if first.type == "simple_identifier"
+            else self._owner_of_expression(first)
+        )
+        for part in parts[1:]:
+            if owner is None:
+                return None
+            if part.type == "simple_identifier":
+                member = self._member_of(owner, _text(part))
+                owner = member.value if member is not None else None
+                continue
+            call = _named(part)[0] if part.type == "function_call" and _named(part) else None
+            function = call.child_by_field_name("function") if call is not None else None
+            member = self._member_of(owner, _text(function)) if function is not None else None
+            owner = member.result if member is not None else None
+        return owner
+
+    def _owner_of_name(self, name: str, where: Node) -> _Owner | None:
+        """Return what a plain name reaches where ``where`` is: a local's type, an object, a module."""
+        if name == "super":
+            receiver = self._receiver_type(where)
+            return _Type(self, receiver) if receiver is not None else None
+        local = self._local(name, where)
+        if local is not None:
+            return self._owner_of_local(local)
+        module = self._module_of(name)
+        if module is not None:
+            return _ModuleRef(self, module)
+        binding = self.bindings().get(name)
+        if binding is not None and binding[1].type in _OBJECT_TYPES:
+            return _Object(self, binding[1], name)  # `Context.new`: the object itself
+        return None
+
+    def _owner_of_local(self, local: Node) -> _Owner | None:
+        """Return the type of a local: as written, or what its value (or what a ``forall`` goes through) gives."""
+        if local.id in self._following:
+            return None  # `let x = x.next`: it is what it is being found from
+        self._following.add(local.id)
+        try:
+            parts = _named(local)
+            if local.type == "forall":
+                return self._element(self._owner_of_expression(parts[1])) if parts[1:] else None
+            if local.type == "local_assignment" and local.child_by_field_name("type") is None and parts[1:]:
+                found = self._owner_of_expression(parts[-1])
+                if found is not None:
+                    return found
+            kind = self._type_of_binding(local)
+            return _Type(self, kind) if kind is not None else None
+        finally:
+            self._following.discard(local.id)
+
+    def _owner_of_expression(self, value: Node) -> _Owner | None:
+        """Return what an expression gives, for the cases a member is read of: names, ``a.b``, ``xs[i]``, calls."""
+        value = _unwrap(value)
+        parts = _named(value)
+        written = _written_entries(value)  # `#{...}`, `tasks.gather(...)`
+        owner: _Owner | None = None
+        if written is not None:
+            owner = _Record(self, written)
+        elif value.type in {"identifier", "simple_identifier"}:
+            owner = self._owner_of_name(_text(value), value)
+        elif value.type == "child_annotation" and parts:
+            owner = self._owner_of_parts(parts)
+        elif value.type == "await_expression" and parts:
+            owner = self._owner_of_expression(parts[0])
+        elif value.type == "get_expression" and len(parts) > 1 and _named(parts[0]):
+            listed = self._owner_of_expression(_named(parts[0])[0])  # the getter_owner's
+            owner = self._element(listed) if parts[1].type == "expression" else listed  # `xs[1...]`: a list
+        elif value.type == "pipe_expression" and (into := value.child_by_field_name("into")) is not None:
+            owner = self._piped_result(_unwrap(into))  # `w.ball |> fly(dt) |> off_walls`: what the last gives
+        elif value.type == "function_call" and parts and (function := parts[0].child_by_field_name("function")):
+            owner = self._called_result(_text(function), value)
+        return owner
+
+    def _called_result(self, name: str, where: Node) -> _Owner | None:
+        """Return what calling ``name(...)`` gives: an object of this file (built), or a function's result."""
+        if self._local(name, where) is not None:
+            return None  # a lambda, typed only by its signature
+        binding = self.bindings().get(name)
+        if binding is not None and binding[1].type in _OBJECT_TYPES:
+            return _Type(self, name)  # `Context(...)`: a Context
+        result = _written_result(binding[1]) if binding is not None else None
+        if binding is not None and result == RECORD:
+            returned = self._returned_entries(binding[1])
+            return _Record(self, returned) if returned is not None else None
+        return _Type(self, result) if result is not None else None
+
+    def _piped_result(self, into: Node) -> _Owner | None:
+        """Return what a pipe's right side gives: ``fly(dt)``, ``off_walls`` or ``physics.step``, called."""
+        parts = _named(into) if into.type == "child_annotation" else []
+        if into.type == "function_call" or (parts and parts[-1].type == "function_call"):
+            return self._owner_of_expression(into)
+        if parts[1:] and parts[-1].type == "simple_identifier":
+            member = self._member_of(self._owner_of_parts(parts[:-1]), _text(parts[-1]))
+            return member.result if member is not None else None
+        return self._called_result(_text(into), into) if into.type == "identifier" else None
+
+    @staticmethod
+    def _element(owner: _Owner | None) -> _Owner | None:
+        """Return the type of what a list holds: ``User`` for ``User[]``."""
+        if not isinstance(owner, _Type):
+            return None
+        text = " ".join(owner.text.split())
+        if text in owner.bound:
+            return Document._element(owner.bound[text])
+        return _Type(owner.document, text[:-2].strip(), owner.bound) if text.endswith("[]") else None
+
+    def _resolve(self, kind: _Type, depth: int = 0) -> _Object | _CStruct | None:
+        """Find the object or C struct a type names: through what its type parameters stand for, and ``mem``'s.
+
+        ``mem.Shared[AppState]`` and a guard of one reach ``AppState``; ``Html[T]`` with ``T`` bound
+        is an Html of it.
+        """
+        text = " ".join(kind.text.split())
+        written = re.fullmatch(r"([\w.]+)\s*(?:\[(.*)\])?", text)
+        if written is None or depth > _MAX_DEPTH:
+            return None
+        head, arguments = written.group(1), _top_level(written.group(2) or "")
+        document = kind.document
+        if head in kind.bound and not arguments:
+            return self._resolve(kind.bound[head], depth + 1)
+        if arguments and document._holds(head):
+            return self._resolve(_Type(document, arguments[0], kind.bound), depth + 1)
+        found = document._struct_named(head, union=True)
+        if found is not None:
+            other, value, name = found
+            filled = (_Type(document, argument, kind.bound) for argument in arguments)
+            bound = dict(zip(_ordered_type_parameters(value), filled, strict=False))  # `Box` alone: none filled
+            return _Object(other, value, name, bound)
+        alias, _, member = head.partition(".")
+        module = document._module_of(alias) if member else None
+        declaration = document._declaration(module, member) if module and not _is_file_module(module) else None
+        if declaration is None or declaration.type != "struct":
+            return None
+        return _CStruct(document, module, declaration)  # type: ignore[arg-type] - module is set
+
+    def _holds(self, head: str) -> bool:
+        """Whether ``head`` is one of ``std:mem``'s containers or guards: ``mem.Shared``, ``mem.WeakGuard``.
+
+        Or ``Weak``/``WeakGuard``, unqualified, as ``super`` is lent to a method in a file without ``std:mem``.
+        """
+        alias, _, member = head.partition(".")
+        if member:
+            return member in mem.CONTAINERS and self._module_of(alias) == f"{std.PREFIX}mem"
+        return head in mem.CONTAINERS and self.bindings().get(head) is None
+
+    def _member_of(self, owner: _Owner | None, name: str) -> _Member | None:
+        """Return what ``owner.name`` names, and what reading or calling it gives."""
+        if isinstance(owner, _Type):
+            return self._member_of(self._resolve(owner), name)
+        if isinstance(owner, _ModuleRef):
+            return owner.document._module_member(owner.spec, name)
+        if isinstance(owner, _CStruct):
+            return owner.document._c_field(owner, name)
+        if isinstance(owner, _Record):
+            return owner.document._record_entry(owner, name)
+        return owner.document._object_member_of(owner, name) if owner is not None else None
+
+    def _object_member_of(self, owner: _Object, name: str) -> _Member | None:
+        """Return the member ``name`` of an object or union: its own, or a base's, or what each of a union's has."""
+        found = self._declared_member(owner.value, name, owner.name)
+        if found is None:
+            return None
+        document, member, _ = found
+        identifier = _name_of(member)
+        bound = owner.bound if member.parent == owner.value else {}  # a base's member knows nothing of them
+        written = next((part for part in _named(member) if part.type in _TYPES), None)
+        function = next((part for part in _named(member) if part.type == "local_function_definition"), None)
+        result = _written_result(function) if function is not None else None
+        if function is None and written is not None:
+            result = _function_type_result(_text(written))  # `h.step(...)`, of `let step: (f: Frame) => W`
+        return _Member(
+            Location(document.path, document.range(identifier if identifier is not None else member)),
+            _Type(document, _text(written), bound) if written is not None else None,
+            _Type(document, result, bound) if result is not None else None,
+            found,
+        )
+
+    def _module_member(self, spec: str, name: str) -> _Member | None:
+        """Return what ``module.name`` names: a ``let`` of a Bifrost module, or a configured C declaration."""
+        if not _is_file_module(spec):
+            location = self._config_location(spec, name)
+            declaration = self._declaration(spec, name)
+            if location is None or declaration is None:
+                return None
+            if declaration.type == "struct":
+                made = _CStruct(self, spec, declaration)
+                return _Member(location, made, made)
+            return _Member(location, result=self._c_struct(declaration.return_type))
+        found = self._file_member(spec, name)
+        identifier = _name_of(found[1]) if found is not None else None
+        if found is None or identifier is None:
+            return None
+        other, assignment = found
+        value = _named(assignment)[-1]
+        location = Location(other.path, other.range(identifier))
+        if value.type in _OBJECT_TYPES:  # `sse.Event`: the object, and what building one gives
+            return _Member(location, _Object(other, value, name), _Type(other, name))
+        result = _written_result(value)
+        return _Member(location, result=_Type(other, result) if result is not None else None)
+
+    def _record_entry(self, record: _Record, name: str) -> _Member | None:
+        """Return the field ``name`` of a record: where it is written (``q`` in ``#{q: ...}``), and what it holds."""
+        value = next((value for written, value in record.entries if written == name), None)
+        holder = value.parent if value is not None else None
+        if holder is None:
+            return None
+        key = holder.child_by_field_name("name") if holder.type == "named_argument" else _named(holder)[0]
+        if key is None:
+            return None
+        return _Member(Location(self.path, self.range(key)), self._owner_of_expression(value))
+
+    def _c_field(self, struct: _CStruct, name: str) -> _Member | None:
+        """Return the field ``name`` of a C struct (``y`` of ``rl.Rectangle``), where its YAML declares it."""
+        declaration = struct.declaration
+        assert declaration.type == "struct"
+        written = next((entry for entry in declaration.fields if to_snake_case(entry) == name), None)
+        if written is None:
+            return None
+        location = self._config_location(struct.module, extern_name(declaration), written)
+        return _Member(location, self._c_struct(declaration.fields[written])) if location is not None else None
+
+    def _c_struct(self, kind: str) -> _CStruct | None:
+        """Find the C struct a configured type names: ``raylib_Vector2`` is raylib's ``Vector2``."""
+        try:
+            externs = self.load_config().externs
+        except Exception:  # noqa: BLE001 - reported by diagnostics
+            return None
+        for extern in sorted(externs, key=lambda extern: -len(extern.module)):  # `axum_ws_Socket` is axum_ws's
+            if not kind.startswith(f"{extern.module}_"):
+                continue
+            name = kind.removeprefix(f"{extern.module}_")
+            declaration = next(
+                (d for d in extern.declarations if d.type == "struct" and name in {d.name, extern_name(d)}), None
+            )
+            return _CStruct(self, extern.module, declaration) if declaration is not None else None
+        return None
+
     def _module_of(self, binding: str) -> str | None:
         """Return the configured module a top-level ``let x = import(...)`` names."""
         found = self.bindings().get(binding)
@@ -1318,6 +1719,34 @@ class Document:
         if self._is_argument_name(node):
             target = self._argument_target(node)
             return target[1] if target is not None else None
+        if self._is_record_key(node):
+            return None  # `#{id: id}`: the key names a field of the record it makes, not the local `id`
+        declaring = self._declaring(node)
+        if declaring is not None:  # a declaration is its own definition
+            return Location(self.path, self.range(declaring))
+        if self._member_path(node) is not None:  # after a `.`: a member, never a local of the same name
+            return self._member_definition(node)
+        return self._name_definition(node)
+
+    def _name_definition(self, node: Node) -> Location | None:
+        """Return where a plain name is declared: ``super``'s object, a local, a type parameter, a ``let``."""
+        name = _text(node)
+        if name == "super":
+            receiver = self._receiver_name(node)
+            return Location(self.path, self.range(receiver)) if receiver is not None else None
+        local = self._local(name, node)
+        parameter = self._type_parameter(name, node) if local is None else None
+        if parameter is not None:
+            return Location(self.path, self.range(parameter))
+        binding = self.bindings().get(name)
+        declared = local if local is not None else binding[0] if binding is not None else None
+        if declared is None:
+            return None
+        identifier = _name_of(declared)
+        return Location(self.path, self.range(identifier if identifier is not None else declared))
+
+    def _member_definition(self, node: Node) -> Location | None:
+        """Return where a name after a ``.`` is declared: a module's member, an object's, a C struct's field."""
         dotted = self._dotted(node)
         if dotted is not None:
             return self._member_location(*dotted)
@@ -1326,29 +1755,71 @@ class Document:
             document, member, _ = found
             identifier = _name_of(member)
             return Location(document.path, document.range(identifier if identifier is not None else member))
-        name = _text(node)
-        local = self._local(name, node)
-        binding = self.bindings().get(name)
-        declared = local if local is not None else binding[0] if binding is not None else None
-        if declared is None:
-            return None
-        identifier = _name_of(declared)
-        return Location(self.path, self.range(identifier if identifier is not None else declared))
+        target = self._member_target(node)
+        return target.location if target is not None else None
 
-    def _config_location(self, module: str, member: str) -> Location | None:
-        """Find ``member``'s declaration (``init_window`` is ``InitWindow``) in the file declaring ``module``."""
+    @staticmethod
+    def _is_record_key(node: Node) -> bool:
+        """Whether ``node`` is a field's name where a record is written: ``q`` in ``#{q: found.q}``."""
+        identifier = node.parent if node.parent is not None and node.parent.type == "identifier" else node
+        field = identifier.parent
+        return field is not None and field.type == "record_field" and _named(field)[0] == identifier
+
+    def _declaring(self, node: Node) -> Node | None:
+        """For a name where it is declared, return it (or, for ``export rules``, the module it exports).
+
+        An object's member, a module, a type parameter (``T`` of ``Box[T]``), a parameter of a
+        function type, a field of a record type (``#{id: i64}``).
+        """
+        identifier = node.parent if node.parent is not None and node.parent.type == "identifier" else node
+        holder = identifier.parent
+        if holder is None:
+            return None
+        if holder.type == "export_statement":
+            exported = next(
+                (m for m in _named(self.root) if m.type == "module" and _text(_name_of(m) or m) == _text(node)), None
+            )
+            return exported.child_by_field_name("name") if exported is not None else None
+        if holder.type in {"module", "record_type_field"}:
+            return identifier if holder.child_by_field_name("name") == identifier else None
+        if holder.type == "type_parameters":
+            return identifier
+        in_function_type = holder.parent is not None and holder.parent.type == "function_type"
+        if holder.type == "struct_field" or (holder.type == "parameter" and in_function_type):
+            return identifier if _name_of(holder) == identifier else None
+        return None
+
+    def _type_parameter(self, name: str, node: Node) -> Node | None:
+        """Return the type parameter ``name`` of a generic around ``node``: ``T`` of ``let Box[T] = ...``."""
+        current = node.parent
+        while current is not None:
+            parameters = current.child_by_field_name("type_parameters") if current.type == "assignment" else None
+            for declared in parameters.children_by_field_name("name") if parameters is not None else []:
+                if _text(declared) == name:
+                    return declared
+            current = current.parent
+        return None
+
+    def _config_location(self, module: str, member: str, entry: str | None = None) -> Location | None:
+        """Find ``member``'s declaration (``init_window`` is ``InitWindow``) in the file declaring ``module``.
+
+        With ``entry``, one of its struct's ``fields:`` or function's ``parameters:`` (``x`` of ``Rectangle``).
+        """
         declaration = self._declaration(module, member)
         found = self._extern(module)
         if found is None or found[1] is None or declaration is None:
             return None
         path = found[1]
         member = declaration.name
+        lines = path.read_text().splitlines()
         in_module = False
-        for row, line in enumerate(path.read_text().splitlines()):
+        for row, line in enumerate(lines):
             stripped = line.strip().removeprefix("- ")
             if stripped.startswith("module:"):
                 in_module = stripped.removeprefix("module:").strip().strip('"') == module
             elif in_module and stripped in {f"name: {member}", f'name: "{member}"'}:
+                if entry is not None:
+                    return _config_entry(path, lines, row, entry)
                 column = line.index("name:") + len("name: ")
                 return Location(path, ((row, column), (row, column + len(member))))
         return None
@@ -2272,6 +2743,67 @@ def _parameter_names(function: Node) -> list[str] | None:
     else:
         return None
     return [_text(identifier) for member in members if (identifier := _name_of(member)) is not None]
+
+
+def _config_entry(path: Path, lines: list[str], declared: int, entry: str) -> Location | None:
+    """Find ``entry`` among the ``fields:`` or ``parameters:`` of the YAML declaration at row ``declared``."""
+    indent = len(lines[declared]) - len(lines[declared].lstrip(" "))  # where its `- name:` starts
+    block: int | None = None  # the indent of its `fields:` or `parameters:`, inside them
+    for row in range(declared + 1, len(lines)):
+        line = lines[row]
+        stripped = line.strip()
+        at = len(line) - len(line.lstrip(" "))
+        if not stripped or stripped.startswith("#"):
+            continue
+        if at <= indent:
+            return None  # past the declaration: it has no such entry
+        key = stripped.partition(":")[0].strip()
+        if block is not None and at > block and key.strip("\"'") == entry:
+            return Location(path, ((row, at), (row, at + len(key))))
+        if block is not None and at <= block:
+            block = None
+        if key in {"fields", "parameters"}:
+            block = at
+    return None
+
+
+def _written_result(function: Node) -> str | None:
+    """Return a function's result type as written: ``Context`` of ``() => Context``."""
+    if function.type not in {"function_definition", "local_function_definition"}:
+        return None
+    parts = [p for p in _named(function) if p.type not in _DEPENDENCY_LISTS]
+    if len(parts) < 2 or parts[0].type != "parameter_list" or parts[1].type not in _TYPES:  # noqa: PLR2004
+        return None
+    return " ".join(_text(parts[1]).split())
+
+
+def _function_type_result(kind: str) -> str | None:
+    """Return what a function type gives: ``W`` of ``(f: Frame, w: W) => W``; ``None`` for another type."""
+    text = " ".join(kind.split())
+    while text.startswith("(") and _closing(text) == len(text) - 1:
+        text = text[1:-1].strip()  # `((f: Frame) => null)`
+    end = _closing(text) if text.startswith("(") else None
+    rest = text[end + 1 :].strip() if end is not None else ""
+    if not rest.startswith("=>"):
+        return None
+    return rest.removeprefix("=>").strip() or None
+
+
+def _closing(text: str) -> int | None:
+    """Return where the bracket opening ``text`` closes."""
+    depth = 0
+    for index, character in enumerate(text):
+        depth += {"(": 1, "[": 1, "{": 1, ")": -1, "]": -1, "}": -1}.get(character, 0)
+        if depth == 0:
+            return index
+    return None
+
+
+def _ordered_type_parameters(definition: Node) -> list[str]:
+    """Return a generic's type parameters in order: ``["K", "V"]`` of ``let Map[K, V] = struct {...}``."""
+    assignment = definition.parent
+    parameters = assignment.child_by_field_name("type_parameters") if assignment is not None else None
+    return [_text(name) for name in parameters.children_by_field_name("name")] if parameters is not None else []
 
 
 def _signature_names(signature: str) -> list[str]:

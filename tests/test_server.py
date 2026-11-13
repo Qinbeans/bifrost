@@ -835,3 +835,235 @@ def test_objects_built_on_others_in_the_editor() -> None:
     line = typing.splitlines().index("    a.")
     offered = Document.open(EXAMPLES / "scratch.bif", typing).completions((line, len("    a.")))
     assert [(c.label, c.kind) for c in offered] == [("type", "field"), ("label", "method"), ("greet", "method")]
+
+
+# -- go to definition: every name that is declared somewhere jumps there --------------------------
+
+NAVIGATED_MODELS = """\
+module models = {
+    /* What the handlers send */
+    let Event = struct {
+        let data: str,
+        static let of = [] (data: str) => Event Event(data: data)
+    }
+    let Box[T] = struct { let value: T }
+    let WithStatus[T] = struct { let status: i32, let inner: T }
+}
+
+export(models)
+"""
+
+NAVIGATED = """\
+let models = import("models:models")
+let mem = import("std:mem")
+let User = struct { let id: i64, let name: str }
+let Search = struct { let q: str, let limit: i64 }
+let Point = struct { let x: i64, let y: i64 }
+let Team = struct {
+    let members: User[],
+    let size = [super] () => i64 len(super.members)
+}
+let Person = struct { let name: str }
+let Employee = struct { let id: str } & Person
+let total = (first: i64, second: i64) => i64 first + second
+let apply = (step: (f: i64) => i64) => i64 step(1)
+let find = [models.Event.of, Team.size, total, copy] (
+    users: User[],
+    found: models.Box[Search],
+    shared: mem.Shared[Point],
+    team: Team
+) => models.WithStatus[models.Box[User]] {
+    let event = models.Event.of("tick")
+    let s <- shared
+    let far = s.y + 1
+    s -> shared
+    let _held = found.value.q
+    let _record = #{q: found.value.q, limit: found.value.limit}
+    let _text = "{found.value.limit}"
+    let sum = total(far, team.size())
+    let _worker = Employee(id: "e1", name: "ada")
+    forall i in #[0...len(users)] {
+        if users[i].id == sum {
+            return models.WithStatus(status: 200, inner: models.Box(value: copy(users[i])))
+        }
+    }
+    return models.WithStatus(status: 404, inner: models.Box(value: User(id: 0, name: event.data)))
+}
+let main = [] () => null {}
+"""
+
+
+@pytest.fixture
+def navigated(tmp_path: Path) -> Document:
+    (tmp_path / "config.yaml").write_text(
+        (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
+    )
+    (tmp_path / "models.bif").write_text(NAVIGATED_MODELS)
+    return Document.open(tmp_path / "main.bif", NAVIGATED)
+
+
+def _span(source: str, needle: str, name: str, occurrence: int = 0) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the range of ``name``, the first in the ``occurrence``-th ``needle`` of ``source``."""
+    line, column = _position(source, needle, occurrence)
+    start = column + needle.index(name)
+    return (line, start), (line, start + len(name))
+
+
+def _jump(document: Document, source: str, needle: str, name: str, occurrence: int = 0) -> tuple[str, object]:
+    """Go to the definition of ``name`` (in ``needle``): the file it is in, and its range."""
+    location = document.definition(_span(source, needle, name, occurrence)[0])
+    assert location is not None, f"no definition for {name} in {needle!r}"
+    return location.path.name, location.range
+
+
+def test_the_navigated_project_compiles(navigated: Document) -> None:
+    assert [d.message for d in navigated.diagnostics() if d.severity == Severity.ERROR] == []
+
+
+def test_a_forall_variable_is_where_it_is_bound(navigated: Document) -> None:
+    bound = ("main.bif", _span(NAVIGATED, "forall i", "i"))
+    assert _jump(navigated, NAVIGATED, "forall i", "i") == bound
+    assert _jump(navigated, NAVIGATED, "users[i].id", "i") == bound
+    assert _jump(navigated, NAVIGATED, "users[i]))", "i") == bound
+
+
+@pytest.mark.parametrize(
+    ("needle", "name", "declared"),
+    [
+        # a base's field (`& Person`), and an own one
+        ('Employee(id: "e1", name', "name", ("main.bif", "Person = struct { let name", "name")),
+        ('Employee(id: "e1"', "id", ("main.bif", "Employee = struct { let id", "id")),
+        # an imported generic object's fields
+        ("WithStatus(status: 200", "status", ("models.bif", "let status: i32", "status")),
+        ("WithStatus(status: 200, inner", "inner", ("models.bif", "let inner: T", "inner")),
+        ("Box(value: copy", "value", ("models.bif", "let value: T", "value")),
+    ],
+)
+def test_a_named_argument_is_the_field_it_fills(
+    navigated: Document, needle: str, name: str, declared: tuple[str, str, str]
+) -> None:
+    file, declared_at, declared_name = declared
+    source = NAVIGATED if file == "main.bif" else NAVIGATED_MODELS
+    assert _jump(navigated, NAVIGATED, needle, name) == (file, _span(source, declared_at, declared_name))
+
+
+@pytest.mark.parametrize(
+    ("needle", "name", "declared"),
+    [
+        ("s.y + 1", "y", ("main.bif", "let y: i64", "y")),  # in a binary expression, through a guard
+        ("_held = found.value.q", "q", ("main.bif", "let q: str", "q")),  # a let's value, of a generic's T
+        ("_held = found.value.q", "value", ("models.bif", "let value: T", "value")),
+        ("value.q, limit", "q", ("main.bif", "let q: str", "q")),  # a record field's value
+        ("value.limit}", "limit", ("main.bif", "let limit: i64", "limit")),
+        ('"{found.value.limit}"', "limit", ("main.bif", "let limit: i64", "limit")),  # in an interpolation
+        ("len(super.members)", "members", ("main.bif", "let members: User[]", "members")),  # super, an argument
+        ("users[i].id", "id", ("main.bif", "User = struct { let id", "id")),  # an element of a list
+        ("name: event.data", "data", ("models.bif", "let data: str", "data")),  # a static function's result
+    ],
+)
+def test_a_field_read_is_the_field_wherever_it_is_read(
+    navigated: Document, needle: str, name: str, declared: tuple[str, str, str]
+) -> None:
+    file, declared_at, declared_name = declared
+    source = NAVIGATED if file == "main.bif" else NAVIGATED_MODELS
+    assert _jump(navigated, NAVIGATED, needle, name) == (file, _span(source, declared_at, declared_name))
+
+
+def test_a_field_is_never_a_local_of_the_same_name() -> None:
+    source = (
+        "let User = struct { let id: i64 }\n"
+        "let has = [] (users: User[], id: i64) => bool users[0].id == id\n"
+        "let unknown = [] (u: i64, id: i64) => i64 u.id + id\n"
+    )
+    document = Document.open(EXAMPLES / "scratch.bif", source)
+    assert _jump(document, source, ".id ==", "id") == ("scratch.bif", _span(source, "let id", "id"))
+    assert document.definition(_span(source, "u.id", "id")[0]) is None  # an i64 has no fields
+
+
+def test_super_is_the_object_its_method_is_called_on(navigated: Document) -> None:
+    assert _jump(navigated, NAVIGATED, "super.members", "super") == ("main.bif", _span(NAVIGATED, "Team =", "Team"))
+
+
+@pytest.mark.parametrize(
+    ("needle", "name", "declared", "declared_name"),
+    [
+        ("models.Event.of,", "of", "static let of", "of"),  # an entry of a dependency list
+        ('models.Event.of("tick")', "of", "static let of", "of"),  # a call
+        ('models.Event.of("tick")', "Event", "let Event", "Event"),
+    ],
+)
+def test_a_static_function_of_an_imported_object_is_in_its_file(
+    navigated: Document, needle: str, name: str, declared: str, declared_name: str
+) -> None:
+    assert _jump(navigated, NAVIGATED, needle, name) == ("models.bif", _span(NAVIGATED_MODELS, declared, declared_name))
+
+
+def test_a_declaration_is_its_own_definition(navigated: Document, tmp_path: Path) -> None:
+    for needle, name in [
+        ("let id: i64", "id"),  # an object's field
+        ("let size", "size"),  # its method
+        ("(f: i64) => i64", "f"),  # a parameter of a function type
+    ]:
+        assert _jump(navigated, NAVIGATED, needle, name) == ("main.bif", _span(NAVIGATED, needle, name))
+    models = Document.open(tmp_path / "models.bif", NAVIGATED_MODELS)
+    module = ("models.bif", _span(NAVIGATED_MODELS, "module models", "models"))
+    assert _jump(models, NAVIGATED_MODELS, "module models", "models") == module
+    assert _jump(models, NAVIGATED_MODELS, "export(models)", "models") == module  # what it exports
+    parameter = ("models.bif", _span(NAVIGATED_MODELS, "Box[T]", "T"))
+    assert _jump(models, NAVIGATED_MODELS, "Box[T]", "T") == parameter  # a type parameter
+    assert _jump(models, NAVIGATED_MODELS, "value: T", "T") == parameter  # and where it is used
+    # A record's keys name the fields of the record they make: none is declared elsewhere.
+    assert navigated.definition(_span(NAVIGATED, "#{q: found", "q")[0]) is None
+
+
+@pytest.mark.parametrize(
+    ("needle", "name", "declared"),
+    [
+        ("models.Box[User]]", "User", ("main.bif", "let User", "User")),
+        ("models.Box[Search]", "Search", ("main.bif", "let Search", "Search")),
+        ("models.Box[Search]", "Box", ("models.bif", "let Box", "Box")),
+        ("WithStatus[models.Box[User]]", "WithStatus", ("models.bif", "let WithStatus", "WithStatus")),
+    ],
+)
+def test_types_in_type_arguments(navigated: Document, needle: str, name: str, declared: tuple[str, str, str]) -> None:
+    file, declared_at, declared_name = declared
+    source = NAVIGATED if file == "main.bif" else NAVIGATED_MODELS
+    assert _jump(navigated, NAVIGATED, needle, name) == (file, _span(source, declared_at, declared_name))
+
+
+def test_a_method_is_where_its_object_declares_it(navigated: Document) -> None:
+    method = ("main.bif", _span(NAVIGATED, "let size", "size"))
+    assert _jump(navigated, NAVIGATED, "Team.size,", "size") == method  # a dependency list's entry
+    assert _jump(navigated, NAVIGATED, "team.size()", "size") == method  # a call
+
+
+def test_the_fields_of_a_c_struct_are_in_its_yaml() -> None:
+    source = (
+        'let rl = import("raylib")\n'
+        "let main = [rl.Rectangle] () => null {\n"
+        "    let box = rl.Rectangle(x: 1.0, y: 2.0, width: 3.0, height: 4.0)\n"
+        "    let _right = box.x + box.width\n"
+        "}\n"
+    )
+    document = Document.open(EXAMPLES / "scratch.bif", source)
+    for needle, name in [("x: 1.0", "x"), (".x + box", "x"), ("box.width", "width")]:
+        location = document.definition(_span(source, needle, name)[0])
+        assert location is not None
+        lines = location.path.read_text().splitlines()
+        declared = next(row for row, line in enumerate(lines) if line.strip() == "- name: Rectangle")
+        row = next(row for row in range(declared, len(lines)) if lines[row].strip().startswith(f"{name}:"))
+        column = lines[row].index(name)
+        assert location.range == ((row, column), (row, column + len(name)))
+
+
+def test_a_file_a_feature_gates_sees_that_features_externs() -> None:
+    # axum's ws.bif is only built with its ws feature, but editing it uses that feature's externs.
+    path = Path(__file__).parents[1] / "extras" / "axum" / "src" / "axum" / "ws.bif"
+    source = path.read_text()
+    document = Document.open(path, source)
+    assert [d.message for d in document.diagnostics() if d.severity == Severity.ERROR] == []
+    location = document.definition(_span(source, "socket.accept(super", "accept")[0])
+    assert location is not None
+    assert location.path.name == "config.yaml"
+    (row, column), _ = location.range
+    assert location.path.read_text().splitlines()[row][column:].startswith("axum_ws_accept")
