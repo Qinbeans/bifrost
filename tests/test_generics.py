@@ -82,13 +82,13 @@ let App[W] = struct {
     let updates: ((n: i64, w: W) => W)[]
 }
 
-let app[W] = [] (world: W) => App[W] App(world: copy(world), updates: #[])
+let app[W] = [copy] (world: W) => App[W] App(world: copy(world), updates: #[])
 
-let on_update[W] = [] (a: App[W], handler: (n: i64, w: W) => W) => App[W] {
+let on_update[W] = [copy] (a: App[W], handler: (n: i64, w: W) => W) => App[W] {
     return App(world: copy(a.world), updates: #[...a.updates, copy(handler)])
 }
 
-let run[W] = [] (a: App[W], frames: i64) => W {
+let run[W] = [copy] (a: App[W], frames: i64) => W {
     let world = copy(a.world)
     forall n in #[0...frames] {
         forall handler in a.updates {
@@ -101,7 +101,7 @@ let run[W] = [] (a: App[W], frames: i64) => W {
 let World = struct { let score: i64, let log: i64[] }
 
 let tick = [] (n: i64, w: World) => World World(score: w.score + n, log: #[...w.log, n])
-let bonus = [] (_n: i64, w: World) => World World(score: w.score + 100, log: copy(w.log))
+let bonus = [copy] (_n: i64, w: World) => World World(score: w.score + 100, log: copy(w.log))
 
 let main = [io.printf, app, on_update, run, tick, bonus] () => null {
     let game = app(World(score: 0, log: #[])) |> on_update(tick) |> on_update(bonus)
@@ -241,7 +241,7 @@ let io = import("std:stdio")
 let Team = struct { let name: str, let scores: i64[] }
 let H = struct { let make: (x: i64) => i64[] }
 
-let main = [io.printf] () => null {
+let main = [io.printf, copy] () => null {
     let a = Team(name: "a", scores: #[1, 2])
     let b = copy(a)
     let c = copy(b.scores)
@@ -324,14 +324,14 @@ let Box[T] = struct {
         b.items = #[...b.items, by]
         b -> super
     },
-    let mapped = [super] (f: (x: T) => T) => Box[T] Box(value: f(super.value), items: super.items.map(f)),
+    let mapped = [super, list.map] (f: (x: T) => T) => Box[T] Box(value: f(super.value), items: super.items.map(f)),
     let describe = [super, fmt.format] () => mem.Unique[str] fmt.format("Box(%v, %v)", super.value, super.items)
 }
 
 let double = [] (x: i64) => i64 x * 2
 let half = [] (x: f64) => f64 x / 2.0
 
-let main = [io.printf, io.puts, double, half] () => null {
+let main = [io.printf, io.puts, double, half, Box.bump, Box.get, Box.mapped, Box.describe] () => null {
     let b = Box(value: 5, items: #[1])
     b.bump(2)
     io.printf("%d\n", b.get())

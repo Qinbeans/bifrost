@@ -121,7 +121,9 @@ module rules = {
         return physics.overlaps(physics.around(ball.at, RADIUS), brick.box)
     }
 
-    let standing = [] (bricks: world.Brick[], ball: world.Ball) => world.Brick[] {
+    let standing = [
+        list.filter
+    ] (bricks: world.Brick[], ball: world.Ball) => world.Brick[] {
         /* The bricks the ball does not touch */
         return bricks.filter(
             // ignore: copy
@@ -143,6 +145,7 @@ module rules = {
     let step = [
         steer,
         held,
+        copy,
         fly,
         off_walls,
         off_paddle,
@@ -204,7 +207,7 @@ module rules = {
         )
     }
 
-    let serve = [served, start] (w: world.World) => world.World {
+    let serve = [served, copy, start] (w: world.World) => world.World {
         /* Serve the ball, or, once the game is over, a new game */
         if w.phase == world.SERVING {
             return world.World(

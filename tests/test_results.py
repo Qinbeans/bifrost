@@ -70,7 +70,7 @@ let describe = [io.printf] (r: Result[i64, str]) => null {
     match r { ok(v): io.printf("ok %d\n", v), err(e): io.printf("err %s\n", e) }
 }
 
-let main = [io.printf, older, check, names, first_name, describe] () => null {
+let main = [io.printf, older, check, names, first_name, describe, Result.is_ok, Result.is_err] () => null {
     describe(older(41))
     describe(older(-1))
     let checked = check(-5)

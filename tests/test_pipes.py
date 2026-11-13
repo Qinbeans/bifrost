@@ -47,7 +47,7 @@ let bump = [] (c: mem.Weak[Team], by: i64) => null {
     g -> c
 }
 
-let main = [io.printf, double, add, total, make, maths.add, bump] () => null {
+let main = [io.printf, double, add, total, make, maths.add, bump, list.sorted, list.map, Team.grow] () => null {
     io.printf("%d\n", 3 |> double)
     io.printf("%d\n", 3 |> add(4))
     io.printf("%d\n", 3 |> double |> add(1) |> double)

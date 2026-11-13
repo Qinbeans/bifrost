@@ -606,11 +606,15 @@ let Team = struct {
     let name: str,
     let count: i64,
     let size = [super] () => i64 super.count,
-    let to_string = [super, fmt.format] () => mem.Unique[str] fmt.format("%s of %d", super.name, super.size()),
+    let to_string = [
+        super,
+        Team.size,
+        fmt.format
+    ] () => mem.Unique[str] fmt.format("%s of %d", super.name, super.size()),
     let greet = [] (who: str) => str who
 }
 
-let main = [] () => null {
+let main = [Team.greet] () => null {
     let team = Team(name: "core", count: 2)
     let hello = team.greet("ada")
 }
@@ -706,7 +710,7 @@ def test_a_method_that_changes_its_object_is_lent_it(tmp_path: Path) -> None:
 
 
 LIST_METHODS = """\
-let main = [] () => null {
+let main = [list.filter] () => null {
     let xs = #[5, 3, 9]
     let big = xs.filter([] (x: i64) => bool x > 4)
 }
@@ -718,7 +722,7 @@ def test_list_methods_in_the_editor(tmp_path: Path) -> None:
         (Path(__file__).parents[1] / "examples" / "async" / "config.yaml").read_text()
     )
     document = Document.open(tmp_path / "main.bif", LIST_METHODS)
-    row, column = _position(LIST_METHODS, "filter")
+    row, column = _position(LIST_METHODS, "filter(")
     completions = {c.label: c.detail for c in document.completions((row, column))}
     assert completions["map"] == "map = (f: (x: i64) => U) => U[]"
     assert completions["sort"] == "sort = () => null"
@@ -801,7 +805,7 @@ let Robot = struct {
 let Actor = Employee | Robot on "type" {
     let label = [super] () => i64 match super { Employee(_): 1, Robot(r): r.serial }
 }
-let main = [] () => null {
+let main = [Actor.label] () => null {
     let e = Employee("e1", "ada", 3)
     let a: Actor = e
     let _n = a.label()

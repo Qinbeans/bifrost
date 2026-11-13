@@ -13,7 +13,8 @@ module extract = {
         static let from_request = [
             axum.path_params,
             axum.text,
-            form.decode
+            form.decode,
+            copy
         ] (req: axum.Request) => Result[Path[T], axum.Response] {
             let found: Result[T, mem.Unique[str]] = form.decode(axum.path_params(req))
             match found {

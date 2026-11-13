@@ -23,6 +23,7 @@ let ApiError = struct {
 
 let root = [
     fs.read_to_string,
+    copy,
     axum.text
 ] () => Result[response.Html[mem.Unique[str]], axum.Response] {
     /* The page in index.html (read on each request: edit it and reload) */
@@ -41,7 +42,7 @@ let list_users = [] (state: mem.Shared[AppState]) => json.Json[User[]] {
 }
 
 let create_user = [
-
+    copy
 ] (state: mem.Shared[AppState], body: json.Json[NewUser]) => response.WithStatus[json.Json[User]] {
     let s <- state
     let user = User(id: s.next_id, name: copy(body.value.name))
@@ -61,7 +62,8 @@ let find = [] (users: User[], id: i64) => i64 {
 }
 
 let show_user = [
-    find
+    find,
+    copy
 ] (state: mem.Shared[AppState], id: extract.Path[i64]) => Result[json.Json[User], ApiError] {
     let s <- state
     let at = find(s.users, id.value)
@@ -121,6 +123,7 @@ let ticks = [
 
 let timing = [
     time.now,
+    middleware.Next.run,
     axum.append_header
 ] async (req: axum.Request, next: middleware.Next) => axum.Response {
     let started = time.now()

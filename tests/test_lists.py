@@ -370,7 +370,18 @@ let mem = import("std:mem")
 
 let User = struct { let name: mem.Unique[str], let age: i64 }
 
-let main = [io.printf, fmt.format] () => null {
+let main = [
+    io.printf,
+    fmt.format,
+    list.contains,
+    list.index_of,
+    list.filter,
+    list.map,
+    list.sorted,
+    list.reversed,
+    list.sort,
+    list.reverse
+] () => null {
     let xs = #[5, 3, 9, 1, 7]
     io.printf("%v %v %d %d\n", xs.contains(9), xs.contains(4), xs.index_of(1), xs.index_of(4))
     let limit = 4
@@ -522,7 +533,7 @@ HEAD = (
             "rows is read by first (line 9) until the end of its block, so it cannot be changed here",
         ),
         (
-            "let f = [] () => null {\n    let xs = #[3, 1]\n    xs.sort()\n}",
+            "let f = [list.sort] () => null {\n    let xs = #[3, 1]\n    xs.sort()\n}",
             "sort changes xs in place, so call it through a guard (`let g <- xs`, then g.sort()), "
             "or make a new list: xs.sorted()",
         ),
@@ -536,22 +547,25 @@ HEAD = (
             "reverse changes its object, but row is a view of grid (a copy of an item)",
         ),
         (
-            "let f = [] () => null {\n    let rs = #[#{a: 1}]\n    let b = rs.contains(#{a: 1})\n}",
+            "let f = [list.contains] () => null {\n    let rs = #[#{a: 1}]\n    let b = rs.contains(#{a: 1})\n}",
             "contains compares numbers, bools and strings, not record",
         ),
         (
-            "let f = [] () => null {\n    let bs = #[true]\n    let s = bs.sorted()\n}",
+            "let f = [list.sorted] () => null {\n    let bs = #[true]\n    let s = bs.sorted()\n}",
             "sorted orders numbers and strings",
         ),
         (
-            "let f = [] () => null {\n    let xs = #[1]\n    let ys = xs.map([] (x: f64) => f64 x)\n}",
+            "let f = [list.map] () => null {\n    let xs = #[1]\n    let ys = xs.map([] (x: f64) => f64 x)\n}",
             "map's function takes one item, an i64",
         ),
         (
-            "let f = [] () => null {\n    let xs = #[1]\n    let ys = xs.filter([] (x: i64) => i64 x)\n}",
+            "let f = [list.filter] () => null {\n    let xs = #[1]\n    let ys = xs.filter([] (x: i64) => i64 x)\n}",
             "filter's function says whether to keep an item: it returns bool",
         ),
-        ("let f = [] () => null {\n    let xs = #[1]\n    let b = xs.contains()\n}", "contains takes one argument"),
+        (
+            "let f = [list.contains] () => null {\n    let xs = #[1]\n    let b = xs.contains()\n}",
+            "contains takes one argument",
+        ),
         (
             "let f = [] () => null {\n    let xs = #[1]\n    let b = xs.size()\n}",
             "i64[] has no method size; a list's are contains, filter, index_of, map, reverse, reversed, sort, sorted",

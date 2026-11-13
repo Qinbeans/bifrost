@@ -14,7 +14,8 @@ module json = {
             axum.body,
             axum.json_valid,
             axum.text,
-            std_json.decode
+            std_json.decode,
+            copy
         ] (req: axum.Request) => Result[Json[T], axum.Response] {
             if !axum.content_type_is(req, "application/json", "+json") {
                 return err(

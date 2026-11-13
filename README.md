@@ -49,6 +49,28 @@ let area = [square] (side: i32) => i32 square(side)
 
 The compiler checks it both ways: calling a function that is not listed is an error, and so is listing one that is never called. A function without a list calls nothing, and `[]` says so explicitly. `this` lets a function call itself. What a function can reach is always visible in its signature, which keeps functions small and their effects explicit.
 
+Each entry names what a call reaches by a name that is certain where it is written, never by a value:
+
+- a function of this file (`square`) or of a module (`io.printf`), and an object's static function (`Context.new`);
+- a method, by its object's type: `team.size()` lists `Team.size`, whatever the value is called. A generic object's methods are listed by its bare name (`Box.get`, for every `Box[T]`), an imported object's by the name this file reaches it by (`models.User.label`), a method an object has from its base by the base that declares it (`Person.greet`; one the object declares itself, in place of the base's, by the object: `Employee.greet`), a union's by the union (`ApiError.status`), and, inside a generic, a method of a value of a type parameter's type by the parameter (`super.inner.get()` in a `Wrap[T]` lists `T.get`, the method of whatever type each `Wrap` is made for). A method calling another on `super` lists it too, beside `super`; one calling itself lists `this`. Naming a method by a value (`[team.size]`) is an error that says which entry to write;
+- a list's functions as `list.<name>` (`list.sorted`, `list.map`), a Result's as `Result.is_ok` and `Result.is_err`, and the prelude's `copy`, which duplicates what it is given. They are built in, so they need no import, but they are calls like any other, so the list shows them.
+
+```bifrost
+let Team = struct {
+    let members: str[],
+    let size = [super] () => i64 len(super.members)
+}
+
+let roster = [Team.size, list.sorted, io.printf] (team: Team) => str[] {
+    io.printf("%d members\n", team.size())
+    return team.members.sorted()                // a new list
+}
+
+let keep = [copy] (team: Team) => Team copy(team)
+```
+
+What is syntax, or a value written another way, needs no entry: `len`, `assert`, `panic`, `exit` and the other builtins, `ok(v)` and `err(e)`, conversions (`i32(x)`), building an object (`Team(members: xs)`), string interpolation (`"{name}"`), spreads (`#[...xs]`), and calling a function value (below). An object's own functions called for it by the language, like `to_string` for `%v`, need none either.
+
 ### Functions are values
 
 A function is a value like any other. Its type is written like its head, `(x: i32) => i32` (parameter names are optional: `(i32) => i32`), and it can be passed, stored in a `let` or an object field, and called:
@@ -63,7 +85,7 @@ let main = [apply, double] () => null {
 }
 ```
 
-Naming a function without calling it counts as depending on it, so `main` lists `double`; calling a function value (`f(x)` in `apply`) needs no entry, because its type already says what it is.
+Naming a function without calling it counts as depending on it, so `main` lists `double`; calling a function value (`f(x)` in `apply`) needs no entry, because its type already says what it is. A method is not a value yet: pass a lambda calling it (`[Team.size] (t: Team) => i64 t.size()`).
 
 A lambda has its own dependency list, which also names the locals it captures. It captures a copy, made where the lambda is written: later changes to the local are not seen. An owned value (a list, an owned string) moves in, so copy it first (`let mine = #[...xs]`) if it stays in use. A function value can be returned, stored in an object or a list, and passed on; it owns what it captured, which its owner frees:
 
@@ -82,7 +104,7 @@ let main = [adder, io.printf] () => null {
 
 The language server warns at each capture that it is a copy; `// ignore: copy` on that line (or the one above) accepts it.
 
-`|>` pipes a value into a call, as its first argument: `x |> f(a)` is `f(x, a)`, so a chain of steps reads in the order they run. The right side is a call, a function's name (`x |> f` is `f(x)`), a lambda, or a method of the value (`xs |> .sorted()` is `xs.sorted()`). It is exactly that call: it needs the same dependency entry, and lends, moves and checks its arguments as the call does.
+`|>` pipes a value into a call, as its first argument: `x |> f(a)` is `f(x, a)`, so a chain of steps reads in the order they run. The right side is a call, a function's name (`x |> f` is `f(x)`), a lambda, or a method of the value (`xs |> .sorted()` is `xs.sorted()`). It is exactly that call: it needs the same dependency entry (`xs |> .sorted()` lists `list.sorted`), and lends, moves and checks its arguments as the call does.
 
 ```bifrost
 let total = xs
@@ -125,13 +147,13 @@ A call's types come from its arguments' types (numbers written as arguments take
 
 A generic function is called, not passed as a value (pass a lambda calling it, `[first] (xs: i64[]) => i64 first(xs)`).
 
-A generic object's own functions are compiled with each object type made from it: `Box[i64]`'s methods are found on a `Box[i64]` (`box.get()`), and its static functions are what the compiler calls for it (an [extractor](#http-servers)'s `from_request`):
+A generic object's own functions are compiled with each object type made from it: `Box[i64]`'s methods are found on a `Box[i64]` (`box.get()`, listed as `Box.get` for every `Box[T]`), and its static functions are what the compiler calls for it (an [extractor](#http-servers)'s `from_request`):
 
 ```bifrost
 let Box[T] = struct {
     let value: T,
     let get = [super] () => T super.value,
-    let mapped = [super] (f: (x: T) => T) => Box[T] Box(value: f(super.value))
+    let mapped = [super, Box.get] (f: (x: T) => T) => Box[T] Box(value: f(super.get()))
 }
 ```
 
@@ -139,14 +161,14 @@ let Box[T] = struct {
 
 `struct` defines an object. `let name: Type` members are stored fields, laid out as a C struct, so objects pass to and from C unchanged. `static let` members are functions called on the type (`Context.new()`) and take no space in the object. Objects are built with named arguments: `Context(window_width: 800, ...)`.
 
-A member function without `static` is a method: it is called on an object (`team.size()`), which it reads as `super`, listed in its dependencies like anything else it uses. A method named `to_string` is how `%v` prints the object:
+A member function without `static` is a method: it is called on an object (`team.size()`), which it reads as `super`, listed in its dependencies like anything else it uses. A function calling a method lists it by its object's type, `Team.size`, as a method calling one on `super` does (see [Dependency lists](#dependency-lists)). A method named `to_string` is how `%v` prints the object:
 
 ```bifrost
 let Team = struct {
     let name: str,
     let members: str[],
     let size = [super] () => i64 len(super.members),
-    let to_string = [super, fmt.format] () => mem.Unique[str] {
+    let to_string = [super, Team.size, fmt.format] () => mem.Unique[str] {
         return fmt.format("%s (%d members)", super.name, super.size())
     }
 }
@@ -166,7 +188,7 @@ let Counter = struct {
     }
 }
 
-let main = [] () => null {
+let main = [Counter.bump] () => null {
     let counter = Counter(hits: 0)
     counter.bump(2)                      // counter.hits is 2
 
@@ -198,7 +220,7 @@ describe(e)                     // lent as a Person: its Person fields, read in 
 let p: Person = e               // kept as one: e moves, and its own fields (employee_id) are freed
 ```
 
-An Employee goes where a Person does: a parameter, a `let`'s type, a returned value, an object's field, a list's item, or a union that holds Persons. Lent (a parameter), it is read in place; kept, it moves, as any owned value does, and becomes the Person it holds. Its methods are its own: `describe` calls Person's, not an Employee's of the same name. A member of the same name as a base's (a field, or a field and a method) is an error, and a base is an object declared before it, not a union, a Result or a generic object.
+An Employee goes where a Person does: a parameter, a `let`'s type, a returned value, an object's field, a list's item, or a union that holds Persons. Lent (a parameter), it is read in place; kept, it moves, as any owned value does, and becomes the Person it holds. Its methods are its own: `describe` calls Person's, not an Employee's of the same name. A function calling a method an object has from a base lists it by the base: `e.greet()` lists `Person.greet`. A member of the same name as a base's (a field, or a field and a method) is an error, and a base is an object declared before it, not a union, a Result or a generic object.
 
 ### Owners, guards and shared values
 
@@ -377,7 +399,7 @@ let show = [io.printf] (r: Result[i64, str]) => null {
 }
 ```
 
-`x?` is the value `x` holds; if it holds an error, the function returns it at once, freeing what is alive as `return` does, so its result must be a `Result` with the same error type (and no guard may be held). `Result[null, E]` says only whether something worked: `ok()`, and `check()?` as a statement. In a `match`, `ok(v)` binds the value and `err(e)` the error (`_` binds nothing); the two arms cover every Result. `r.is_ok()` and `r.is_err()` say which it holds. A Result owns what it holds, and frees only the side it holds; a `match` on one that owns names it first (`let r = find(id)`).
+`x?` is the value `x` holds; if it holds an error, the function returns it at once, freeing what is alive as `return` does, so its result must be a `Result` with the same error type (and no guard may be held). `Result[null, E]` says only whether something worked: `ok()`, and `check()?` as a statement. In a `match`, `ok(v)` binds the value and `err(e)` the error (`_` binds nothing); the two arms cover every Result. `r.is_ok()` and `r.is_err()` say which it holds (listed as `Result.is_ok` and `Result.is_err`). A Result owns what it holds, and frees only the side it holds; a `match` on one that owns names it first (`let r = find(id)`).
 
 A `match` is a value too: `let page = match r { ok(text): axum.html(200, text), err(e): axum.html(500, e) }`. Only the arm that matches runs. When every arm makes a new value (a call returning an owned string, a list, a handle), the match's value is new as well and owned by where it goes, like a call's; arms that give back what the Result holds (`ok(t): t`) lend it, and it stays the Result's.
 
@@ -409,7 +431,7 @@ A literal field is filled in when its object is built, so it is left out of the 
 
 `Employee(e)` binds the Employee the union holds (`Employee(_)` binds nothing); arms naming every object cover the union, and `_` covers the rest. It owns what its objects own, and frees only the one it holds; a `match` on one that owns names it first (`let a = hire(1)`), and `e.name` stays the union's. A union is of objects declared before it (in this file, a module of it, or one it imports: `models.Employee`), not of generic objects or other unions. An object built on one of its objects (`& Employee`) goes in as that one.
 
-A union reads what each of its objects has alike, as TypeScript's do: `actor.type`, and `actor.name` when every object's `name` has one type (Employee's `mem.Unique[str]` and Service's `str` differ, so that one is read with `match`). It calls a method each of its objects has, taking and giving the same, on the one it holds: `%v` prints it with their `to_string`s, and an axum handler's error can be a union of objects with `into_response`. And it can have functions of its own, in braces after `on`, where `super` is the union:
+A union reads what each of its objects has alike, as TypeScript's do: `actor.type`, and `actor.name` when every object's `name` has one type (Employee's `mem.Unique[str]` and Service's `str` differ, so that one is read with `match`). It calls a method each of its objects has, taking and giving the same, on the one it holds: `%v` prints it with their `to_string`s, and an axum handler's error can be a union of objects with `into_response`. And it can have functions of its own, in braces after `on`, where `super` is the union. A function calling either kind lists it by the union's name: `actor.to_string()` lists `Actor.to_string`, and `e.status()` lists `ApiError.status`:
 
 ```
 let ApiError = NotFound | Invalid on "kind" {
@@ -471,18 +493,20 @@ g[1] = #[30, 40, 50]             // the old row is freed
 g -> grid
 ```
 
-A list has its own functions, called on it like methods (built in, like `len`: no import, no dependency entry):
+A list has its own functions, called on it like methods. They are built in, like `len`, so they need no import; each is listed as `list.<name>`, like any function a function calls:
 
 ```bifrost
-let xs = #[5, 3, 9, 1]
-xs.contains(9)                                   // true (numbers, bools and strings)
-xs.index_of(1)                                   // 3, or -1 when absent
-let big = xs.filter([] (x: i64) => bool x > 4)   // #[5, 9]: a new list
-let doubled = big.map([] (x: i64) => i64 x * 2)  // #[10, 18]
-let ordered = xs.sorted()                        // #[1, 3, 5, 9] (also xs.reversed())
-let g <- xs
-g.sort()                                         // in place, through a guard (also g.reverse())
-g -> xs
+let main = [list.contains, list.index_of, list.filter, list.map, list.sorted, list.sort] () => null {
+    let xs = #[5, 3, 9, 1]
+    let has = xs.contains(9)                         // true (numbers, bools and strings)
+    let at = xs.index_of(1)                          // 3, or -1 when absent
+    let big = xs.filter([] (x: i64) => bool x > 4)   // #[5, 9]: a new list
+    let doubled = big.map([] (x: i64) => i64 x * 2)  // #[10, 18]
+    let ordered = xs.sorted()                        // #[1, 3, 5, 9] (also xs.reversed())
+    let g <- xs
+    g.sort()                                         // in place, through a guard (also g.reverse())
+    g -> xs
+}
 ```
 
 `map`, `filter`, `sorted` and `reversed` make new lists, of copies, which their owner frees; `sort` and `reverse` change the list in place, so they go through a guard, like item writes. Sorting orders numbers and strings, in O(n log n) and no extra memory.
@@ -528,7 +552,7 @@ A list has one owner, like an owned string: the `let` holding it, freed at the e
 
 `copy(x)` is a deep copy of any value: a new owner of the lists, strings and function values it holds, at any depth. It is what keeping a view or a parameter asks for, when it is a record or object (`world: copy(app.world)`); a list can also be copied with `#[...xs]`. A function value's copy copies what it captured.
 
-Numbers convert by calling their type: `i32(x / 2)`, `f32(column)`, `i64(2.9)` (a float becomes an integer toward zero). `/` always divides as floats, so `i32((800 - width) / 2)` centers. `copy`, `i32` and the others are the language's own functions: they need no import or dependency entry, and a local of the same name hides them.
+Numbers convert by calling their type: `i32(x / 2)`, `f32(column)`, `i64(2.9)` (a float becomes an integer toward zero). `/` always divides as floats, so `i32((800 - width) / 2)` centers. `copy`, `i32` and the others are the language's own functions: they need no import, and a local of the same name hides them. `copy` duplicates what it is given, so a function calling it lists it, `[copy]`, and its signature shows that it copies; a conversion only makes a value of another type, so it needs no entry.
 
 ### HTTP servers
 

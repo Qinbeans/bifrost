@@ -52,7 +52,7 @@ module game = {
         let draws: ((f: Frame, w: W) => null)[]
     }
 
-    let app[W] = [] (title: str, width: i32, height: i32, world: W) => App[W] {
+    let app[W] = [copy] (title: str, width: i32, height: i32, world: W) => App[W] {
         /* A game of world, in a window of width x height titled title (60 frames a second, on black) */
         let window = Window(
             title: title,
@@ -64,7 +64,7 @@ module game = {
         return App(window: window, world: copy(world), handlers: #[], draws: #[])
     }
 
-    let with_window[W] = [] (app: App[W], window: Window) => App[W] {
+    let with_window[W] = [copy] (app: App[W], window: Window) => App[W] {
         /* app, in window instead */
         return App(
             window: window,
@@ -74,7 +74,7 @@ module game = {
         )
     }
 
-    let with_handler[W] = [] (app: App[W], handler: Handler[W]) => App[W] {
+    let with_handler[W] = [copy] (app: App[W], handler: Handler[W]) => App[W] {
         /* app, with one more handler (run after those before it) */
         return App(
             window: app.window,
@@ -85,7 +85,7 @@ module game = {
     }
 
     let handler[W] = [
-
+        copy
     ] (when: i64, key: i32, seconds: f64, step: (f: Frame, w: W) => W) => Handler[W] {
         /* A handler of the world: step, run when it says */
         return Handler(when: when, key: key, seconds: seconds, step: copy(step))
@@ -145,7 +145,7 @@ module game = {
         return app |> with_handler(handler(TIMER, 0, seconds, step))
     }
 
-    let on_draw[W] = [] (app: App[W], draw: (f: Frame, w: W) => null) => App[W] {
+    let on_draw[W] = [copy] (app: App[W], draw: (f: Frame, w: W) => null) => App[W] {
         /* app, calling draw every frame on the cleared screen: where the world is drawn, with raylib */
         return App(
             window: app.window,
@@ -198,6 +198,7 @@ module game = {
         rl.clear_background,
         rl.end_drawing,
         rl.close_window,
+        copy,
         runs
     ] (app: App[W]) => i32 {
         /* Open the window and run the game until it is closed (Escape closes it) */

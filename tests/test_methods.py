@@ -22,7 +22,7 @@ let Team = struct {
     let name: str,
     let members: str[],
     let size = [super] () => i64 len(super.members),
-    let to_string = [super, fmt.format] () => mem.Unique[str] {
+    let to_string = [super, Team.size, fmt.format] () => mem.Unique[str] {
         return fmt.format("%s (%d members)", super.name, super.size())
     },
     let greet = [super, io.printf] (who: str) => null {
@@ -30,7 +30,7 @@ let Team = struct {
     }
 }
 
-let main = [io.printf, io.puts] () => null {
+let main = [io.printf, io.puts, Team.greet, Team.size, Team.to_string] () => null {
     let team = Team(name: "core", members: #["ada", "bob"])
     io.printf("%v\n", team)
     team.greet("cy")
@@ -89,14 +89,14 @@ let Counter = struct {
         c.hits = c.hits + by
         c -> super
     },
-    let add = [super, fmt.format] (name: str) => i64 {
+    let add = [super, Counter.size, fmt.format] (name: str) => i64 {
         let c <- super
         c.names = #[...c.names, fmt.format("%s", name)]
         let n = c.size()
         c -> super
         return n
     },
-    let twice = [super] () => null {
+    let twice = [super, Counter.bump] () => null {
         let c <- super
         c.bump(1)
         c.bump(1)
@@ -104,11 +104,11 @@ let Counter = struct {
     }
 }
 
-let tick = [] (counter: mem.Weak[Counter]) => null {
+let tick = [Counter.bump] (counter: mem.Weak[Counter]) => null {
     counter.bump(10)
 }
 
-let main = [io.printf, tick] () => null {
+let main = [io.printf, tick, Counter.bump, Counter.twice, Counter.add, Counter.size] () => null {
     let counter = Counter(hits: 0, names: #[])
     counter.bump(2)
     counter.twice()
@@ -234,7 +234,7 @@ _C = (
             "bump changes its object, but this method reads super as a copy; lock super here to change it",
         ),
         (
-            f'{_C}let f = [io.printf] () => null {{\n    let c = C(hits: 1)\n    io.printf("%d", c.add())\n}}',
+            f'{_C}let f = [io.printf, C.add] () => null {{\n    let c = C(hits: 1)\n    io.printf("%d", c.add())\n}}',
             "call add in a statement of its own: it lends c for the call",
         ),
         (
@@ -243,11 +243,11 @@ _C = (
             "c is read by ns",
         ),
         (
-            f"{_C}let f = [] () => null {{\n    C(hits: 1).bump()\n}}",
+            f"{_C}let f = [C.bump] () => null {{\n    C(hits: 1).bump()\n}}",
             "bump changes its object, so call it on a name or through a guard (g[i].bump()), not on C(hits: 1)",
         ),
         (
-            f"{_C}let f = [] () => null {{\n    let cs = #[C(hits: 1)]\n    cs[0].bump()\n}}",
+            f"{_C}let f = [C.bump] () => null {{\n    let cs = #[C(hits: 1)]\n    cs[0].bump()\n}}",
             "bump changes cs[0]; change it through a guard: `let g <- cs`",
         ),
     ],

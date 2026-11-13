@@ -33,7 +33,14 @@ let print_encoded_person = [stdio.printf, json.encode] (person: Person) => null 
     stdio.printf("%s\n", json.encode(person))
 }
 
-let main = [stdio.printf, json.encode, print_encoded_person] () => null {
+let main = [
+    stdio.printf,
+    json.encode,
+    print_encoded_person,
+    Person.get_info,
+    Employee.get_info,
+    Vehicle.get_info
+] () => null {
     let car: Vehicle = Car(make: "Toyota", model: "Corolla")
     let airplane: Vehicle = Airplane(make: "Boeing", model: "747")
     let person = Person(name: "Alice", age: 30, owned_vehicles: #[car])

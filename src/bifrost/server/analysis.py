@@ -32,6 +32,24 @@ from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
 _MODULE_MEMBER = 2  # parts in ``module.Member``
+# What a dependency list names of the language's own (see ``bifrost.lowering``): `copy`, `list.sorted`, `Result.is_ok`.
+_COPY = "copy"
+_COPY_SUMMARY = "a deep copy of x: a new owner of the lists, strings and function values it holds"
+_LIST = "list"
+_RESULT_METHODS = {
+    "is_ok": ("() => bool", "whether it holds a value"),
+    "is_err": ("() => bool", "whether it holds an error"),
+}
+_LANGUAGE_OWNERS = {
+    _LIST: "a list's functions: list.sorted, list.map, ...",
+    results.NAME: "a Result's methods: Result.is_ok, Result.is_err",
+}
+_DEPENDENCY_LISTS = {"dependency_list", "local_dependency_list"}
+_OBJECT_TYPES = {"struct_assignment", "union_definition"}  # what `Type.member` names the members of
+_LISTED = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_., \t\r\n"  # names, and what separates them
+_AFTER_VALUE = set(
+    b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_)]#"'
+)  # `xs[`, `#[`: not a list of names
 
 KEYWORDS = ["let", "struct", "if", "else", "while", "forall", "in", "match", "return", "this", "true", "false", "null"]
 TYPES = [
@@ -487,6 +505,11 @@ class Document:
         """Span the token a ``BifrostError`` points at."""
         start = ((error.lineno or 1) - 1, (error.offset or 1) - 1)
         node = self.root.descendant_for_point_range(self._byte_point(start), self._byte_point(start))
+        entry = node
+        while entry is not None and entry.parent is not None and entry.parent.type not in _DEPENDENCY_LISTS:
+            entry = entry.parent
+        if entry is not None and entry.parent is not None and entry.start_point == self._byte_point(start):
+            node = entry  # a dependency list's entry: all of it (`Team.size`), not its first name
         end = node.end_point if node is not None and node.start_point == self._byte_point(start) else None
         start_position = self.position(self._byte_point(start))
         return Diagnostic((start_position, self.position(end) if end else start_position), error.msg)
@@ -1167,21 +1190,55 @@ class Document:
         """
         access = self._member_access(node)
         if access is None:
-            return None
+            return self._module_type_member(node)
         binding = self.bindings().get(access[0])
         found: tuple[Document, Node, str] | None = None
-        if binding is not None and binding[1].type == "struct_assignment":
+        if binding is not None and binding[1].type in _OBJECT_TYPES:
             found = (self, binding[1], access[0])
         if found is None:
             found = self._struct_of(access[0], node)  # `guard.counter`: the struct `guard` reaches
         if found is None:
+            kind = self.type_of(access[0], node)  # `pet.legs()`, of a union
+            found = self._struct_named(kind, union=True) if kind is not None else None
+        if found is None:
             return None
         document, struct, owner = found
-        for member in struct.named_children:
-            identifier = _name_of(member) if member.type == "struct_field" else None
-            if identifier is not None and _text(identifier) == access[1]:
-                return document, member, owner
-        return None
+        return document._declared_member(struct, access[1], owner)
+
+    def _declared_member(self, struct: Node, name: str, owner: str) -> "tuple[Document, Node, str] | None":
+        """Find the ``struct_field`` declaring ``name`` for an object or a union declared in this document.
+
+        An object's own, or else its base's (with the base's name: ``Person.greet``); a union's own,
+        or else the one each of its objects has (``Pet.legs``), at its first object's.
+        """
+        member = next((m for m in struct.named_children if m.type == "struct_field" and _declares(m, name)), None)
+        if member is not None:
+            return self, member, owner
+        if struct.type == "struct_assignment":
+            for base in struct.children_by_field_name("base"):
+                named = self._struct_named(_text(base))
+                found = named[0]._declared_member(named[1], name, named[2]) if named is not None else None
+                if found is not None:
+                    return found
+            return None
+        objects = [self._struct_named(_text(written)) for written in _union_members(struct) or []]
+        each = [o[0]._declared_member(o[1], name, o[2]) if o is not None else None for o in objects]
+        if not each or any(found is None for found in each):
+            return None
+        document, member, _ = each[0]  # type: ignore[misc] - none is None
+        names = ", ".join(o[2] for o in objects if o is not None)
+        return document, member, f"each of {owner}'s objects ({names})"
+
+    def _module_type_member(self, node: Node) -> "tuple[Document, Node, str] | None":
+        """For ``models.User.label`` with the cursor on ``label``: its ``struct_field`` (see ``_object_member``)."""
+        path = self._field_path(node)
+        if path is None or len(path[1]) != _MODULE_MEMBER:
+            return None
+        found = self._struct_named(f"{path[0]}.{path[1][0]}", union=True)
+        if found is None:
+            return None
+        document, struct, owner = found
+        return document._declared_member(struct, path[1][1], owner)
 
     def _struct_of(self, name: str, node: Node) -> "tuple[Document, Node, str] | None":
         """Return the ``struct`` a local reaches (``Context``, ``mem.Weak[Context]``, a guard of one).
@@ -1191,10 +1248,14 @@ class Document:
         kind = self.type_of(name, node)
         return self._struct_named(self._shared_inner(kind)) if kind is not None else None
 
-    def _struct_named(self, kind: str) -> "tuple[Document, Node, str] | None":
-        """Find the object type ``Context``, or ``state.AppState`` in the module a file imports as ``state``."""
+    def _struct_named(self, kind: str, *, union: bool = False) -> "tuple[Document, Node, str] | None":
+        """Find the object type ``Context``, or ``state.AppState`` in the module a file imports as ``state``.
+
+        With ``union``, a union too (``Pet``, ``models.Pet``).
+        """
+        kinds = _OBJECT_TYPES if union else {"struct_assignment"}
         binding = self.bindings().get(kind)
-        if binding is not None and binding[1].type == "struct_assignment":
+        if binding is not None and binding[1].type in kinds:
             return self, binding[1], kind
         alias, _, member = kind.partition(".")
         spec = self._module_of(alias) if member and "." not in member else None
@@ -1202,7 +1263,7 @@ class Document:
         if found is None:
             return None
         value = _named(found[1])[-1]
-        return (found[0], value, kind) if value.type == "struct_assignment" else None
+        return (found[0], value, kind) if value.type in kinds else None
 
     def _member_access(self, node: Node) -> tuple[str, str] | None:
         """For ``owner.member`` with the cursor on ``member``, return both names."""
@@ -1297,7 +1358,7 @@ class Document:
         node = self.node_at(position)
         if node is None or node.type not in {"simple_identifier", "identifier"}:
             return None
-        access = self._hover_access(node)
+        access = self._hover_language_entry(node) or self._hover_access(node)
         if access is not None:
             return access or None
         name = _text(node)
@@ -1438,9 +1499,44 @@ class Document:
         written = self._hover_record_literal(node)
         if written is not None:
             return written
-        if self._member_access(node) is not None:
+        if self._member_access(node) is not None or self._module_type_member(node) is not None:  # `models.User.label`
             return self._hover_member(node) or ""
         return self._hover_record_field(node) or "" if self._field_path(node) is not None else None
+
+    def _hover_language_entry(self, node: Node) -> str | None:
+        """Describe the language's own functions: the prelude's ``copy`` (listed or called), and ``list.sorted``.
+
+        ``list`` and ``Result`` of an entry say what they hold. A name of this file, or a local,
+        hides each, as it does for the compiler.
+        """
+        name = _text(node)
+        plain = self._member_access(node) is None and self._field_path(node) is None  # not `x.copy`
+        if name == _COPY and plain and self.bindings().get(_COPY) is None and self._local(_COPY, node) is None:
+            return _code(f"{_COPY} = (x: T) => T\n// {_COPY_SUMMARY}")
+        if _ancestor(node, "dependency_list") is None and _ancestor(node, "local_dependency_list") is None:
+            return None
+        if name in _LANGUAGE_OWNERS and plain and self.bindings().get(name) is None:
+            return _code(f"{name}\n// {_LANGUAGE_OWNERS[name]}")
+        path = self._field_path(node)
+        if path is None or len(path[1]) != 1 or self.bindings().get(path[0]) is not None:
+            return None
+        return self._hover_listed_function(node, path[0], path[1][0])
+
+    def _hover_listed_function(self, node: Node, owner: str, name: str) -> str | None:
+        """Describe an entry ``owner.name`` that no name of this file declares: ``list.sorted``, ``T.get``."""
+        around = node.parent
+        while around is not None and around.type not in {"struct_assignment", "function_definition"}:
+            around = around.parent
+        if around is not None and owner in _type_parameters(around):
+            # `T.get`, in a generic: the method of each type T is made for
+            return _code(f"{owner}.{name}\n// the {name} method of each type {owner} stands for")
+        if owner == _LIST and name in list_methods.METHODS:
+            signature, summary = list_methods.describe(name, "T")
+            return _code(f"let {name} = {signature}\n// a list's function: {summary}")
+        if owner == results.NAME and name in _RESULT_METHODS:
+            signature, summary = _RESULT_METHODS[name]
+            return _code(f"let {name} = {signature}\n// a Result's method: {summary}")
+        return None
 
     def _hover_record_field(self, node: Node) -> str | None:
         """Describe ``found.user`` or ``found.user.id``: a field of a record (or object) a local holds.
@@ -1578,8 +1674,11 @@ class Document:
         before = line.rstrip()
         stem = before[len(before.rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")) :]
         prefix = before[: len(before) - len(stem)]
+        listing = self._in_dependency_list((row, character))
         if prefix.endswith("."):
-            return self._member_completions(prefix[:-1].rstrip(), (row, character))
+            head = prefix[:-1].rstrip()
+            listed = self._dependency_members(_written_owner(head)) if listing else None
+            return listed if listed is not None else self._member_completions(head, (row, character))
         names = [
             Completion(
                 name,
@@ -1594,11 +1693,78 @@ class Document:
         if function is not None:
             for candidate in self._locals(function):
                 names.append(Completion(candidate, "variable"))
+        if listing:
+            names += self._language_entries()
         return (
             names
             + [Completion(keyword, "keyword") for keyword in KEYWORDS]
             + [Completion(kind, "type") for kind in TYPES]
         )
+
+    def _in_dependency_list(self, point: tuple[int, int]) -> bool:
+        """Whether ``point`` is in a dependency list being written: after ``[`` and names (``[io.printf, Team.``).
+
+        Read from the text, which is often not yet parsed there. A ``[`` after a value is an index
+        (``xs[i``), and ``#[`` a list.
+        """
+        row, character = point
+        current = self._lines[row][:character] if row < len(self._lines) else b""
+        before = b"\n".join([*self._lines[:row], current]).rstrip(_LISTED)
+        if not before.endswith(b"["):
+            return False
+        opener = before[:-1].rstrip(b" \t")
+        return not opener or opener[-1] not in _AFTER_VALUE
+
+    def _language_entries(self) -> list[Completion]:
+        """Offer what a dependency list names of the language's own: ``copy``, and ``list``'s and ``Result``'s."""
+        bound = self.bindings()
+        found = (
+            []
+            if _COPY in bound
+            else [Completion(_COPY, "function", f"{_COPY} = (x: T) => T", documentation=_COPY_SUMMARY)]
+        )
+        found += [Completion(name, "module", what) for name, what in _LANGUAGE_OWNERS.items() if name not in bound]
+        return found
+
+    def _dependency_members(self, owner: str) -> list[Completion] | None:
+        """Offer what a dependency list names after ``owner.``, or ``None`` to offer as elsewhere.
+
+        A list's functions after ``list.``, a Result's after ``Result.``, and an object's static
+        functions and its own methods (listed by its type: ``Team.size``) after its name.
+        """
+        if owner == _LIST and owner not in self.bindings():
+            return [
+                Completion(
+                    name,
+                    "function",
+                    f"{name} = {list_methods.describe(name, 'T')[0]}",
+                    documentation=list_methods.describe(name, "T")[1],
+                )
+                for name in sorted(list_methods.METHODS)
+            ]
+        if owner == results.NAME and owner not in self.bindings():
+            return [
+                Completion(name, "function", f"{name} = {signature}", documentation=summary)
+                for name, (signature, summary) in sorted(_RESULT_METHODS.items())
+            ]
+        found = self._struct_named(owner, union=True) if owner else None
+        if found is None:
+            return None
+        document, struct, _ = found
+        methods = [entry for entry in document._own_fields(struct) if entry.kind == "method"]
+        if struct.type == "union_definition":
+            alike = document._alike_methods(struct)
+            methods += [entry for entry in alike if all(entry.label != m.label for m in methods)]
+        return document._statics(struct) + methods
+
+    def _alike_methods(self, union: Node) -> list[Completion]:
+        """Return the methods each object of a union has, which it calls on the one it holds."""
+        alike: list[Completion] | None = None
+        for written in _union_members(union) or []:
+            named = self._struct_named(_text(written))
+            methods = [entry for entry in named[0]._fields(named[1]) if entry.kind == "method"] if named else []
+            alike = methods if alike is None else [e for e in alike if any(m.label == e.label for m in methods)]
+        return alike or []
 
     def _member_completions(self, head: str, point: tuple[int, int]) -> list[Completion]:
         """Offer what follows ``head.``: a module's members, an object's static functions, or a value's fields.
@@ -1608,7 +1774,7 @@ class Document:
         piped = head.endswith("|>")
         if piped:
             head = head[:-2]
-        owner = head.split()[-1].split("[")[-1].split("(")[-1] if head.strip() else ""
+        owner = _written_owner(head)
         module = self._module_of(owner)
         if module:
             return [] if piped else self._members(module)
@@ -1924,8 +2090,12 @@ class Document:
         binding = self.bindings().get(owner)
         if binding is None or binding[1].type != "struct_assignment":
             return []
+        return self._statics(binding[1])
+
+    def _statics(self, struct: Node) -> list[Completion]:
+        """Return an object's (or a union's) static functions, as completions."""
         found = []
-        for member in binding[1].named_children:
+        for member in struct.named_children:
             identifier = _name_of(member) if member.type == "struct_field" else None
             if identifier is not None and member.child_by_field_name("modifier") is not None:
                 function = next((p for p in _named(member) if p.type == "local_function_definition"), None)
@@ -2128,6 +2298,11 @@ def _declares(member: Node, name: str) -> bool:
     """Whether a ``struct_field`` declares ``name``."""
     identifier = _name_of(member)
     return identifier is not None and _text(identifier) == name
+
+
+def _written_owner(head: str) -> str:
+    """Return the name written last in ``head``, before the ``.`` being completed: ``Team`` in ``[copy,Team``."""
+    return re.split(r"[\s\[(,]", head.strip())[-1]
 
 
 def _ancestor(node: Node, kind: str) -> Node | None:

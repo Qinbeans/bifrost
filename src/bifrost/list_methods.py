@@ -1,9 +1,9 @@
 """A list's own functions, called on it like methods: ``xs.contains(3)``, ``xs.map(f)``, ``g.sort()``.
 
-They are built into the compiler, like ``len``: no import, no dependency
-entry. Each is generated once per element type (and, for ``map``, per
-function type), from source, as the drop and clone functions are (see
-``bifrost.owned``).
+They are built into the compiler, like ``len``: no import, but a function
+calling one lists it, as ``list.contains`` (see ``SourceUnit._dependencies``).
+Each is generated once per element type (and, for ``map``, per function type),
+from source, as the drop and clone functions are (see ``bifrost.owned``).
 
 Reading a list (any list, a view too):
 

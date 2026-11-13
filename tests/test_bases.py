@@ -78,7 +78,7 @@ let promote = [fmt.format] (n: i64) => Person {
     let e = Employee(fmt.format("e%d", n), fmt.format("worker"), 30 + n)
     return e
 }
-let main = [io.printf, fmt.format, describe, promote] () => null {
+let main = [io.printf, fmt.format, describe, promote, Person.greet] () => null {
     let e = Employee(fmt.format("e1"), fmt.format("ada"), 36)
     describe(e)
     describe(Employee(fmt.format("e2"), fmt.format("bo"), 20))
@@ -141,7 +141,16 @@ let Actor = Employee | Service on "type" {
     let kind = [super] () => i64 match super { Employee(_): 1, Service(_): 2 },
     static let make = [] () => Actor Service(name: "api")
 }
-let main = [io.printf, fmt.format, Actor.make] () => null {
+let main = [
+    io.printf,
+    fmt.format,
+    Actor.make,
+    Person.greet,
+    Person.years,
+    Actor.greet,
+    Actor.years,
+    Actor.kind
+] () => null {
     let e = Employee(fmt.format("e1"), fmt.format("ada"), 36)
     io.printf("%s %d\n", e.greet("hello"), e.years())
     let a: Actor = e

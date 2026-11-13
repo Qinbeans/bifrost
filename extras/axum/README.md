@@ -15,7 +15,7 @@ let root = [axum.text] () => axum.Response axum.text(200, "Hello, World!")
 
 let show = [axum.json] (id: extract.Path[i64]) => axum.Response axum.json(200, #{id: id.value})
 
-let create = [] (body: json.Json[NewUser]) => json.Json[User] {
+let create = [copy] (body: json.Json[NewUser]) => json.Json[User] {
     return json.Json(value: User(id: 1337, name: copy(body.value.name)))
 }
 
@@ -36,7 +36,7 @@ let main = [app, axum.bind, axum.serve] async () => null {
 package:
   type: async            # axum.serve is awaited: main is async
 packages:
-  axum: 0.3.0            # or {path: ../extras/axum}, or {version: 0.3.0, features: [ws]}
+  axum: 0.4.0            # or {path: ../extras/axum}, or {version: 0.4.0, features: [ws]}
 ```
 
 ## How axum's API reads here
@@ -131,7 +131,7 @@ let show = [find] (state: mem.Shared[AppState], id: extract.Path[i64]) => Result
 | tower-http's `ServeFile::new(path)`, `::new_with_mime` | `axum.serve_file(path)`, `axum.serve_file_with_mime(path, mime)` (see [Serving files](#serving-files)) |
 
 ```bifrost
-let timing = [time.now, axum.append_header] async (req: axum.Request, next: middleware.Next) => axum.Response {
+let timing = [time.now, middleware.Next.run, axum.append_header] async (req: axum.Request, next: middleware.Next) => axum.Response {
     let started = time.now()
     let res = await next.run(req)
     axum.append_header(res, "x-response-time", "{time.now() - started}ms")
@@ -165,7 +165,7 @@ let ticks = [sse.start, sse.send, sse.keep_alive, sse.end, sse.Event.of, time.sl
     return sse.end(stream)
 }
 
-let echo = [ws.recv, ws.text, ws.send, ws.done] async (upgrade: ws.WebSocketUpgrade) => axum.Response {
+let echo = [ws.WebSocketUpgrade.accept, ws.recv, ws.text, ws.send, ws.done] async (upgrade: ws.WebSocketUpgrade) => axum.Response {
     let socket = upgrade.accept()
     while await ws.recv(socket) {
         await ws.send(socket, "echo: {ws.text(socket)}")
@@ -214,7 +214,7 @@ h2o needs OpenSSL and zlib (`dnf install openssl-devel zlib-devel`, or `apt inst
 
 ```bash
 cmake -B build -G Ninja && cmake --build build      # h2o (pinned), c/axum.c, and the features' libraries
-bfc package                                         # dist/axum-0.3.0-<target>.bifpkg
+bfc package                                         # dist/axum-0.4.0-<target>.bifpkg
 ```
 
 The C side is `c/axum.c` (routers, middleware, requests, responses, the server), `c/stream.c` (streamed bodies), `c/ws.c` and `c/multipart.c` (their features), and `c/features/` (one flag each for the features the C side reads). `tests/test_axum.py` drives a server built from all of it over HTTP.

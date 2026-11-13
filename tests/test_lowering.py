@@ -241,7 +241,7 @@ def test_objects_have_static_functions_and_named_construction(tmp_path: Path) ->
         ),
         (
             OBJECT.replace("static let new", "let new"),
-            "Point.new is a method, called on a Point (value.new(...)); it needs no entry in a dependency list",
+            "Point.new is a method, called on a Point (value.new(...)); call it on one",
         ),
         (OBJECT.replace("let y: i32", "static let y: i32"), "static data is not supported"),
         (OBJECT.replace("let y: i32", "let x: i32"), "Point already has a member named 'x'"),

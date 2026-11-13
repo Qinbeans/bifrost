@@ -11,7 +11,8 @@ module query = {
         static let from_request = [
             axum.query,
             axum.text,
-            form.decode
+            form.decode,
+            copy
         ] (req: axum.Request) => Result[Query[T], axum.Response] {
             let found: Result[T, mem.Unique[str]] = form.decode(axum.query(req))
             match found {

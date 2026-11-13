@@ -16,6 +16,9 @@ A function's dependency list names every function it calls, and nothing else:
 function, listing one that is never called, or listing something that is not a
 function (a module, struct, or constant) is an error; building a struct value
 (``raylib.Color(...)``) is not a call. Without a list, a function calls nothing.
+A method is listed by its object's type, not the value it is called on
+(``team.size()`` needs ``Team.size``); a list's functions as ``list.sorted``, a
+Result's as ``Result.is_ok``, and the prelude's ``copy`` as ``copy``.
 
 Functions are values: naming one without calling it (``http.get(app, "/",
 index)``) passes a pointer to it, typed ``(ctx: http.Context) => null``, and
@@ -118,6 +121,9 @@ _PRIMITIVES: dict[str, object] = {
 }
 
 _DEPENDENCY_LISTS = {"dependency_list", "local_dependency_list"}
+# The language's own functions a dependency list names: `copy`, and a list's (`list.sorted`).
+_COPY = "copy"
+_LIST = "list"
 
 # The numeric types a value converts to by calling them: `i32(x / 2)`, `f32(n)` (see `_convert`).
 _CONVERSIONS = {name for name in _PRIMITIVES if name not in {"bool", "str", "null"}}
@@ -423,6 +429,12 @@ class _FunctionScope:
         # `this`) -> its entry in the list.
         self.dependencies: dict[str, Node] = {}
         self.called: set[str] = set()
+        # A method listed by its object's type (`Team.size`, `Box.get`): (id of the object type,
+        # or of the generic, and the method's name) -> its dependency, a key of `dependencies`.
+        self.methods: dict[tuple[int, str], list[str]] = {}
+        # Entries naming a method by a local's name (`[team.size]`), with the local: reported
+        # once the local's type, and so the object's type to list instead, is known.
+        self.misnamed: list[tuple[Node, str]] = []
         self.pointers: set[str] = set()  # `mem.Weak` parameters and cells (pointers)
         self.cells: dict[str, Any] = {}  # `mem.Shared`/`mem.Atomic` parameters and owners -> their container
         self.cell_parameters: set[str] = set()  # the cells that are parameters (borrowed, never released)
@@ -1266,6 +1278,8 @@ class SourceUnit:
         key = tuple(scalar_type(argument) for argument in arguments)
         found = generic.instances.get(key)
         if found is not None:
+            if found.error is not None:
+                raise found.error  # its functions did not compile: say why each time it is used
             if found.compiled is None:
                 raise self.error(generic.node, f"{found.name} holds a {found.name} itself, which is not supported yet")
             return found.compiled
@@ -1281,7 +1295,11 @@ class SourceUnit:
             raise
         instance.compiled = cls
         generics.made(cls, generic, arguments, name)
-        self._instantiate_members(generic, instance, members)
+        try:
+            self._instantiate_members(generic, instance, members)
+        except BifrostError as error:
+            instance.error = error
+            raise
         return cls
 
     def _instantiate_members(
@@ -1461,12 +1479,19 @@ class SourceUnit:
         if expected is not None:  # what it gives is written where it goes (`let xs: i64[] = empty()`): that first
             self._expected_bindings(generic, call, expected, bindings)
         pairs = self._infer_pairs(generic, call)
+        unknown: list[Node] = []
         for pattern, argument in sorted(pairs, key=lambda pair: _unwrap(pair[1]).type == "literal"):
             concrete = self._static_type(argument)  # literals last: `pick(x, 1)` takes x's type
             if concrete is not None:
                 generic.unit._unify(pattern, concrete, (generic, bindings, argument, self))
+            else:
+                unknown.append(argument)
         missing = [parameter for parameter in generic.parameters if parameter not in bindings]
         if missing:
+            for argument in unknown:  # a call of a generic that does not compile (`unbox(make(3))`): say why
+                found = self._generic_target(_unwrap(argument))
+                if found is not None:
+                    self._instance_for(*found)
             msg = (
                 f"cannot tell what {missing[0]} is in this call of {generic!r}: no argument's type says it; "
                 f"write the type of what it gives where it goes: let x: ... = {_text(call)}"
@@ -1734,10 +1759,7 @@ class SourceUnit:
         statements = self._captured(closure or [], node) + self._body(
             body, returns=annotations["return"] is not type(None)
         )
-        for dependency, entry in self._scope.dependencies.items():
-            if dependency not in self._scope.called:
-                verb = "used" if dependency == "super" or dependency in scope.captures else "called"
-                raise self.error(entry, f"'{dependency}' is a dependency of {name} but never {verb}")
+        self._check_listed(name)
         if inferring:
             annotations["return"] = self._inferred_record(name, self._scope.results or [])
             self._inferring.discard(name)
@@ -2026,8 +2048,10 @@ class SourceUnit:
     def _dependencies(self, node: Node) -> None:
         """Record the functions a dependency list lets the current function call.
 
-        Entries are top-level functions, externs (``raylib.InitWindow``), and
-        ``this`` (the function itself).
+        Entries are top-level functions, externs (``raylib.InitWindow``), an object's static
+        functions (``Context.new``) and methods, by its type (``Team.size``, ``Box.get``,
+        ``models.User.label``), a list's functions (``list.sorted``), a Result's
+        (``Result.is_ok``), the prelude's ``copy``, and ``this`` (the function itself).
         """
         assert self._scope is not None
         for entry in node.children:
@@ -2048,14 +2072,223 @@ class SourceUnit:
                 same = instance is not None and instance[0] == self._scope.function
                 dependency = instance[1] if same and instance is not None else self._scope.function
             else:
-                parts = _text(entry).split(".")
-                dependency = ".".join([self._qualify(parts[0]), *parts[1:]])
-                self._not_a_method(entry, dependency, "it needs no entry in a dependency list")
-                if not self._is_function(entry):
-                    raise self.error(entry, f"'{dependency}' is not a function; list only functions")
+                named = self._named_dependency(entry, node.parent)
+                if named is None:
+                    continue
+                dependency = named
             if dependency in self._scope.dependencies:
                 raise self.error(entry, f"'{dependency}' is already a dependency")
             self._scope.dependencies[dependency] = entry
+
+    def _named_dependency(self, entry: Node, function: Node | None) -> str | None:
+        """Return the dependency an entry that names one is (``io.printf``, ``Team.size``, ``list.sorted``).
+
+        ``None`` for one naming a method by a local (``team.size``), reported once its type is known.
+        """
+        assert self._scope is not None
+        parts = _text(entry).split(".")
+        dependency = ".".join([self._qualify(parts[0]), *parts[1:]])
+        builtin = self._builtin_entry(entry, parts)
+        if builtin is not None:
+            return builtin
+        method = self._method_entry(entry, parts)
+        if method is not None:
+            self._scope.methods.setdefault((id(method), parts[-1]), []).append(dependency)
+            return dependency
+        if len(parts) > 1 and parts[0] in self._local_names(function):
+            self._scope.misnamed.append((entry, parts[0]))
+            return None
+        if not self._is_function(entry):
+            raise self.error(entry, f"'{dependency}' is not a function; list only functions")
+        return dependency
+
+    def _check_listed(self, name: str) -> None:
+        """Once the function ``name`` is lowered: reject an entry it never calls, or one naming a method by a value."""
+        assert self._scope is not None
+        for entry, local in self._scope.misnamed:
+            raise self._misnamed(entry, self._name_type(local))
+        for dependency, entry in self._scope.dependencies.items():
+            if dependency not in self._scope.called:
+                verb = "used" if dependency == "super" or dependency in self._scope.captures else "called"
+                raise self.error(entry, f"'{dependency}' is a dependency of {name} but never {verb}")
+
+    def _builtin_entry(self, entry: Node, parts: list[str]) -> str | None:
+        """For an entry naming one of the language's own functions, its dependency; ``None`` for others.
+
+        ``copy`` (the prelude's), a list's functions (``list.sorted``) and a Result's (``Result.is_ok``):
+        each is listed like any function it calls, unless a name of this file hides it.
+        """
+        assert self._scope is not None
+        taken = self._scope.names | self.globals.keys() | self._functions
+        if parts == [_COPY] and _COPY not in taken:
+            return _COPY
+        if len(parts) != 2 or (parts[0] in taken and self._names_member(entry, parts)):  # noqa: PLR2004
+            return None  # not `list.sorted` (a type and a function), or this file names it (a struct list)
+        owner, name = parts
+        if owner == _LIST:
+            if name not in list_methods.METHODS:
+                methods = ", ".join(f"list.{method}" for method in sorted(list_methods.METHODS))
+                raise self.error(entry, f"a list has no function {name}; its functions are {methods}")
+            return f"{_LIST}.{name}"
+        if owner == results.NAME:
+            if name not in _RESULT_METHODS:
+                methods = ", ".join(f"{results.NAME}.{method}" for method in sorted(_RESULT_METHODS))
+                raise self.error(entry, f"a Result has no method {name}; its methods are {methods}")
+            return f"{results.NAME}.{name}"
+        return None
+
+    def _names_member(self, entry: Node, parts: list[str]) -> bool:
+        """Whether an entry names a function or method of something of this file (``list.sorted`` of a struct ``list``).
+
+        A value (a parameter named ``list``) lists nothing, so its name hides none of the language's own.
+        """
+        assert self._scope is not None
+        if parts[0] in self._scope.names:
+            return False
+        try:
+            return self._method_entry(entry, parts) is not None or self._is_function(entry)
+        except BifrostError:
+            return False
+
+    def _method_entry(self, entry: Node, parts: list[str]) -> object | None:
+        """For an entry naming a method by its object's type (``Team.size``), that type; ``None`` for others.
+
+        A generic object's method is listed by its bare name (``Box.get``, for every ``Box[T]``),
+        and the type it is reached by (``models.User.label``); a base's method by the base that
+        declares it (``Person.greet``, for an Employee's too); and, in a generic, one of a value
+        of a type parameter's type by the parameter (``T.get``). Naming a method by a value
+        (``team.size``) is an error, saying which entry to write instead.
+        """
+        assert self._scope is not None
+        if len(parts) < 2:  # noqa: PLR2004 - a type and a method
+            return None
+        *owner_parts, name = parts
+        if owner_parts == [owner_parts[0]] and owner_parts[0] in self._type_env:
+            # A type parameter's (`T.get`, in a generic): the method of the type it is for, in each
+            # instance; one it lacks is never called (so is reported as such).
+            owner = self._method_owner(scalar_type(self._type_env[owner_parts[0]]), name)
+            return owner if owner is not None else object()
+        if owner_parts[0] == "super" or owner_parts[0] in self._scope.names:
+            receiver = scalar_type(self._scope.receiver) if owner_parts[0] == "super" else None
+            kind = receiver if owner_parts[0] == "super" else self._name_type(owner_parts[0])
+            raise self._misnamed(entry, kind if len(owner_parts) == 1 else None)
+        target = self._reach([*self._qualify(owner_parts[0]).split("."), *owner_parts[1:]])
+        if isinstance(target, generics.Generic):
+            return target if target.kind == generics.OBJECT and name in self._generic_methods(target) else None
+        if not isinstance(target, type) or not hasattr(target, "__lang_struct__"):
+            return None
+        kind = scalar_type(target)
+        found = unions.union(kind)
+        each = found is not None and all(self._method(variant, name) is not None for _, variant in found.variants)
+        if not each and self._method(kind, name) is None:
+            return None
+        owner = self._method_owner(kind, name)
+        if owner is not target:
+            declared = self._written(owner)
+            msg = f"{name} is {declared}'s method ({'.'.join(owner_parts)} is built on {declared}); list it by it"
+            raise self.error(entry, f"{msg}: [{declared}.{name}]")
+        return target
+
+    def _generic_methods(self, generic: generics.Generic) -> set[str]:
+        """Return the names of a generic object's methods: its functions without ``static``."""
+        found = set()
+        for member in _children(generic.node):
+            if member.type == "base" or member.child_by_field_name("modifier") is not None:
+                continue
+            parts = _children(member)
+            if any(part.type == "local_function_definition" for part in parts):
+                found.add(self._identifier(parts[0]))
+        return found
+
+    def _method_owner(self, kind: ScalarType | None, name: str) -> object | None:
+        """Return the type a method ``name`` of ``kind`` objects is listed by (``Team`` for ``Team.size``).
+
+        The object declaring it (a base's method is the base's: ``Person.greet``, unless the
+        object declares its own), the generic
+        object it is made from (``Box`` for a ``Box[i64]``), or the union calling it (its own
+        function, or one each of its objects has); ``None`` when it has no such method.
+        """
+        if not isinstance(kind, StructType) or self._method(kind, name) is None:
+            return None
+        own = self.project.methods.get(kind.python, {}).get(name)
+        if unions.union(kind) is None and (own is None or own[1] in self.project.derived):  # not its own: a base's
+            for base in bases.bases(kind):
+                if self._method(base, name) is not None:
+                    return self._method_owner(base, name)
+        made = generics.made_from(kind.python)
+        return made[0] if made is not None else kind.python
+
+    def _written(self, owner: object) -> str:
+        """Return how this file writes an object type (or a generic object): ``Team``, ``models.User``, ``Box``."""
+        names = [(name, value) for name, value in self.globals.items() if not name.startswith("__")]
+        for name, value in names:
+            if value is owner:
+                return name
+        for name, value in names:
+            if isinstance(value, SimpleNamespace):
+                member = next((member for member, held in vars(value).items() if held is owner), None)
+                if member is not None:
+                    return f"{name}.{member}"
+        if isinstance(owner, generics.Generic):
+            return owner.name
+        kind = scalar_type(owner)
+        return display_types(kind.name) if isinstance(kind, StructType) else str(owner)
+
+    def _local_names(self, function: Node | None) -> set[str]:
+        """Return the names a function's body binds: its lets, guards and loop variables (not its lambdas')."""
+        if function is None:
+            return set()
+        lets = {self._identifier(_children(let)[0]) for let in self._descendants(function, "local_assignment")}
+        guards = {self._identifier(lock.child_by_field_name("guard")) for lock in self._descendants(function, "lock")}
+        loops = {self._identifier(_children(loop)[0]) for loop in self._descendants(function, "forall")}
+        return lets | guards | loops
+
+    def _misnamed(self, entry: Node, kind: ScalarType | None) -> BifrostError:
+        """Report an entry naming a method by a value (``[team.size]``): it is listed by its object's type."""
+        *owner, name = _text(entry).split(".")
+        held = ".".join(owner)
+        found = self._method_owner(kind, name)
+        builtin = (is_list(kind) and name in list_methods.METHODS and _LIST) or (
+            results.is_result(kind) and name in _RESULT_METHODS and results.NAME
+        )
+        if found is not None or builtin:
+            listed = f"{builtin}.{name}" if builtin else f"{self._written(found)}.{name}"
+            return self.error(entry, f"list a method by its object's type, not a value ({held}): [{listed}]")
+        msg = f"{held} is a value, so '{_text(entry)}' names no function; list a method by its object's type"
+        return self.error(entry, f"{msg}: [Type.{name}]")
+
+    def _depend_method(self, kind: StructType, qualified: str, node: Node) -> None:
+        """Check a method call (``team.size()``) against the dependency list: it lists ``Team.size``.
+
+        By the type that has it (see ``_method_owner``), not the value it is called on. A method
+        calling itself (on ``super``) may list ``this`` instead.
+        """
+        assert self._scope is not None
+        name = _text(node)
+        owner = self._method_owner(kind, name)
+        listed = self._scope.methods.get((id(owner), name))
+        if listed is not None:
+            self._scope.called.update(listed)
+            return
+        if qualified == self._scope.function:  # itself
+            self._depend(qualified, node)
+            return
+        for entry, local in self._scope.misnamed:
+            if _text(entry).rpartition(".")[2] == name:
+                raise self._misnamed(entry, self._name_type(local))
+        written = f"{self._written(owner)}.{name}"
+        parameter = next(
+            (
+                held
+                for held, bound in self._type_env.items()
+                if getattr(scalar_type(bound), "python", None) is kind.python
+            ),
+            None,
+        )
+        if parameter is not None and written not in self._scope.dependencies:  # a value of a type parameter's type
+            msg = f"{self._scope.function} calls '{written}' without depending on it"
+            raise self.error(node, f"{msg}; add it to the dependency list: [{parameter}.{name}]")
+        self._depend(written, node)
 
     def _not_a_method(self, node: Node, dotted: str, instead: str) -> None:
         """Reject naming a method as an object's function (``Point.norm``): it is called on a value."""
@@ -3209,6 +3442,11 @@ class SourceUnit:
         captures: list[tuple[str, ScalarType]] = []
         for entry in _children(listed) if listed is not None else []:
             name = _text(entry)
+            held, _, method = name.partition(".")
+            if method and "." not in method and held in outer.names:  # `[team.size]`, team a local around it
+                kind = self._name_type(held)
+                if self._method_owner(kind, method) is not None:
+                    raise self._misnamed(entry, kind)
             if "." in name or name not in outer.names:
                 continue
             if name in outer.guards or name in outer.held:
@@ -3439,6 +3677,7 @@ class SourceUnit:
             return  # a field of a local
         names = [*self._qualify(path[0]).split("."), *path[1:]]
         dotted = ".".join(names)
+        self._not_a_method(node, dotted, "pass a lambda calling it instead")  # not a value, as yet
         if dotted in self._functions:
             self._depend(dotted, node, "uses")
             return
@@ -3751,6 +3990,7 @@ class SourceUnit:
         symbol = f"{self.prefix}{kind.name}_{name}"
         self.project.methods.setdefault(kind.python, {})[name] = (f"{kind.name}.{name}", symbol)
         self.project.method_results[symbol] = result
+        self.project.derived.add(symbol)
         return self.project.methods[kind.python][name]
 
     def _method_result(self, kind: ScalarType, name: str) -> ScalarType | None:
@@ -3777,6 +4017,7 @@ class SourceUnit:
         """``xs.contains(3)``, ``xs.map(f)``, ``g.sort()``: a list's own functions (see ``list_methods``)."""
         assert self._scope is not None
         name = _text(call.child_by_field_name("function"))
+        self._depend(f"{_LIST}.{name}", call.child_by_field_name("function"))
         if any(argument.type == "named_argument" for argument in _children(call)):
             raise self.error(call, f"{name} takes positional arguments")
         arguments = [argument for argument in _children(call) if argument.type == "expression"]
@@ -3808,6 +4049,7 @@ class SourceUnit:
     def _result_method(self, call: Node, value: ast.expr) -> ast.expr:
         """``r.is_ok()``, ``r.is_err()``: whether a Result holds a value, or an error."""
         name = _text(call.child_by_field_name("function"))
+        self._depend(f"{results.NAME}.{name}", call.child_by_field_name("function"))
         if any(argument.type in {"expression", "named_argument"} for argument in _children(call)):
             raise self.error(call, f"{name} takes no arguments: r.{name}()")
         ok = self._at(ast.Attribute(value, "ok", ast.Load()), call)
@@ -3905,6 +4147,7 @@ class SourceUnit:
             raise self.error(call, f"{what} has no method {name}")
         qualified, symbol = found
         assert isinstance(kind, StructType)
+        self._depend_method(kind, qualified, call.child_by_field_name("function"))
         pointees = self.project.pointer_params.get(symbol, [])
         self._give_away(call, qualified if qualified in self._function_nodes else getattr(kind.python, name, None))
         if symbol in self.project.changing:
@@ -4023,6 +4266,7 @@ class SourceUnit:
     def _special_call(self, node: Node, name: str, path: list[str] | None) -> ast.expr | None:
         """Lower ``copy(x)``, ``i32(x)``, ``ok(x)``/``err(e)`` and calls of generics; ``None`` for other calls."""
         if path is None and self._is_copy(name):
+            self._depend(_COPY, node.child_by_field_name("function"))
             return self._copy(node)
         if path is None and self._is_result_constructor(name):
             return self._result_constructor(node, name)
@@ -4036,7 +4280,7 @@ class SourceUnit:
     def _is_copy(self, name: str) -> bool:
         """Whether ``name(...)`` is the prelude's ``copy``: nothing else named ``copy`` is in scope."""
         assert self._scope is not None
-        return name == "copy" and not ({name} & (self._scope.names | self.globals.keys() | self._functions))
+        return name == _COPY and not ({name} & (self._scope.names | self.globals.keys() | self._functions))
 
     def _is_result_constructor(self, name: str) -> bool:
         """Whether ``name(...)`` is the prelude's ``ok`` or ``err``: nothing else of that name is in scope."""

@@ -13,7 +13,15 @@ EXAMPLES = Path(__file__).parents[1] / "examples"
 
 
 @pytest.mark.parametrize(
-    "project", [EXAMPLES / "http", EXAMPLES / "axum", EXAMPLES / "raylib", EXAMPLES / "async", EXAMPLES / "breakout"]
+    "project",
+    [
+        EXAMPLES / "http",
+        EXAMPLES / "axum",
+        EXAMPLES / "raylib",
+        EXAMPLES / "async",
+        EXAMPLES / "breakout",
+        EXAMPLES / "json",
+    ],
 )
 def test_example_compiles(project: Path) -> None:
     config = ConfigBuilder(project / "config.yaml").build()  # its packages from extras/ (see conftest.py)

@@ -79,7 +79,7 @@ let serial = [] (actor: Actor) => i64 {
     return found
 }
 
-let main = [io.printf, fmt.format, describe, hire, label, serial] () => null {
+let main = [io.printf, fmt.format, describe, hire, label, serial, copy] () => null {
     let first: Actor = Employee(name: fmt.format("ada"), age: 36)
     describe(first)
     describe(hire(1))

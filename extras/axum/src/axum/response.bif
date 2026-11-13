@@ -68,7 +68,7 @@ module response = {
         /* Another response, with this status: (StatusCode, T) in axum. WithStatus(status: 201, inner: Json(value: user)). */
         let status: i32,
         let inner: T,
-        let into_response = [super, axum.set_status] () => axum.Response {
+        let into_response = [super, T.into_response, axum.set_status] () => axum.Response {
             let made = super.inner.into_response()
             axum.set_status(made, super.status)
             return made
@@ -80,7 +80,7 @@ module response = {
         let name: str,
         let value: str,
         let inner: T,
-        let into_response = [super, axum.append_header] () => axum.Response {
+        let into_response = [super, T.into_response, axum.append_header] () => axum.Response {
             let made = super.inner.into_response()
             axum.append_header(made, super.name, super.value)
             return made

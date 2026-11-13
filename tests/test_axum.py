@@ -67,7 +67,9 @@ let whoami = [
 }
 
 let peer = [
-    axum.text
+    axum.text,
+    extract.HeaderMap.get,
+    extract.HeaderMap.contains
 ] (who: connect_info.ConnectInfo, headers: extract.HeaderMap, host: extract.Host) => axum.Response {
     let name = headers.get("x-name")
     let none = headers.contains("x-none")
@@ -86,7 +88,7 @@ let pages = [
     return axum.text(200, "page {page.value.page} of {raw.value}")
 }
 
-let echo = [axum.text] (body: extract.Text, ext: extract.Extension) => axum.Response {
+let echo = [axum.text, extract.Extension.get] (body: extract.Text, ext: extract.Extension) => axum.Response {
     return axum.text(200, "{body.value} [{ext.get("tenant")}]")
 }
 
@@ -116,14 +118,14 @@ let made_page = [fmt.format] (counter: mem.Shared[Counter]) => response.Html[mem
     c -> counter
     return response.Html(body: fmt.format("<p>%d hits</p>", hits))
 }
-let file_page = [fs.read_to_string, axum.text] () => Result[response.Html[mem.Unique[str]], axum.Response] {
+let file_page = [fs.read_to_string, axum.text, copy] () => Result[response.Html[mem.Unique[str]], axum.Response] {
     let page = fs.read_to_string("page.html")
     match page {
         ok(text): return ok(response.Html(body: copy(text))),
         err(e): return err(axum.text(500, e))
     }
 }
-let file_text = [fs.read_to_string, axum.text] () => Result[response.Text[mem.Unique[str]], axum.Response] {
+let file_text = [fs.read_to_string, axum.text, copy] () => Result[response.Text[mem.Unique[str]], axum.Response] {
     let notes = fs.read_to_string("missing.md")
     match notes {
         ok(text): return ok(response.Text(body: copy(text))),
@@ -149,7 +151,8 @@ let stamp = [axum.set_header] (res: axum.Response) => null {
 }
 
 let around = [
-    axum.append_header
+    axum.append_header,
+    middleware.Next.run
 ] async (req: axum.Request, next: middleware.Next) => axum.Response {
     let res = await next.run(req)
     axum.append_header(res, "x-around", "1")
@@ -173,7 +176,8 @@ let chat = [
     ws.recv,
     ws.text,
     ws.send,
-    ws.done
+    ws.done,
+    ws.WebSocketUpgrade.accept
 ] async (upgrade: ws.WebSocketUpgrade) => axum.Response {
     let socket = upgrade.accept()
     while await ws.recv(socket) {
@@ -183,7 +187,15 @@ let chat = [
     return ws.done(socket)
 }
 
-let upload = [axum.text] (form: multipart.Multipart) => axum.Response {
+let upload = [
+    axum.text,
+    multipart.Multipart.next_field,
+    multipart.Multipart.name,
+    multipart.Multipart.file_name,
+    multipart.Multipart.content_type,
+    multipart.Multipart.text,
+    multipart.Multipart.size
+] (form: multipart.Multipart) => axum.Response {
     let found: mem.Unique[str][] = #[]
     let total = 0
     while form.next_field() {

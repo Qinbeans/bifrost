@@ -34,6 +34,7 @@ class Instance:
     arguments: tuple[object, ...]  # the types its parameters stand for, as `SourceUnit._type` gives them
     result: Any = None  # a function's result type (a ScalarType), known before its body is compiled
     compiled: Any = None  # the compiled Function, or the object type; None while its body is compiled
+    error: Any = None  # an object's: the BifrostError compiling one of its functions gave, raised again for each use
 
 
 @dataclass(eq=False)

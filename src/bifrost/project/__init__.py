@@ -140,6 +140,8 @@ class Project:
         self.method_results: dict[str, Any] = {}
         # Compiled symbols of the methods that change their object (they lock `super`): it is lent to them.
         self.changing: set[str] = set()
+        # Compiled symbols of the methods an object has from what it is made of (a base's, or a union's).
+        self.derived: set[str] = set()
         # The functions freeing and copying lists, and the records and objects holding them.
         self.drops = Drops(self.program)
         # The decoders of json.decode and form.decode, generated per type.

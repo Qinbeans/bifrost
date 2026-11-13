@@ -15,7 +15,8 @@ module form = {
             axum.body,
             axum.content_type_is,
             axum.text,
-            std_form.decode
+            std_form.decode,
+            copy
         ] (req: axum.Request) => Result[Form[T], axum.Response] {
             let method = axum.method(req)
             let from_query = method == "GET" || method == "HEAD"

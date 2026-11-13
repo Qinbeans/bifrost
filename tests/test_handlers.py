@@ -146,7 +146,12 @@ let time = import("std:time")
 // Extractors and responses, as a web framework's package would write them.
 let Json[T] = struct {
     let value: T,
-    static let from_request = [server.body, server.text, json.decode] (req: server.Req) => Result[Json[T], server.Res] {
+    static let from_request = [
+        server.body,
+        server.text,
+        json.decode,
+        copy
+    ] (req: server.Req) => Result[Json[T], server.Res] {
         let parsed: Result[T, mem.Unique[str]] = json.decode(server.body(req))
         match parsed {
             ok(v): return ok(Json(value: copy(v))),
@@ -173,7 +178,7 @@ let AppError = struct {
 
 let User = struct { let name: mem.Unique[str], let age: i64 }
 
-let echo = [] (user: Json[User]) => Json[User] user |> copy
+let echo = [copy] (user: Json[User]) => Json[User] user |> copy
 
 let create = [time.sleep] async (user: Json[User], state: mem.Shared[i64]) => Result[Created, AppError] {
     await time.sleep(1)
@@ -186,7 +191,11 @@ let create = [time.sleep] async (user: Json[User], state: mem.Shared[i64]) => Re
     return ok(Created(id: id))
 }
 
-let peek = [server.text, server.set_status] (body: Body, user: Result[Json[User], server.Res]) => server.Res {
+let peek = [
+    server.text,
+    server.set_status,
+    Result.is_ok
+] (body: Body, user: Result[Json[User], server.Res]) => server.Res {
     let res = server.text(200, "body {body.text}, user ok: {user.is_ok()}")
     server.set_status(res, 203)
     return res
