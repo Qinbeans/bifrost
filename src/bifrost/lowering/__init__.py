@@ -449,6 +449,7 @@ class _FunctionScope:
         self.before: list[ast.stmt] = []
         self.after: list[ast.stmt] = []
         self.result: object = None  # its result type, as written (`_INFERRED` for `Record`, until lowered)
+        self.owned_result = False  # whether it returns a `mem.Unique[str]` (its caller frees it), not a `str`
         # For a function written `=> Record`: each returned value, with its type.
         self.results: list[tuple[Node, ScalarType | None]] | None = None
 
@@ -1722,6 +1723,7 @@ class SourceUnit:
 
         self._scope = scope = _FunctionScope(name, set(annotations) - {"return"}, symbol or name, dict(closure or []))
         scope.result = annotations["return"]
+        scope.owned_result = not inferring and self._owned_type(return_node)
         scope.receiver = receiver
         scope.results = [] if inferring else None
         scope.is_async = is_async = name in self._pausing
@@ -4602,6 +4604,9 @@ class SourceUnit:
             self._scope.results.append((value, self._static_type(value)))
             return
         self._check_record(value, self._scope.result, f"{self._scope.function} returns")
+        # A `str` result is not freed by its caller, so an owned string returned as one would leak.
+        result = OWNED_STRING if self._scope.owned_result else self._scope.result
+        self._check_string(value, result, f"{self._scope.function}'s result is")
 
     def _check_record(self, value: Node, expected: object, what: str) -> None:
         """Where a record type is expected (``what`` it is for), reject a record with other fields, naming both."""

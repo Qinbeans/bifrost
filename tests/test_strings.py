@@ -129,6 +129,49 @@ def test_a_new_string_is_owned(tmp_path: Path) -> None:
     assert error.value.msg == 'N\'s name is not owned (str), but "n {x}" is; write the type as mem.Unique[str]'
 
 
+FMT = 'let fmt = import("std:fmt")\nlet mem = import("std:mem")\n'
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        # A `str` result is never freed, so returning a new string as one would leak it on each call.
+        (
+            'let label = [fmt.format] (n: i64) => str fmt.format("#%d", n)\n',
+            'label\'s result is not owned (str), but fmt.format("#%d", n) is; write the type as mem.Unique[str]',
+        ),
+        (
+            'let label = [] (n: i64) => str {\n    return "#{n}"\n}\n',
+            'label\'s result is not owned (str), but "#{n}" is; write the type as mem.Unique[str]',
+        ),
+        (
+            "let T = struct {\n    let n: i64,\n"
+            '    let to_string = [super, fmt.format] () => str fmt.format("%d", super.n)\n}\n',
+            'T.to_string\'s result is not owned (str), but fmt.format("%d", super.n) is',
+        ),
+        # And the other way: what the caller frees must be a new string.
+        (
+            'let label = [] () => mem.Unique[str] "fixed"\n',
+            'label\'s result is owned (mem.Unique[str]), but "fixed" is not; keep an owned copy',
+        ),
+    ],
+)
+def test_a_result_is_owned_only_if_it_is_written_so(tmp_path: Path, source: str, message: str) -> None:
+    with pytest.raises(BifrostError) as error:
+        _compile(tmp_path, FMT + source)
+    assert message in error.value.msg
+
+
+def test_an_owned_result_compiles(tmp_path: Path) -> None:
+    source = (
+        'let label = [fmt.format] (n: i64) => mem.Unique[str] fmt.format("#%d", n)\n'
+        'let name = [] () => str "plain"\n'
+        "let T = struct {\n    let n: i64,\n"
+        '    let to_string = [super, fmt.format] () => mem.Unique[str] fmt.format("%d", super.n)\n}\n'
+    )
+    _compile(tmp_path, FMT + source)
+
+
 @pytest.mark.parametrize(
     ("line", "message"),
     [
