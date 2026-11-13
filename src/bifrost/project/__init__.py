@@ -38,6 +38,7 @@ from bifrost.decoding import Decoders
 from bifrost.list_methods import ListMethods
 from bifrost.naming import to_snake_case
 from bifrost.owned import Drops, own_handle
+from bifrost.passes import PIPELINE
 from bifrost.std.fs import Files
 
 # The C functions behind owned values: name -> (parameters, result).
@@ -94,7 +95,7 @@ class _ContextLookupLowerer(ast.NodeTransformer):
 class Project:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.program = Program()
+        self.program = Program(passes=PIPELINE)  # see bifrost.passes
         self.extern_table: dict[str, type | Callable[..., Any]] = {}
         self.type_map: dict[str, type] = {
             "i8": i8,

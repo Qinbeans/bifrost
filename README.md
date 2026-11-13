@@ -277,6 +277,8 @@ These cost a little at run time: each is a pointer to its value, after a count o
 - a `mem.Shared` is for one thread: its count is a plain integer, and taking a second guard while another owner's is held stops the program with the line that tried;
 - lending one to a `mem.Weak` parameter locks it for the call. Passing one to C's `void *` hands over the pointer instead, for C code that passes it back to functions that take a `mem.Shared` or `mem.Atomic` and lock it themselves, such as a web server's handlers or a thread's.
 
+What cancels out is left out of the executable: an owner made and dropped with nothing between (`let copy = counter`, unused), and a guard given back and taken again right away (`g -> counter` then `let h <- counter`, or two lends in a row), which holds the lock once. Anything between that could see it, such as a call, keeps both.
+
 A guard on a whole value, such as a `mem.Atomic[i64]`, reads it as the guard's name and writes it with `guard = ...`:
 
 ```bifrost
@@ -826,6 +828,8 @@ bifrost/
 │   ├── decoding.py        # The decoders json.decode and form.decode compile to
 │   ├── pipes.py           # Reads `x |> f(a)` as the call `f(x, a)`, for every check and the lowering
 │   ├── generics.py        # Generic functions and objects, and what each was compiled for
+│   ├── dialect.py         # The `bifrost` MLIR dialect (IRDL): operations on mem.Shared and mem.Atomic cells
+│   ├── passes.py          # Passes over the linked program, in that dialect: cells' retains and locks that cancel out
 │   ├── lowering/          # Checks a CST (dependencies, names), loads imported modules, and lowers to Python AST
 │   ├── project/           # Declares configured and standard externs; builds the executable
 │   ├── configs/           # config.yaml schema, features, and header traversal (libclang)
@@ -845,7 +849,8 @@ bifrost/
 2. Bind the top-level names: imported modules, objects, constants and functions.
 3. Check each function (guards, dependency lists, names in scope) and lower it to a Python function definition.
 4. Hand the functions and the declared externs to mlir-python, which type-checks them and emits MLIR.
-5. mlir-python compiles to LLVM IR and links the executable with the configured linker and libraries.
+5. Run Bifrost's passes on the linked program: calls into the cell runtime become `bifrost` operations, the pairs that cancel out are removed, and the rest become calls again.
+6. mlir-python compiles to LLVM IR and links the executable with the configured linker and libraries.
 
 Errors from every step, including type errors found by mlir-python, point at the `.bif` source.
 

@@ -299,3 +299,107 @@ def _compile(project: Project, source: Path) -> None:
     unit = lower_file(project, source)
     with unit.errors():
         _ = project.program.mlir
+
+
+# Guards given back and taken again, and owners that come and go with nothing between: what
+# bifrost.passes removes from the linked program.
+MERGED = r"""
+let io = import("std:stdio")
+let mem = import("std:mem")
+
+let Counter = struct { let hits: i64 }
+
+let read = [] (counter: mem.Weak[Counter]) => i64 {
+    let g <- counter
+    let hits = g.hits
+    g -> counter
+    return hits
+}
+
+let main = [io.printf, read] () => null {
+    let counter: mem.Shared[Counter] = Counter(hits: 1)
+    let i = 0
+    while i < 3 {
+        let copy = counter
+        let i = i + 1
+    }
+    let g <- counter
+    g.hits = g.hits + 1
+    g -> counter
+    let h <- counter
+    h.hits = h.hits * 2
+    h -> counter
+    let a = read(counter)
+    let b = read(counter)
+    io.printf("%lld %lld\n", a, b)
+}
+"""
+
+# The same, with calls between: they could lock the cell or drop an owner, so everything stays.
+KEPT = r"""
+let io = import("std:stdio")
+let mem = import("std:mem")
+
+let Counter = struct { let hits: i64 }
+
+let bump = [] (counter: mem.Shared[Counter]) => null {
+    let g <- counter
+    g.hits = g.hits + 1
+    g -> counter
+}
+
+let main = [io.printf, bump] () => null {
+    let counter: mem.Shared[Counter] = Counter(hits: 1)
+    let i = 0
+    while i < 3 {
+        let copy = counter
+        bump(copy)
+        let i = i + 1
+    }
+    let g <- counter
+    g.hits = g.hits + 1
+    g -> counter
+    bump(counter)
+    let h <- counter
+    io.printf("%lld\n", h.hits)
+    h -> counter
+}
+"""
+
+
+def _emitted(tmp_path: Path, program: str) -> tuple[Path, str]:
+    """Build ``program``; return the executable and its linked MLIR, as ``bfc build --emit-mlir`` writes it."""
+    source = tmp_path / "main.bif"
+    source.write_text(program)
+    project = _project(tmp_path)
+    unit = lower_file(project, source)
+    with unit.errors():
+        executable = project.build()
+        (mlir,) = project.emit(mlir=True)
+    return executable, mlir.read_text()
+
+
+def _cell_calls(mlir: str, action: str) -> int:
+    return mlir.count(f"call @bifrost_shared_{action}(") + mlir.count(f"call @bifrost_atomic_{action}(")
+
+
+@pytest.mark.parametrize("container", ["mem.Shared", "mem.Atomic"])
+def test_guards_taken_again_and_owners_that_cancel_out_are_removed(tmp_path: Path, container: str) -> None:
+    executable, mlir = _emitted(tmp_path, MERGED.replace("mem.Shared", container))
+    assert '"bifrost.' not in mlir
+    assert _cell_calls(mlir, "retain") == 0  # `let copy = counter`, unused: retained, then released
+    assert _cell_calls(mlir, "release") == 1  # counter's, at the end of main
+    assert _cell_calls(mlir, "lock") == _cell_calls(mlir, "unlock") == 1  # g, h and both lends: one guard
+    result = subprocess.run([executable], capture_output=True, text=True, check=True, env=_counting(tmp_path))  # noqa: S603
+    assert result.stdout.splitlines() == ["4 4"]
+    assert "live allocations: 1" in result.stderr  # only stdout's buffer
+
+
+def test_guards_and_owners_with_calls_between_are_kept(tmp_path: Path) -> None:
+    executable, mlir = _emitted(tmp_path, KEPT)
+    assert _cell_calls(mlir, "retain") == 1  # bump(copy) is between
+    assert _cell_calls(mlir, "release") == 2
+    assert _cell_calls(mlir, "lock") == _cell_calls(mlir, "unlock") == 3  # bump locks counter between g and h
+    result = subprocess.run([executable], capture_output=True, text=True, check=True, env=_counting(tmp_path))  # noqa: S603
+    assert result.stdout.splitlines() == ["6"]
+    assert "live allocations: 1" in result.stderr
