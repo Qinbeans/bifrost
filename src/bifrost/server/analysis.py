@@ -261,6 +261,13 @@ def _unwrap(node: Node) -> Node:
     return node
 
 
+def _negated(node: Node) -> Node:
+    """Return what ``-x`` negates (``x``, unwrapped), or any other expression itself."""
+    operator = node.child_by_field_name("operator") if node.type == "unary_expression" else None
+    argument = node.child_by_field_name("argument")
+    return _unwrap(argument) if operator is not None and _text(operator) == "-" and argument is not None else node
+
+
 def _descendants(node: Node, *kinds: str, own: bool = False) -> list[Node]:
     """``kinds`` nodes under ``node``; ``own``: only a function's own, not those of a lambda in it."""
     found = []
@@ -776,7 +783,8 @@ class Document:
         if identifier is None or kind is None or local.child_by_field_name("type") is not None:
             return first_line  # unknown, or already written: `let ctx: mem.Shared[Context] = ...`
         name = _text(identifier)
-        rest = first_line[first_line.index(name) + len(name) :]  # ` <- ctx`, ` = Context.new()`
+        # ` <- ctx`, ` = Context.new()`: after the name itself (not the `e` or `t` of `let`)
+        rest = first_line.encode()[identifier.end_byte - local.start_byte :].decode()
         return f"let {name}: {kind}{rest}"
 
     def _describe_arm(self, arm: Node) -> str:
@@ -974,13 +982,18 @@ class Document:
         method = self._method_node(owner, _text(function), where)
         return self._result_of(method) if method is not None else self._type_of_call(owner, _text(function))
 
-    def _type_of_math_call(self, function: std_math.MathFunction, call: Node, where: Node) -> str:
-        """Return what ``math.sqrt(x)`` gives: its arguments' type, or ``f64`` for numbers written as such."""
-        arguments = [_unwrap(argument) for argument in _named(call) if argument.type == "expression"]
-        for argument in arguments:
+    def _type_of_math_call(self, function: std_math.MathFunction, call: Node, where: Node) -> str | None:
+        """Return what ``math.sqrt(x)`` gives: its arguments' type, or ``f64`` for numbers written as such.
+
+        ``None`` when an argument's type is not plain to see (``2 * math.pi * x``): the compiler tells.
+        """
+        arguments = [_negated(_unwrap(argument)) for argument in _named(call) if argument.type == "expression"]
+        for argument in arguments:  # `x`, or the `x` of `-x`
             kind = self._type_of_value(argument, where)
             if kind is not None:
                 return kind
+        if any(argument.type not in {"literal", "identifier", "child_annotation"} for argument in arguments):
+            return None  # not only numbers written as such (2, -0.5) and constants (half, math.pi)
         whole = all("." not in _text(argument) for argument in arguments)
         return "i64" if whole and function.takes != std_math.FLOATS else "f64"
 

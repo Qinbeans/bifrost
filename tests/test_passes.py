@@ -288,16 +288,24 @@ func.func @{name}(%items: !llvm.ptr, %n: i64) -> {kind} {{
 
 def test_a_float_sum_adds_in_any_order() -> None:
     # Only the generated sum functions' additions are marked: a function of the program's own adds
-    # left to right, as written; an integer sum needs nothing (its order changes nothing).
+    # left to right, as written, even named like one in the source (`bifrost_sum_4`: a Bifrost
+    # name has no dot); an integer sum needs nothing (its order changes nothing).
     sums = [_adding(f"{SUMMED}_1", "f32"), _adding(f"{SUMMED}_2", "f64"), _adding(f"{SUMMED}_3", "i64")]
-    module = ir.Module.parse("\n".join([*sums, _adding("total", "f32")]))
+    own = [_adding("total", "f32"), _adding("bifrost_sum_4", "f32")]
+    module = ir.Module.parse("\n".join([*sums, *own]))
     ir.PassManager(ir.Module, list(PIPELINE)).run(module)
     module.verify()
     marked = {
         function.sym_name: [op.fastmath for op in _ops(function, arith.AddFOp)] for function in module.body.operations
     }
     reassoc, none = arith.FastMathFlags.REASSOC, arith.FastMathFlags.NONE
-    assert marked == {f"{SUMMED}_1": [reassoc], f"{SUMMED}_2": [reassoc], f"{SUMMED}_3": [], "total": [none]}
+    assert marked == {
+        f"{SUMMED}_1": [reassoc],
+        f"{SUMMED}_2": [reassoc],
+        f"{SUMMED}_3": [],
+        "total": [none],
+        "bifrost_sum_4": [none],
+    }
     assert "fastmath<reassoc>" in str(module)
 
 
@@ -310,15 +318,15 @@ def _ops(op: ir.Operation, kind: type[ir.Operation]) -> list[ir.Operation]:
 def test_math_placeholders_become_operations() -> None:
     # As lowering declares them: C functions, called with llvm.call.
     module = ir.Module.parse("""
-llvm.func @bifrost_math_sqrt_f32(f32) -> f32
-llvm.func @bifrost_math_min_u8(i8, i8) -> i8
-llvm.func @bifrost_math_min_i8(i8, i8) -> i8
-llvm.func @bifrost_math_fma_f64(f64, f64, f64) -> f64
+llvm.func @bifrost.math_sqrt_f32(f32) -> f32
+llvm.func @bifrost.math_min_u8(i8, i8) -> i8
+llvm.func @bifrost.math_min_i8(i8, i8) -> i8
+llvm.func @bifrost.math_fma_f64(f64, f64, f64) -> f64
 func.func @f(%x: f32, %a: i8, %b: i8, %y: f64) -> (f32, i8, i8, f64) {
-  %root = llvm.call @bifrost_math_sqrt_f32(%x) : (f32) -> f32
-  %low = llvm.call @bifrost_math_min_u8(%a, %b) : (i8, i8) -> i8
-  %signed = llvm.call @bifrost_math_min_i8(%a, %b) : (i8, i8) -> i8
-  %fused = llvm.call @bifrost_math_fma_f64(%y, %y, %y) : (f64, f64, f64) -> f64
+  %root = llvm.call @bifrost.math_sqrt_f32(%x) : (f32) -> f32
+  %low = llvm.call @bifrost.math_min_u8(%a, %b) : (i8, i8) -> i8
+  %signed = llvm.call @bifrost.math_min_i8(%a, %b) : (i8, i8) -> i8
+  %fused = llvm.call @bifrost.math_fma_f64(%y, %y, %y) : (f64, f64, f64) -> f64
   return %root, %low, %signed, %fused : f32, i8, i8, f64
 }""")
     ir.PassManager(ir.Module, [LowerMath()]).run(module)
@@ -328,4 +336,4 @@ func.func @f(%x: f32, %a: i8, %b: i8, %y: f64) -> (f32, i8, i8, f64) {
     assert "arith.minui %arg1, %arg2 : i8" in text
     assert "arith.minsi %arg1, %arg2 : i8" in text
     assert "math.fma %arg3, %arg3, %arg3 : f64" in text
-    assert "bifrost_math" not in text  # the declarations go too
+    assert "bifrost.math" not in text  # the declarations go too

@@ -4491,9 +4491,10 @@ class SourceUnit:
     ) -> tuple[ScalarType, list[tuple[Node, bool]]]:
         """Check a ``std:math`` call's arguments; return their type, and each one, and whether it takes that type.
 
-        Arguments written as numbers (``2``, ``-0.5``) and constants (``math.pi``,
-        a top-level ``let``) take the type the others have, or ``f64`` (``i64``
-        for whole numbers ``min``, ``max`` and ``abs`` take alone).
+        Arguments written as numbers (``2``, ``-0.5``), constants (``math.pi``,
+        a top-level ``let``) and arithmetic of them (``2 * math.pi``) take the
+        type the others have, or ``f64`` (``i64`` for whole numbers ``min``,
+        ``max`` and ``abs`` take alone).
         """
         written = f"math.{function.name}"
         arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
@@ -4552,10 +4553,11 @@ class SourceUnit:
     def _loose_number(self, node: Node) -> type | None:
         """For a number written as one (``2``, ``-0.5``) or a constant (``math.pi``, a top-level ``let``): its kind.
 
-        ``int`` or ``float``; ``None`` for anything else.
+        So for arithmetic of them (``2 * math.pi``). ``int`` or ``float``; ``None`` for anything else.
         """
-        assert self._scope is not None
         node = _unwrap(node)
+        if node.type == "binary_expression":
+            return self._loose_arithmetic(node)
         if node.type == "unary_expression" and _text(node.child_by_field_name("operator")) == "-":
             node = _unwrap(node.child_by_field_name("argument"))
         if node.type == "literal":
@@ -4569,10 +4571,19 @@ class SourceUnit:
             names = [_text(part) for part in _children(node)]
         else:
             return None
-        if names[0] in self._scope.names or names[0] in self._scope.guards:
+        if self._scope is None or names[0] in self._scope.names or names[0] in self._scope.guards:
             return None
         value = self._reach([*self._qualify(names[0]).split("."), *names[1:]])
         return type(value) if type(value) in {int, float} else None
+
+    def _loose_arithmetic(self, node: Node) -> type | None:
+        """For arithmetic of numbers written as such and constants (``2 * math.pi``): its kind, as ``_loose_number``."""
+        operator = _text(node.child_by_field_name("operator"))
+        left = self._loose_number(node.child_by_field_name("left"))
+        right = self._loose_number(node.child_by_field_name("right"))
+        if operator not in _BINARY_OPERATORS or left is None or right is None:
+            return None
+        return float if float in {left, right} or operator == "/" else int
 
     def _language_call(self, node: Node) -> ast.expr:
         """Lower a call of a function of the language itself: ``len(xs)``."""
@@ -5550,9 +5561,15 @@ class SourceUnit:
             (left_kind and left_kind.kind == "float") or (right_kind and right_kind.kind == "float")
         ):
             return f64
-        # A literal takes the type of the other side: `hits + 1` is `hits`'s type.
-        if _unwrap(left).type == "literal" and right_kind is not None:
+        # A number written as one, or a constant, takes the type of the other side: `hits + 1` is
+        # `hits`'s type, and so is `2 * math.pi * x` `x`'s.
+        left_loose, right_loose = self._loose_number(left), self._loose_number(right)
+        if left_loose is not None and right_loose is not None:
+            return f64 if float in {left_loose, right_loose} or operator == "/" else i64
+        if left_loose is not None and right_kind is not None:
             return right_kind
+        if right_loose is not None and left_kind is not None:
+            return left_kind
         return left_kind or right_kind
 
     def _format(self, call: Node) -> ast.expr:

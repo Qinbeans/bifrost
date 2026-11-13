@@ -118,10 +118,20 @@ def test_calls_become_math_operations(tmp_path: Path) -> None:
     assert "math.sqrt %" in mlir
     assert ": f32" in mlir.split("narrow", 1)[1]
     assert "arith.maxnumf" in mlir
-    assert "bifrost_math" not in mlir  # no placeholder left, called or declared
+    assert "bifrost.math" not in mlir  # no placeholder left, called or declared
     assert "@sqrt" not in llvm  # not a libm call: LLVM's intrinsic, folded into the constant
     assert "ret i32 8" in llvm
     assert subprocess.run([project.build()], check=False).returncode == 8  # noqa: S603
+
+
+def test_a_function_named_like_a_placeholder_is_the_programs_own(tmp_path: Path) -> None:
+    # The placeholders' names have a dot, which no Bifrost name has: no clash, nor a call made sqrt.
+    source = (
+        'let math = import("std:math")\n\n'
+        "let bifrost_math_sqrt_f64 = (x: f64) => f64 x + 1.0\n"
+        "let main = [math.sqrt, bifrost_math_sqrt_f64] () => i32 i32(math.sqrt(9.0) + bifrost_math_sqrt_f64(9.0))\n"
+    )
+    assert subprocess.run([_lower(tmp_path, source).build()], check=False).returncode == 13  # noqa: S603
 
 
 def test_math_needs_dependency_entries(tmp_path: Path) -> None:
@@ -159,16 +169,24 @@ def test_math_type_errors(tmp_path: Path, body: str, message: str) -> None:
 def test_numbers_written_as_such_take_the_others_type(tmp_path: Path) -> None:
     source = (
         'let io = import("std:stdio")\nlet math = import("std:math")\n\nlet half = 0.5\n\n'
-        "let main = [io.printf, math.sqrt, math.pow, math.max, math.cos] () => null {\n"
+        "let main = [io.printf, math.sqrt, math.pow, math.max, math.cos, math.sin] () => null {\n"
         "    let x: f32 = 3.0\n"
         "    let y = math.pow(x, 2)\n"  # f32, from x
         "    let s = math.sqrt(2)\n"  # f64: numbers alone are f64
         '    io.printf("%.9g %.9g %d %.9g\\n", y + half, s, math.max(2, -3), math.cos(math.pi))\n'
+        "    let k: i32 = 7\n"  # arithmetic of numbers and constants too, inside an argument or as one
+        "    let wave = math.sin(2 * math.pi * x / 12)\n"
+        '    io.printf("%.9g %.9g %d\\n", wave, math.max(x, 2 * math.pi), math.max(k, 3 + 5))\n'
         "}\n"
     )
     executable = _lower(tmp_path, source).build()
     output = subprocess.run([executable], capture_output=True, text=True, check=True).stdout  # noqa: S603
-    assert output == f"9.5 {math.sqrt(2):.9g} 2 -1\n"
+    lines = output.splitlines()
+    assert lines[0] == f"9.5 {math.sqrt(2):.9g} 2 -1"
+    sine, wide, most = lines[1].split()
+    assert float(sine) == pytest.approx(1.0, abs=1e-7)  # sin(pi / 2), in f32
+    assert wide == f"{_f32(2 * math.pi):.9g}" != f"{2 * math.pi:.9g}"  # f32, from x
+    assert most == "8"
 
 
 def test_only_programs_using_math_link_libm(tmp_path: Path) -> None:
@@ -192,3 +210,14 @@ def test_the_editor_knows_math(tmp_path: Path) -> None:
     assert "math.sqrt = (x: F) => F" in hover
     assert "F is f32 or f64" in hover
     assert "let r: f32 = math.sqrt(x)" in (document.hover((3, 8)) or "")  # x's type
+    source = (
+        'let math = import("std:math")\n\n'
+        "let f = [math.sin, math.abs] (x: f32) => f32 {\n"
+        "    let wave = math.sin(2 * math.pi * x)\n"  # f32, as it compiles (not f64, for math.pi)
+        "    let e = math.abs(-x)\n"
+        "    return wave + e\n"
+        "}\n"
+    )
+    document = Document.open(tmp_path / "main.bif", source)
+    assert "let wave: f32 = math.sin(2 * math.pi * x)" in (document.hover((3, 8)) or "")
+    assert "let e: f32 = math.abs(-x)" in (document.hover((4, 8)) or "")

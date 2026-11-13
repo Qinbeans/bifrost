@@ -18,7 +18,7 @@ And, on each function, ``ReassociateSums`` lets a float ``xs.sum()`` add its
 items in any order, so its loop vectorizes.
 
 First of all, ``LowerMath`` makes each call of a ``std:math`` placeholder
-(``bifrost_math_sqrt_f64(x)``) the operation it stands for (``math.sqrt %x``),
+(``bifrost.math_sqrt_f64(x)``) the operation it stands for (``math.sqrt %x``),
 which then counts as inert between cell operations.
 """
 
@@ -235,7 +235,7 @@ class ReassociateSums(passes.PythonPass):
     def run(self, op: ir.Operation) -> None:
         """Mark the float additions of ``op``, if it is a sum function."""
         assert isinstance(op, func.FuncOp)
-        if not op.sym_name.startswith(f"{SUMMED}_"):
+        if not op.sym_name.startswith(f"{SUMMED}_"):  # never one of the program's own (see SUMMED)
             return
         added: list[arith.AddFOp] = []
         op.walk(lambda inner: added.append(inner) if isinstance(inner, arith.AddFOp) else None)
@@ -269,14 +269,14 @@ _MATH_OPS: dict[str, tuple[type[ir.Operation], type[ir.Operation] | None, type[i
     "min": (arith.MinNumFOp, arith.MinSIOp, arith.MinUIOp),  # minnum: a NaN gives the other, as C's fmin
     "max": (arith.MaxNumFOp, arith.MaxSIOp, arith.MaxUIOp),
 }
-_MATH_CALL = re.compile(rf"{std_math.PREFIX}({'|'.join(_MATH_OPS)})_([fiu])(8|16|32|64)")
+_MATH_CALL = re.compile(rf"{re.escape(std_math.PREFIX)}({'|'.join(_MATH_OPS)})_([fiu])(8|16|32|64)")
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class LowerMath(passes.PythonPass):
     """Rewrites calls of ``std:math``'s placeholders as math (and arith) operations, and drops their declarations.
 
-    ``bifrost_math_sqrt_f32(x)`` is ``math.sqrt %x : f32``; ``bifrost_math_min_u64(a, b)``
+    ``bifrost.math_sqrt_f32(x)`` is ``math.sqrt %x : f32``; ``bifrost.math_min_u64(a, b)``
     is ``arith.minui``. LLVM gets its intrinsics (``llvm.sqrt.f32``) instead of a call it
     cannot see into.
     """

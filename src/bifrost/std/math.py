@@ -9,15 +9,17 @@ libm.
 
 Each function works on ``f32`` and ``f64`` alike, in the type of its
 arguments: ``math.sqrt(x)`` with an ``f32`` ``x`` is an ``f32``. Arguments
-are of one type; a number written as one (``math.pow(x, 2)``), or a constant
-(``math.pi``), takes the type the others give, or ``f64``. An integer is an
-error that says to convert it (``math.sqrt(f64(n))``), except for ``abs``
-(signed integers too), ``min`` and ``max`` (any number type).
+are of one type; a number written as one (``math.pow(x, 2)``), a constant
+(``math.pi``), or arithmetic of them (``2 * math.pi``), takes the type the
+others give, or ``f64``. An integer is an error that says to convert it
+(``math.sqrt(f64(n))``), except for ``abs`` (signed integers too), ``min``
+and ``max`` (any number type).
 
-Lowering calls a placeholder per function and type, ``bifrost_math_<name>_<type>``
-(``bifrost_math_sqrt_f32``), declared as a C function but never linked: the
+Lowering calls a placeholder per function and type, ``bifrost.math_<name>_<type>``
+(``bifrost.math_sqrt_f32``), declared as a C function but never linked: the
 ``LowerMath`` pass (``bifrost.passes``) rewrites each call into its operation,
-and drops the declarations.
+and drops the declarations. No function of a program can be so named: a
+Bifrost name has no dot, and neither has the symbol it compiles to.
 """
 
 import math
@@ -34,7 +36,7 @@ from bifrost.std.fmt import Builtin
 FLOATS = "floats"  # f32 and f64
 SIGNED = "signed"  # floats and signed integers
 NUMBERS = "numbers"  # every number type
-PREFIX = "bifrost_math_"  # the placeholders' names: bifrost_math_sqrt_f64
+PREFIX = "bifrost.math_"  # the placeholders' names: bifrost.math_sqrt_f64
 
 
 @dataclass(frozen=True, repr=False)  # shown as Builtin is: math.sqrt
@@ -117,7 +119,7 @@ VALUES = {name: constant.value for name, constant in CONSTANTS.items()}  # `math
 
 
 def placeholder_name(function: MathFunction, kind: ScalarType) -> str:
-    """Return the name of ``function``'s placeholder for ``kind``: ``bifrost_math_sqrt_f64``."""
+    """Return the name of ``function``'s placeholder for ``kind``: ``bifrost.math_sqrt_f64``."""
     return f"{PREFIX}{function.name}_{kind.name}"
 
 

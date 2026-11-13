@@ -407,11 +407,12 @@ class Drops:
     ) -> Any:  # noqa: ANN401
         """Compile generated source (``mlir_python.lang`` reads a function's source) into the program.
 
-        Its name is ``prefix`` and a count: ``bifrost_owned_3``, or ``bifrost_sum_4`` for a pass to find.
+        Its name is ``prefix`` and a count: ``bifrost_owned_3``, or ``bifrost.sum_4`` for a pass to find
+        (in the source, where a name has no dot, ``bifrost_sum_4``).
         """
         self._count += 1
         name = f"{prefix}_{self._count}"
-        source = "\n".join(lines).format(name=name) + "\n"
+        source = "\n".join(lines).format(name=name.replace(".", "_")) + "\n"
         filename = f"<bifrost owned {name}>"
         linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
         code = compile(source, filename, "exec")

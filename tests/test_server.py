@@ -95,6 +95,14 @@ def test_hover(document: Document) -> None:
     assert "raylib.init_window = (width: i32, height: i32, title: str) => null" in extern
 
 
+def test_hover_shows_a_locals_type_after_its_name() -> None:
+    # Named `t` or `e`, as letters of `let` are: the type still goes after the name.
+    source = "let f = (a: i32) => null {\n    let t = a + 1\n    let le = a\n}\n"
+    document = Document.open(EXAMPLES / "scratch.bif", source)
+    assert "let t: i32 = a + 1" in (document.hover((1, 8)) or "")
+    assert "let le: i32 = a" in (document.hover((2, 8)) or "")
+
+
 def test_completes_module_members() -> None:
     source = 'let raylib = import("raylib")\nlet f = () => null {\n    raylib.\n}\n'
     document = Document.open(EXAMPLES / "scratch.bif", source)

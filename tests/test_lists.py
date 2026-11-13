@@ -481,14 +481,21 @@ def test_list_sum(tmp_path: Path) -> None:
 def test_a_float_sum_vectorizes(tmp_path: Path) -> None:
     # Free to add in any order (see bifrost.passes.ReassociateSums), LLVM adds several f32 items at
     # once; an integer sum vectorizes as it is.
+    # A function of the program's own keeps its order, even one named like a generated sum.
     source = (
         "let total = [list.sum] (xs: f32[]) => f32 xs.sum()\n"
         "let count = [list.sum] (xs: i32[]) => i32 xs.sum()\n"
-        "let main = [total, count] () => null {\n    let t = total(#[1.0])\n    let c = count(#[1])\n}\n"
+        "let bifrost_sum_1 = (xs: f32[]) => f32 {\n"
+        "    let t: f32 = 0.0\n    forall x in xs {\n        let t = t + x\n    }\n    return t\n}\n"
+        "let main = [total, count, bifrost_sum_1] () => null {\n"
+        "    let t = total(#[1.0])\n    let c = count(#[1])\n    let o = bifrost_sum_1(#[1.0])\n}\n"
     )
     llvm = str(_compile(tmp_path, source).program.llvm_ir(opt_level=OptLevel.O2))
     assert re.search(r"fadd reassoc <\d+ x float>", llvm)
     assert re.search(r"add <\d+ x i32>", llvm)
+    own = llvm.split("@bifrost_sum_1(", 1)[1].split("\n}\n", 1)[0]
+    assert "fadd" in own
+    assert "reassoc" not in own
 
 
 HEAD = (

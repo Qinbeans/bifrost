@@ -34,8 +34,12 @@ METHODS = READING | CHANGING
 
 _STRINGS = ("cstr",)
 
-SUMMED = "bifrost_sum"
-"""What the generated ``sum`` functions' names start with: ``bifrost.passes.ReassociateSums`` finds them by it."""
+SUMMED = "bifrost.sum"
+"""What the generated ``sum`` functions' names start with: ``bifrost.passes.ReassociateSums`` finds them by it.
+
+No function of a program can be so named: a Bifrost name has no dot, and
+neither has the symbol it compiles to (``helper.greet`` is ``helper_greet``).
+"""
 
 
 # How each reads, for the editor: its signature (`T` is the item type) and what it does.
