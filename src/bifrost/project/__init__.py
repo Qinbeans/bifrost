@@ -40,6 +40,7 @@ from bifrost.naming import to_snake_case
 from bifrost.owned import Drops, own_handle
 from bifrost.passes import PIPELINE
 from bifrost.std.fs import Files
+from bifrost.std.math import Placeholders
 
 # The C functions behind owned values: name -> (parameters, result).
 # `(Request, i32) => None` in an extern declaration: a function type (one level; no nesting).
@@ -149,6 +150,8 @@ class Project:
         self.decoders = Decoders(self.program, self.drops)
         # std:fs's functions, compiled when a file imports it.
         self.files = Files(self.program, self.drops, self.owned_signatures)
+        # The placeholders std:math's calls lower to, until LowerMath makes them math operations.
+        self.math = Placeholders(self.program)
         # A list's own functions (xs.map(f), g.sort()), generated per element type.
         self.list_methods = ListMethods(self.drops)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
@@ -357,7 +360,7 @@ class Project:
         return self.program.build_executable(
             output,
             opt_level=level,
-            libraries=[*self.config.libraries, *runtimes],
+            libraries=[*self.config.libraries, *runtimes, *(["m"] if self.math.used else [])],  # libm: sin, ...
             linker=self.config.flags.linker,
             async_runtime=async_runtime,
         )

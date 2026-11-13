@@ -660,11 +660,24 @@ To start a call without waiting for it, deliberately, pass it to `tasks.ignore`,
 
 A C library that runs an event loop lets the runtime use it: it calls `bifrost_async_run_ready()` after handling events, waits at most `bifrost_async_next_timer()` milliseconds (for `std:time`), and calls `bifrost_async_set_poller(poll, context)` so that blocking code can turn the loop. A function passed where C expects a `(...) => token` callback, such as an HTTP handler, is started by C, which gets the token to wait on; plain functions are wrapped so they fit too. `examples/async` and `examples/http` show both.
 
+### Math
+
+`import("std:math")` brings in square roots, rounding, trigonometry and exponents, and the numbers `math.pi` and `math.e`:
+
+```bifrost
+let math = import("std:math")
+
+let distance = [math.sqrt] (x: f32, y: f32) => f32 math.sqrt(x * x + y * y)
+let heading = [math.atan2] (dx: f64, dy: f64) => f64 math.atan2(dy, dx) * 180.0 / math.pi
+```
+
+There are `sqrt`, `floor`, `ceil`, `round` (halves away from zero), `trunc`, `abs`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `tanh`, `exp`, `exp2`, `log`, `log2`, `log10`, `pow(x, y)`, `fma(a, b, c)` (`a * b + c`, rounded once), `min` and `max`. Each works on `f32` and `f64` alike, in the type of its arguments, so `math.sqrt(x)` of an `f32` is an `f32`; a number written as one (`math.pow(x, 2)`) or a constant takes the type the others give. An integer is an error that says to convert it (`math.sqrt(f64(n))`), except for `abs` (signed integers too) and `min` and `max` (any number type). They are called like any module's functions, so a function lists each one it calls (`[math.sqrt]`). A call is no call into a library: it becomes an operation of MLIR's `math` dialect, which LLVM folds, vectorizes, or turns into one instruction (`math.sqrt` of an `f32` is `sqrtss`); a program that uses `std:math` links libm, for those LLVM leaves to it (`sin`, `pow`, ...).
+
 ### C libraries and standard modules
 
 `import("raylib")` brings in a module declared in `config.yaml`, the project's or a package's (raylib's is [`extras/raylib`](./extras/raylib)). Its functions take Bifrost names: `InitWindow` is `rl.init_window`, and structs keep PascalCase (`rl.Color`). The C symbols are unchanged.
 
-`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, and `import("std:fs")` [files](#files).
+`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, and `import("std:fs")` [files](#files), and `import("std:math")` [math](#math).
 
 ### Modules
 
@@ -832,7 +845,7 @@ bifrost/
 │   ├── pipes.py           # Reads `x |> f(a)` as the call `f(x, a)`, for every check and the lowering
 │   ├── generics.py        # Generic functions and objects, and what each was compiled for
 │   ├── dialect.py         # The `bifrost` MLIR dialect (IRDL): operations on mem.Shared and mem.Atomic cells
-│   ├── passes.py          # Passes over the linked program, in that dialect: cells' retains and locks that cancel out
+│   ├── passes.py          # Passes over the linked program: cells' retains and locks that cancel out, float sums, std:math calls
 │   ├── lowering/          # Checks a CST (dependencies, names), loads imported modules, and lowers to Python AST
 │   ├── project/           # Declares configured and standard externs; builds the executable
 │   ├── configs/           # config.yaml schema, features, and header traversal (libclang)
@@ -852,7 +865,7 @@ bifrost/
 2. Bind the top-level names: imported modules, objects, constants and functions.
 3. Check each function (guards, dependency lists, names in scope) and lower it to a Python function definition.
 4. Hand the functions and the declared externs to mlir-python, which type-checks them and emits MLIR.
-5. Run Bifrost's passes on the linked program: calls into the cell runtime become `bifrost` operations, the pairs that cancel out are removed, and the rest become calls again.
+5. Run Bifrost's passes on the linked program: calls into the cell runtime become `bifrost` operations, the pairs that cancel out are removed, and the rest become calls again; the generated float sums are marked as free to reassociate; and `std:math` calls become `math` operations.
 6. mlir-python compiles to LLVM IR and links the executable with the configured linker and libraries.
 
 Errors from every step, including type errors found by mlir-python, point at the `.bif` source.

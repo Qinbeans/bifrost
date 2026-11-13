@@ -34,6 +34,7 @@ the ``.bif`` file, and so do compile errors in the generated functions.
 
 import ast
 import copy
+import itertools
 import keyword
 import linecache
 import re
@@ -100,6 +101,7 @@ from bifrost.owned import (
 )
 from bifrost.project import Project
 from bifrost.std import fmt, form, json, json_runtime, list_runtime, mem, mem_runtime, tasks
+from bifrost.std import math as std_math
 from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
@@ -4465,6 +4467,113 @@ class SourceUnit:
         copied = self._at(ast.Call(clone, [value], []), node)
         return copied if self._call_expression(node).id in self._owning else self._temporary(copied, kind, node)
 
+    def _math_call(self, function: std_math.MathFunction, call: Node) -> ast.expr:
+        """``math.sqrt(x)``: a call of its placeholder for x's type, which ``LowerMath`` makes ``math.sqrt``."""
+        kind, arguments = self._math_arguments(function, call)
+        values = []
+        for argument, loose in arguments:
+            value = self._argument(argument)
+            if loose:  # a number written as one, or a constant: as the others' type
+                value = self._at(ast.Call(self._global(kind, "type"), [value], []), argument)
+            values.append(value)
+        placeholder = self._at(self._global(self.project.math.get(function, kind, kind), "math"), call)
+        return self._at(ast.Call(placeholder, values, []), call)
+
+    def _math_type(self, function: std_math.MathFunction, call: Node) -> ScalarType | None:
+        """Return the type ``math.sqrt(x)`` gives: its arguments' (``None`` if they are wrong, as lowering says)."""
+        try:
+            return self._math_arguments(function, call)[0]
+        except BifrostError:
+            return None
+
+    def _math_arguments(
+        self, function: std_math.MathFunction, call: Node
+    ) -> tuple[ScalarType, list[tuple[Node, bool]]]:
+        """Check a ``std:math`` call's arguments; return their type, and each one, and whether it takes that type.
+
+        Arguments written as numbers (``2``, ``-0.5``) and constants (``math.pi``,
+        a top-level ``let``) take the type the others have, or ``f64`` (``i64``
+        for whole numbers ``min``, ``max`` and ``abs`` take alone).
+        """
+        written = f"math.{function.name}"
+        arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
+        if len(arguments) != len(function.parameters) or any(a.type != "expression" for a in arguments):
+            names = ", ".join(function.parameters)
+            raise self.error(call, f"{written} takes {names}: {written}({names})")
+        typed, loose = self._math_operands(written, arguments)
+        if typed:
+            kind = typed[0][1]
+        else:
+            whole = function.takes != std_math.FLOATS and float not in loose.values()
+            kind = scalar_type(i64 if whole else f64)
+        for argument in arguments:
+            if loose.get(argument.id) is float and kind.kind != "float":
+                msg = f"{_text(argument)} is not a whole number, and {written} takes {_shown(kind)}s here"
+                raise self.error(argument, msg)
+        culprit = _text(typed[0][0]) if typed else ""
+        if function.takes == std_math.FLOATS and kind.kind != "float":
+            msg = f"{written} takes a float (f32 or f64), and {culprit} is {_shown(kind)}; convert it: f64({culprit})"
+            raise self.error(typed[0][0], msg)
+        if function.takes == std_math.SIGNED and kind.kind == "uint":
+            msg = f"{written} takes a float or a signed integer, and {culprit} is {_shown(kind)}, never below zero"
+            raise self.error(typed[0][0], msg)
+        return kind, [(argument, argument.id in loose) for argument in arguments]
+
+    def _math_operands(
+        self, written: str, arguments: list[Node]
+    ) -> tuple[list[tuple[Node, ScalarType]], dict[int, type]]:
+        """Split a ``std:math`` call's arguments: those of a type, which must agree, and those written as numbers.
+
+        Return each typed one with its type, and the ``int`` or ``float`` of each other one, by id.
+        """
+        typed: list[tuple[Node, ScalarType]] = []
+        loose: dict[int, type] = {}
+        for argument in arguments:
+            number = self._loose_number(argument)
+            if number is not None:
+                loose[argument.id] = number
+                continue
+            kind = self._static_type(argument)
+            if kind is None:
+                text = _text(argument)
+                raise self.error(argument, f"cannot tell the type of {text}; convert it: f64({text})")
+            if kind.kind not in {"int", "uint", "float"}:
+                raise self.error(argument, f"{written} takes numbers, not a {_shown(kind)} ({_text(argument)})")
+            typed.append((argument, kind))
+        for (first, first_kind), (other, other_kind) in itertools.pairwise(typed):
+            if first_kind != other_kind:
+                msg = (
+                    f"{written} takes numbers of one type, and {_text(first)} is {_shown(first_kind)} while "
+                    f"{_text(other)} is {_shown(other_kind)}; convert one: {_shown(first_kind)}({_text(other)})"
+                )
+                raise self.error(other, msg)
+        return typed, loose
+
+    def _loose_number(self, node: Node) -> type | None:
+        """For a number written as one (``2``, ``-0.5``) or a constant (``math.pi``, a top-level ``let``): its kind.
+
+        ``int`` or ``float``; ``None`` for anything else.
+        """
+        assert self._scope is not None
+        node = _unwrap(node)
+        if node.type == "unary_expression" and _text(node.child_by_field_name("operator")) == "-":
+            node = _unwrap(node.child_by_field_name("argument"))
+        if node.type == "literal":
+            number = _children(node)[0]
+            if number.type != "number":
+                return None
+            return float if _children(number)[0].type == "float" else int
+        if node.type == "identifier":
+            names = [_text(node)]
+        elif node.type == "child_annotation" and all(part.type == "simple_identifier" for part in _children(node)):
+            names = [_text(part) for part in _children(node)]
+        else:
+            return None
+        if names[0] in self._scope.names or names[0] in self._scope.guards:
+            return None
+        value = self._reach([*self._qualify(names[0]).split("."), *names[1:]])
+        return type(value) if type(value) in {int, float} else None
+
     def _language_call(self, node: Node) -> ast.expr:
         """Lower a call of a function of the language itself: ``len(xs)``."""
         builtin = _text(node.child_by_field_name("function"))
@@ -4481,6 +4590,8 @@ class SourceUnit:
 
     def _builtin_call(self, builtin: fmt.Builtin, node: Node) -> ast.expr:
         """Expand a call of a function built into the compiler: ``fmt.format``, ``json.encode``, ``tasks.*``."""
+        if isinstance(builtin, std_math.MathFunction):
+            return self._math_call(builtin, node)
         expansions = {
             fmt.FORMAT: self._format,
             json.ENCODE: self._encode_call,
@@ -5370,6 +5481,9 @@ class SourceUnit:
             return self._generic_result(generic, _children(part)[0])
         if self._is_decode(path, name) and part.parent is not None:
             return self._expected_values.get(part.parent.id)  # `json.decode(text)`: what it is written to make
+        target = self._reach([*self._qualify(path[0]).split("."), *path[1:], name]) if path else None
+        if isinstance(target, std_math.MathFunction):
+            return self._math_type(target, _children(part)[0])  # `math.sqrt(x)`: x's type
         return self._returns(".".join([*path, name]))
 
     def _is_decode(self, path: list[str], name: str) -> bool:
@@ -6356,6 +6470,7 @@ _STD_MODULES: dict[str, Mapping[str, object]] = {
     f"{std.PREFIX}json": json.FUNCTIONS,
     f"{std.PREFIX}tasks": tasks.FUNCTIONS,
     f"{std.PREFIX}form": form.FUNCTIONS,
+    f"{std.PREFIX}math": std_math.FUNCTIONS | std_math.VALUES,
 }
 
 # The index of a slice: `xs[a...b]`, `xs[a...]`, `xs[...b]`.

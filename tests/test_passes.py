@@ -3,7 +3,8 @@
 The programs call the ``mem.Shared`` and ``mem.Atomic`` runtime as lowering
 does. Each runs through ``RaiseCells``, ``OptimizeCells`` and ``LowerCells``;
 the tests count the calls left. Whole programs are in ``test_cells``.
-``ReassociateSums`` runs on functions shaped like the generated ``sum``.
+``ReassociateSums`` runs on functions shaped like the generated ``sum``, and
+``LowerMath`` on calls of ``std:math``'s placeholders.
 """
 
 import itertools
@@ -14,7 +15,7 @@ from mlir_python.dialects import arith
 
 from bifrost.dialect import Lock, Retain
 from bifrost.list_methods import SUMMED
-from bifrost.passes import PIPELINE, LowerCells, OptimizeCells, RaiseCells
+from bifrost.passes import PIPELINE, LowerCells, LowerMath, OptimizeCells, RaiseCells
 
 RUNTIME = """
 func.func private @bifrost_shared_new(i64) -> !llvm.ptr
@@ -250,3 +251,27 @@ def _ops(op: ir.Operation, kind: type[ir.Operation]) -> list[ir.Operation]:
     found: list[ir.Operation] = []
     op.walk(lambda inner: found.append(inner) if isinstance(inner, kind) else None)
     return found
+
+
+def test_math_placeholders_become_operations() -> None:
+    # As lowering declares them: C functions, called with llvm.call.
+    module = ir.Module.parse("""
+llvm.func @bifrost_math_sqrt_f32(f32) -> f32
+llvm.func @bifrost_math_min_u8(i8, i8) -> i8
+llvm.func @bifrost_math_min_i8(i8, i8) -> i8
+llvm.func @bifrost_math_fma_f64(f64, f64, f64) -> f64
+func.func @f(%x: f32, %a: i8, %b: i8, %y: f64) -> (f32, i8, i8, f64) {
+  %root = llvm.call @bifrost_math_sqrt_f32(%x) : (f32) -> f32
+  %low = llvm.call @bifrost_math_min_u8(%a, %b) : (i8, i8) -> i8
+  %signed = llvm.call @bifrost_math_min_i8(%a, %b) : (i8, i8) -> i8
+  %fused = llvm.call @bifrost_math_fma_f64(%y, %y, %y) : (f64, f64, f64) -> f64
+  return %root, %low, %signed, %fused : f32, i8, i8, f64
+}""")
+    ir.PassManager(ir.Module, [LowerMath()]).run(module)
+    module.verify()
+    text = str(module)
+    assert "math.sqrt %arg0 : f32" in text
+    assert "arith.minui %arg1, %arg2 : i8" in text
+    assert "arith.minsi %arg1, %arg2 : i8" in text
+    assert "math.fma %arg3, %arg3, %arg3 : f64" in text
+    assert "bifrost_math" not in text  # the declarations go too

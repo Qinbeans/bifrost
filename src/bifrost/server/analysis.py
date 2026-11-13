@@ -28,6 +28,7 @@ from bifrost.owned import is_list
 from bifrost.packages import PackageError
 from bifrost.project import Project
 from bifrost.std import fmt, form, fs, json, mem, tasks
+from bifrost.std import math as std_math
 from bifrost.syntax import syntax_errors
 
 _LANGUAGE = Language(tree_sitter_bifrost.language())
@@ -967,8 +968,21 @@ class Document:
         if function is None:
             return None
         owner = [_text(p) for p in parts[:-1]]
+        math_function = std_math.FUNCTIONS.get(_text(function)) if len(owner) == 1 else None
+        if math_function is not None and self._module_of(owner[0]) == f"{std.PREFIX}math":
+            return self._type_of_math_call(math_function, _named(last)[0], where)
         method = self._method_node(owner, _text(function), where)
         return self._result_of(method) if method is not None else self._type_of_call(owner, _text(function))
+
+    def _type_of_math_call(self, function: std_math.MathFunction, call: Node, where: Node) -> str:
+        """Return what ``math.sqrt(x)`` gives: its arguments' type, or ``f64`` for numbers written as such."""
+        arguments = [_unwrap(argument) for argument in _named(call) if argument.type == "expression"]
+        for argument in arguments:
+            kind = self._type_of_value(argument, where)
+            if kind is not None:
+                return kind
+        whole = all("." not in _text(argument) for argument in arguments)
+        return "i64" if whole and function.takes != std_math.FLOATS else "f64"
 
     def _method_node(self, owner: list[str], name: str, where: Node) -> Node | None:
         """For ``value.name(...)`` on a local (or ``super``), return the method's definition."""
@@ -1894,7 +1908,8 @@ class Document:
             return _documented(described, _doc(_named(member)[-1]))
         if dotted is not None and dotted[0] in _BUILTIN_FUNCTIONS:
             builtin = _BUILTIN_FUNCTIONS[dotted[0]].get(dotted[1])
-            return _code(f"{builtin!r} = {builtin.signature}\n// {builtin.summary}") if builtin else None
+            shown = _code(f"{builtin!r} = {builtin.signature}\n// {builtin.summary}") if builtin else None
+            return shown or _constant_hover(*dotted)  # or a number it holds: math.pi
         if dotted is not None and dotted[0] == f"{std.PREFIX}mem":
             container = mem.CONTAINERS.get(dotted[1])
             return _code(f"{container!r}[T]\n// {container.summary}") if container else None
@@ -2593,7 +2608,11 @@ class Document:
                     completions.append(Completion(_text(identifier), kind, described, documentation=doc))
             return completions
         if module in _BUILTIN_FUNCTIONS:
-            return [Completion(f.name, "function", f"{f!r}{f.signature}") for f in _BUILTIN_FUNCTIONS[module].values()]
+            functions = [
+                Completion(f.name, "function", f"{f!r}{f.signature}") for f in _BUILTIN_FUNCTIONS[module].values()
+            ]
+            constants = _BUILTIN_CONSTANTS.get(module, {}).values()
+            return functions + [Completion(c.name, "constant", f"{c!r} = {c.value!r}: {c.summary}") for c in constants]
         if module == f"{std.PREFIX}mem":
             return [
                 Completion(container.name, "struct", f"{container!r}[T]: {container.summary}")
@@ -2930,7 +2949,18 @@ _BUILTIN_FUNCTIONS = {
     f"{std.PREFIX}form": form.FUNCTIONS,
     f"{std.PREFIX}tasks": tasks.FUNCTIONS,
     f"{std.PREFIX}fs": fs.FUNCTIONS,
+    f"{std.PREFIX}math": std_math.FUNCTIONS,
 }
+
+
+# The numbers standard modules built into the compiler hold: `math.pi`.
+_BUILTIN_CONSTANTS = {f"{std.PREFIX}math": std_math.CONSTANTS}
+
+
+def _constant_hover(module: str, name: str) -> str | None:
+    """Describe a number a standard module holds (``math.pi``), if ``module`` holds ``name``."""
+    constant = _BUILTIN_CONSTANTS.get(module, {}).get(name)
+    return _code(f"{constant!r} = {constant.value!r}\n// {constant.summary}") if constant is not None else None
 
 
 # What each standard module built into the compiler is for, and what it holds (shown in the editor).
@@ -2941,6 +2971,7 @@ _BUILTIN_SUMMARIES: dict[str, tuple[str, Iterable[str]]] = {
     "tasks": ("running async functions at the same time", tasks.FUNCTIONS),
     "form": ("values as forms (a=1&b=x)", form.FUNCTIONS),
     "fs": ("reading and writing whole files", fs.FUNCTIONS),
+    "math": ("square roots, rounding, trigonometry, pi and e", [*std_math.FUNCTIONS, *std_math.CONSTANTS]),
 }
 
 

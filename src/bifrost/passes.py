@@ -16,6 +16,10 @@ The cell passes, in order:
 
 And, on each function, ``ReassociateSums`` lets a float ``xs.sum()`` add its
 items in any order, so its loop vectorizes.
+
+First of all, ``LowerMath`` makes each call of a ``std:math`` placeholder
+(``bifrost_math_sqrt_f64(x)``) the operation it stands for (``math.sqrt %x``),
+which then counts as inert between cell operations.
 """
 
 import dataclasses
@@ -23,10 +27,11 @@ import re
 
 import mlir_python as ir
 from mlir_python import passes
-from mlir_python.dialects import arith, func
+from mlir_python.dialects import arith, func, math
 
 from bifrost.dialect import CELL_OPS, KINDS, CellOp, Lock, Release, Retain, Unlock
 from bifrost.list_methods import SUMMED
+from bifrost.std import math as std_math
 
 _ACTIONS = {op.ACTION: op for op in CELL_OPS}
 _RUNTIME_CALL = re.compile(rf"bifrost_({'|'.join(KINDS)})_({'|'.join(_ACTIONS)})")
@@ -236,7 +241,92 @@ class ReassociateSums(passes.PythonPass):
             addition.fastmath |= arith.FastMathFlags.REASSOC
 
 
+# Each std:math function's operation: (on floats, on signed integers, on unsigned integers).
+_MATH_OPS: dict[str, tuple[type[ir.Operation], type[ir.Operation] | None, type[ir.Operation] | None]] = {
+    "sqrt": (math.SqrtOp, None, None),
+    "floor": (math.FloorOp, None, None),
+    "ceil": (math.CeilOp, None, None),
+    "round": (math.RoundOp, None, None),
+    "trunc": (math.TruncOp, None, None),
+    "abs": (math.AbsFOp, math.AbsIOp, None),
+    "sin": (math.SinOp, None, None),
+    "cos": (math.CosOp, None, None),
+    "tan": (math.TanOp, None, None),
+    "asin": (math.AsinOp, None, None),
+    "acos": (math.AcosOp, None, None),
+    "atan": (math.AtanOp, None, None),
+    "atan2": (math.Atan2Op, None, None),
+    "tanh": (math.TanhOp, None, None),
+    "exp": (math.ExpOp, None, None),
+    "exp2": (math.Exp2Op, None, None),
+    "log": (math.LogOp, None, None),
+    "log2": (math.Log2Op, None, None),
+    "log10": (math.Log10Op, None, None),
+    "pow": (math.PowFOp, None, None),
+    "fma": (math.FmaOp, None, None),
+    "min": (arith.MinNumFOp, arith.MinSIOp, arith.MinUIOp),  # minnum: a NaN gives the other, as C's fmin
+    "max": (arith.MaxNumFOp, arith.MaxSIOp, arith.MaxUIOp),
+}
+_MATH_CALL = re.compile(rf"{std_math.PREFIX}({'|'.join(_MATH_OPS)})_([fiu])(8|16|32|64)")
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LowerMath(passes.PythonPass):
+    """Rewrites calls of ``std:math``'s placeholders as math (and arith) operations, and drops their declarations.
+
+    ``bifrost_math_sqrt_f32(x)`` is ``math.sqrt %x : f32``; ``bifrost_math_min_u64(a, b)``
+    is ``arith.minui``. LLVM gets its intrinsics (``llvm.sqrt.f32``) instead of a call it
+    cannot see into.
+    """
+
+    def run(self, op: ir.Operation) -> None:
+        """Lower every placeholder call nested in ``op``; erase the declarations left unused.
+
+        Raises:
+            RuntimeError: If a placeholder is still called.
+
+        """
+        calls: list[ir.Operation] = []
+        declarations: list[ir.Operation] = []
+
+        def visit(inner: ir.Operation) -> None:
+            if _calls_placeholder(inner):
+                calls.append(inner)
+            elif inner.name == "llvm.func" and inner.attributes["sym_name"].value.startswith(std_math.PREFIX):
+                declarations.append(inner)
+
+        op.walk(visit)
+        for call in calls:
+            match = _MATH_CALL.fullmatch(call.attributes["callee"].value)
+            if match is None:
+                continue  # reported below
+            on_float, on_signed, on_unsigned = _MATH_OPS[match[1]]
+            lowered = {"f": on_float, "i": on_signed, "u": on_unsigned}[match[2]]
+            assert lowered is not None, f"{match[0]} has no operation (lowering checks what each function takes)"
+            with ir.InsertionPoint.before(call), call.location:
+                operation = lowered(*call.operands)
+            call.results[0].replace_all_uses_with(operation.result)
+            call.erase()
+        left: list[str] = []
+        op.walk(lambda inner: left.append(inner.attributes["callee"].value) if _calls_placeholder(inner) else None)
+        if left:
+            msg = f"std:math placeholders still called after lowering: {', '.join(sorted(set(left)))}"
+            raise RuntimeError(msg)
+        for declaration in declarations:
+            declaration.erase()
+
+
+def _calls_placeholder(op: ir.Operation) -> bool:
+    """Whether ``op`` calls a ``std:math`` placeholder (declared as a C function, so with ``llvm.call``)."""
+    return (
+        op.name == "llvm.call"
+        and "callee" in op.attributes
+        and op.attributes["callee"].value.startswith(std_math.PREFIX)
+    )
+
+
 PIPELINE: tuple[passes.PipelineElement, ...] = (
+    LowerMath(),
     RaiseCells(),
     OptimizeCells(),
     LowerCells(),
