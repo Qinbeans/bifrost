@@ -54,7 +54,7 @@ def init(
 
 
 @cli.command()
-def build(
+def build(  # noqa: PLR0913, PLR0917 - each argument is a command-line option
     source: Annotated[Path | None, typer.Argument(help="File to compile; default: the entry in config.yaml.")] = None,
     config: Annotated[Path, typer.Option("--config", "-c", help="Project configuration.")] = Path("config.yaml"),
     path: Annotated[
@@ -65,6 +65,13 @@ def build(
     ] = "",
     no_default_features: Annotated[  # noqa: FBT002 - a command-line flag
         bool, typer.Option("--no-default-features", help="Leave the project's default features off.")
+    ] = False,
+    emit_mlir: Annotated[  # noqa: FBT002 - a command-line flag
+        bool,
+        typer.Option("--emit-mlir", help="Also write the linked MLIR, as codegen gets it, to <output>/<name>.mlir."),
+    ] = False,
+    emit_llvm: Annotated[  # noqa: FBT002 - a command-line flag
+        bool, typer.Option("--emit-llvm", help="Also write the optimized LLVM IR to <output>/<name>.ll.")
     ] = False,
 ) -> None:
     """Compile a Bifrost source file (by default, the project's entry) into the configured executable."""
@@ -104,6 +111,8 @@ def build(
         unit = lower_file(project, source, root=source_root(project_folder))
         with unit.errors():
             executable = project.build()
+            for written in project.emit(mlir=emit_mlir, llvm=emit_llvm):
+                log.step("Wrote", str(written))
     except BifrostError as error:
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None

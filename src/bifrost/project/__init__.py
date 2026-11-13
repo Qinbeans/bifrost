@@ -332,6 +332,18 @@ class Project:
         lowered_handler = FunctionType(function_code, lowerer.globals, handler.__name__)
         return self.program.main(lowered_handler)
 
+    def emit(self, *, mlir: bool = False, llvm: bool = False) -> list[Path]:
+        """Write the program's linked MLIR (``<name>.mlir``) and optimized LLVM IR (``<name>.ll``), as asked."""
+        written = []
+        base = self.config.path / self.config.package.name
+        if mlir:
+            written.append(base.with_suffix(".mlir"))
+            written[-1].write_text(f"{self.program.linked()}\n")
+        if llvm:
+            written.append(base.with_suffix(".ll"))
+            written[-1].write_text(f"{self.program.llvm_ir(opt_level=self.config.flags.optimization)}\n")
+        return written
+
     def build(self) -> Path:
         """Build the project executable (with Bifrost's async runtime, if anything pauses)."""
         runtimes = [self._c_runtime("decode_runtime")] if self.decoders.used else []

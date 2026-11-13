@@ -74,3 +74,15 @@ def test_build_without_entry_says_how(workspace: Path) -> None:
     result = CliRunner().invoke(cli, ["build"])
     assert result.exit_code == 1
     assert "set package.entry" in result.output
+
+
+def test_build_can_write_the_mlir_and_llvm_ir(workspace: Path) -> None:
+    runner = CliRunner()
+    assert runner.invoke(cli, ["init", "ir"]).exit_code == 0
+    os.chdir(workspace / "ir")
+    result = runner.invoke(cli, ["build", "--emit-mlir", "--emit-llvm"])
+    assert result.exit_code == 0, result.output
+    mlir = (workspace / "ir" / "build" / "ir.mlir").read_text()
+    assert "func.func @main" in mlir  # the linked module, as codegen gets it
+    assert "define " in (workspace / "ir" / "build" / "ir.ll").read_text()
+    assert (workspace / "ir" / "build" / "ir").is_file()  # and still the executable
