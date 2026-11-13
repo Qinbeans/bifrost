@@ -1,0 +1,13 @@
+[package]
+name = "zed_bifrost"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Zed extension for the Bifrost programming language"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"

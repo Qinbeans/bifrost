@@ -1,0 +1,17 @@
+name = "Bifrost"
+grammar = "bifrost"
+path_suffixes = ["bif"]
+line_comments = ["// "]
+# Block comments are descriptions: `/* text */`, continued on lines indented
+# past the `/*` (as in the examples), with no `*` prefix.
+block_comment = { start = "/* ", prefix = "", end = " */", tab_size = 3 }
+tab_size = 4
+hard_tabs = false
+autoclose_before = ":.,=}])"
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string", "comment"] },
+    { start = "/*", end = " */", close = true, newline = false, not_in = ["string", "comment"] },
+]

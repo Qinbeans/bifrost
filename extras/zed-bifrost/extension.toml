@@ -1,0 +1,18 @@
+id = "bifrost"
+name = "Bifrost"
+version = "0.0.1"
+schema_version = 1
+authors = ["Ryan Fong <ryan.lawrence.fong@gmail.com>"]
+description = "Bifrost language support: tree-sitter highlighting and the bfc language server."
+repository = "https://github.com/Qinbeans/bifrost"
+
+[grammars.bifrost]
+repository = "https://github.com/Qinbeans/tree-sitter-bifrost"
+rev = "1e3bd17c2fc823eef010560ddf0d78645d14ccae"
+
+[language_servers.bifrost-lsp]
+name = "Bifrost Language Server"
+languages = ["Bifrost"]
+
+[language_servers.bifrost-lsp.language_ids]
+Bifrost = "bifrost"
