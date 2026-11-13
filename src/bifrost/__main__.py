@@ -11,7 +11,7 @@ from rich.markup import escape
 from typer import Typer
 
 from bifrost import log, packages, scaffold, versioning
-from bifrost.configs import Config, ConfigBuilder, source_root
+from bifrost.configs import Config, ConfigBuilder, ConfigError, source_root
 from bifrost.configs.features import FeatureError
 from bifrost.configs.schema import DEFAULT_INDEX
 from bifrost.formatter import FormatError, format_source
@@ -86,7 +86,7 @@ def build(  # noqa: PLR0913, PLR0917 - each argument is a command-line option
         msg = f"no {config_path}; create a project with `bfc init <name>`"
         print(f"[bold red]✘ ERROR[/bold red]: {escape(msg)}", file=sys.stderr)
         raise typer.Exit(1) from None
-    except (PackageError, FeatureError) as error:
+    except (PackageError, FeatureError, ConfigError) as error:
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     project_folder = config_path.parent
@@ -141,7 +141,7 @@ def package(
         raise typer.Exit(1)
     try:
         archive = packages.build(config.parent, output)
-    except PackageError as error:
+    except (PackageError, ConfigError) as error:
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     print(f"[bold green]✔ SUCCESS[/bold green]: packaged {archive}")
@@ -175,7 +175,7 @@ def add(
     name, _, version = (package or "").partition("@")
     try:
         added, source = packages.add(config, name or None, version=version or None, path=path, index=index)
-    except PackageError as error:
+    except (PackageError, ConfigError) as error:
         print(f"[bold red]✘ ERROR[/bold red]: {escape(str(error))}", file=sys.stderr)
         raise typer.Exit(1) from None
     if isinstance(source, str):

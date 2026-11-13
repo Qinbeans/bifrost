@@ -1,9 +1,24 @@
 from pathlib import Path
 
 import yaml
+from pydantic import ValidationError
 
 from bifrost.configs import features
 from bifrost.configs.schema import Config, source_root
+
+
+class ConfigError(ValueError):
+    """A config.yaml that does not describe a project: the message names each key that is wrong or missing."""
+
+
+def _problems(path: Path, error: ValidationError) -> str:
+    """Each problem pydantic found, one per line, by its key's dotted path: ``flags: missing``."""
+    lines = []
+    for problem in error.errors():
+        key = ".".join(str(part) for part in problem["loc"]) or "(top level)"
+        what = "missing" if problem["type"] == "missing" else problem["msg"]
+        lines.append(f"  {key}: {what}")
+    return f"{path} is not a valid project configuration:\n" + "\n".join(lines)
 
 
 class ConfigBuilder:
@@ -23,7 +38,14 @@ class ConfigBuilder:
         ``default_features``); see ``bifrost.configs.features``.
         """
         with config_path.open("r") as config_file:
-            self._config = Config(**yaml.safe_load(config_file))
+            loaded = yaml.safe_load(config_file)
+        if not isinstance(loaded, dict):
+            msg = f"{config_path} is not a valid project configuration: it holds no keys (package:, flags:, ...)"
+            raise ConfigError(msg)
+        try:
+            self._config = Config(**loaded)
+        except ValidationError as error:
+            raise ConfigError(_problems(config_path, error)) from None
         # Library paths are relative to config.yaml, wherever bifrost runs from.
         self._config.libraries = [
             config_path.parent / library if isinstance(library, Path) and not library.is_absolute() else library
@@ -51,4 +73,4 @@ class ConfigBuilder:
         return self._config
 
 
-__all__ = ["Config", "ConfigBuilder", "source_root"]
+__all__ = ["Config", "ConfigBuilder", "ConfigError", "source_root"]

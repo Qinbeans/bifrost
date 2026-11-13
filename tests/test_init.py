@@ -86,3 +86,21 @@ def test_build_can_write_the_mlir_and_llvm_ir(workspace: Path) -> None:
     assert "func.func @main" in mlir  # the linked module, as codegen gets it
     assert "define " in (workspace / "ir" / "build" / "ir.ll").read_text()
     assert (workspace / "ir" / "build" / "ir").is_file()  # and still the executable
+
+
+@pytest.mark.parametrize(
+    ("text", "said"),
+    [
+        ("package:\n  name: p\n  version: 0.1.0\n", ["package.description: missing", "flags: missing"]),
+        ("", ["it holds no keys"]),
+    ],
+)
+def test_build_names_what_a_config_lacks(workspace: Path, text: str, said: list[str]) -> None:
+    (workspace / "config.yaml").write_text(text)
+    result = CliRunner().invoke(cli, ["build"])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    output = " ".join(result.output.split())
+    assert "config.yaml is not a valid project configuration" in output
+    for part in said:
+        assert part in output
