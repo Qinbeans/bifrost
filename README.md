@@ -677,7 +677,7 @@ There are `sqrt`, `floor`, `ceil`, `round` (halves away from zero), `trunc`, `ab
 
 `import("raylib")` brings in a module declared in `config.yaml`, the project's or a package's (raylib's is [`extras/raylib`](./extras/raylib)). Its functions take Bifrost names: `InitWindow` is `rl.init_window`, and structs keep PascalCase (`rl.Color`). The C symbols are unchanged.
 
-`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, and `import("std:fs")` [files](#files), and `import("std:math")` [math](#math).
+`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, `import("std:fs")` [files](#files), and `import("std:math")` [math](#math).
 
 ### Modules
 
@@ -907,6 +907,8 @@ cd my_api
 bfc build          # compiles package.entry (src/my_api/main.bif) into build/
 ./build/my_api
 ```
+
+`bfc build --emit-mlir` also writes the linked MLIR module, after Bifrost's passes and as codegen gets it, to `build/my_api.mlir`, and `--emit-llvm` the optimized LLVM IR to `build/my_api.ll`, to see what a function compiles to.
 
 A project uses the source layout:
 
