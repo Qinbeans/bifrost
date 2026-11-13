@@ -11,7 +11,10 @@ Reading a list (any list, a view too):
 - ``map(f)``, ``filter(f)``: a new list, of what ``f`` gives, or of the items
   ``f`` keeps (copies);
 - ``sorted()``, ``reversed()``: a new list, sorted (numbers and strings,
-  ascending) or reversed.
+  ascending) or reversed;
+- ``sum()``: its items added up (numbers), 0 for an empty list. A float sum
+  may be added in any order (``SUMMED`` marks it so, for the loop to
+  vectorize), so it can differ in the last bits from adding left to right.
 
 Changing it in place, through a guard (``let g <- xs``), like item writes:
 ``sort()`` and ``reverse()``. Sorting is a heapsort: O(n log n), in place.
@@ -25,11 +28,14 @@ from bifrost.formats import article
 from bifrost.owned import Drops, is_closure, list_of, owns, signature_of
 from bifrost.std import list_runtime
 
-READING = {"contains", "index_of", "map", "filter", "sorted", "reversed"}
+READING = {"contains", "index_of", "map", "filter", "sorted", "reversed", "sum"}
 CHANGING = {"sort", "reverse"}  # in place, through a guard
 METHODS = READING | CHANGING
 
 _STRINGS = ("cstr",)
+
+SUMMED = "bifrost_sum"
+"""What the generated ``sum`` functions' names start with: ``bifrost.passes.ReassociateSums`` finds them by it."""
 
 
 # How each reads, for the editor: its signature (`T` is the item type) and what it does.
@@ -40,6 +46,7 @@ _DESCRIBED = {
     "filter": ("(f: (x: T) => bool) => T[]", "a new list of copies of the items f keeps"),
     "sorted": ("() => T[]", "a new list of copies of its items, smallest first"),
     "reversed": ("() => T[]", "a new list of copies of its items, last first"),
+    "sum": ("() => T", "its items added up (numbers), 0 when it has none"),
     "sort": ("() => null", "sorts it in place, smallest first (through a guard)"),
     "reverse": ("() => null", "reverses it in place (through a guard)"),
 }
@@ -65,15 +72,20 @@ def orderable(element: ScalarType) -> bool:
     return element.kind in {"int", "uint", "float", *_STRINGS}
 
 
+def summable(element: ScalarType) -> bool:
+    """Whether items of ``element`` can be added up: numbers."""
+    return element.kind in {"int", "uint", "float"}
+
+
 def result(name: str, kind: ScalarType, function: object = None) -> ScalarType | None:
     """Return what calling the method ``name`` on a list of type ``kind`` gives (``function``: what ``map`` takes)."""
     match name:
-        case "contains":
-            return scalar_type(bool)
-        case "index_of":
-            return scalar_type(int)
+        case "contains" | "index_of":
+            return scalar_type(bool if name == "contains" else int)
         case "filter" | "sorted" | "reversed":
             return kind
+        case "sum":
+            return kind.element
         case "map":
             if not is_closure(function):
                 return None
@@ -239,6 +251,23 @@ class ListMethods:
         ]
         return self.drops.function(lines, self._names(kind), {"items": kind, "return": kind})
 
+    def _sum(self, kind: ScalarType, _: object) -> Any:  # noqa: ANN401
+        element = kind.element
+        assert element is not None
+        zero = "0.0" if element.kind == "float" else "0"
+        lines = [
+            "def {name}(items):",
+            "    count = length(items)",
+            f"    total: Item = {zero}",
+            "    index = 0",
+            "    while index < count:",
+            "        total = total + items[index]",
+            "        index = index + 1",
+            "    return total",
+        ]
+        names = self._names(kind) | {"Item": element}
+        return self.drops.function(lines, names, {"items": kind, "return": element}, prefix=SUMMED)
+
     def _map(self, kind: ScalarType, function: object) -> Any:  # noqa: ANN401
         mapped = result("map", kind, function)
         assert mapped is not None
@@ -296,6 +325,10 @@ def check(name: str, kind: ScalarType, arguments: list[ScalarType | None]) -> No
         raise ListMethodError(f"{name} compares numbers, bools and strings, not {element.name}")
     if name in {"sort", "sorted"} and not orderable(element):
         raise ListMethodError(f"{name} orders numbers and strings, not {element.name}")
+    if name == "sum" and not summable(element):
+        written = "str" if element.kind in _STRINGS else element.name
+        hint = "give the numbers to add up with map first: xs.map(f).sum()"
+        raise ListMethodError(f"sum adds up numbers (ints and floats), not {written}; {hint}")
     if name in {"map", "filter"}:
         function = arguments[0]
         if not is_closure(function):
@@ -315,6 +348,7 @@ __all__ = [
     "CHANGING",
     "METHODS",
     "READING",
+    "SUMMED",
     "ListMethodError",
     "ListMethods",
     "check",

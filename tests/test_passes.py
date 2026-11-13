@@ -3,14 +3,17 @@
 The programs call the ``mem.Shared`` and ``mem.Atomic`` runtime as lowering
 does. Each runs through ``RaiseCells``, ``OptimizeCells`` and ``LowerCells``;
 the tests count the calls left. Whole programs are in ``test_cells``.
+``ReassociateSums`` runs on functions shaped like the generated ``sum``.
 """
 
 import itertools
 
 import mlir_python as ir
 import pytest
+from mlir_python.dialects import arith
 
 from bifrost.dialect import Lock, Retain
+from bifrost.list_methods import SUMMED
 from bifrost.passes import PIPELINE, LowerCells, OptimizeCells, RaiseCells
 
 RUNTIME = """
@@ -207,3 +210,43 @@ def test_operations_are_verified() -> None:
 def test_optimize_alone_leaves_calls_as_they_are() -> None:
     body = "\n".join([_retain("%a"), _release("%a")])
     assert _run(body, (OptimizeCells(),)) == _run(body, ())
+
+
+def _adding(name: str, kind: str) -> str:
+    """Write a function ``name`` adding up ``n`` items of type ``kind`` at ``%items``, as the generated sum does."""
+    add = "arith.addf" if kind.startswith("f") else "arith.addi"
+    zero = "0.0" if kind.startswith("f") else "0"
+    return f"""
+func.func @{name}(%items: !llvm.ptr, %n: i64) -> {kind} {{
+  %c0 = arith.constant 0 : i64
+  %c1 = arith.constant 1 : i64
+  %zero = arith.constant {zero} : {kind}
+  %total = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %zero) -> ({kind}) : i64 {{
+    %at = llvm.getelementptr %items[%i] : (!llvm.ptr, i64) -> !llvm.ptr, {kind}
+    %item = llvm.load %at : !llvm.ptr -> {kind}
+    %next = {add} %acc, %item : {kind}
+    scf.yield %next : {kind}
+  }}
+  return %total : {kind}
+}}"""
+
+
+def test_a_float_sum_adds_in_any_order() -> None:
+    # Only the generated sum functions' additions are marked: a function of the program's own adds
+    # left to right, as written; an integer sum needs nothing (its order changes nothing).
+    sums = [_adding(f"{SUMMED}_1", "f32"), _adding(f"{SUMMED}_2", "f64"), _adding(f"{SUMMED}_3", "i64")]
+    module = ir.Module.parse("\n".join([*sums, _adding("total", "f32")]))
+    ir.PassManager(ir.Module, list(PIPELINE)).run(module)
+    module.verify()
+    marked = {
+        function.sym_name: [op.fastmath for op in _ops(function, arith.AddFOp)] for function in module.body.operations
+    }
+    reassoc, none = arith.FastMathFlags.REASSOC, arith.FastMathFlags.NONE
+    assert marked == {f"{SUMMED}_1": [reassoc], f"{SUMMED}_2": [reassoc], f"{SUMMED}_3": [], "total": [none]}
+    assert "fastmath<reassoc>" in str(module)
+
+
+def _ops(op: ir.Operation, kind: type[ir.Operation]) -> list[ir.Operation]:
+    found: list[ir.Operation] = []
+    op.walk(lambda inner: found.append(inner) if isinstance(inner, kind) else None)
+    return found

@@ -498,13 +498,14 @@ g -> grid
 A list has its own functions, called on it like methods. They are built in, like `len`, so they need no import; each is listed as `list.<name>`, like any function a function calls:
 
 ```bifrost
-let main = [list.contains, list.index_of, list.filter, list.map, list.sorted, list.sort] () => null {
+let main = [list.contains, list.index_of, list.filter, list.map, list.sorted, list.sum, list.sort] () => null {
     let xs = #[5, 3, 9, 1]
     let has = xs.contains(9)                         // true (numbers, bools and strings)
     let at = xs.index_of(1)                          // 3, or -1 when absent
     let big = xs.filter([] (x: i64) => bool x > 4)   // #[5, 9]: a new list
     let doubled = big.map([] (x: i64) => i64 x * 2)  // #[10, 18]
     let ordered = xs.sorted()                        // #[1, 3, 5, 9] (also xs.reversed())
+    let total = xs.sum()                             // 18 (numbers; 0 when empty)
     let g <- xs
     g.sort()                                         // in place, through a guard (also g.reverse())
     g -> xs
@@ -512,6 +513,8 @@ let main = [list.contains, list.index_of, list.filter, list.map, list.sorted, li
 ```
 
 `map`, `filter`, `sorted` and `reversed` make new lists, of copies, which their owner frees; `sort` and `reverse` change the list in place, so they go through a guard, like item writes. Sorting orders numbers and strings, in O(n log n) and no extra memory.
+
+`sum` adds up a list of numbers, in its item type (a `u8[]`'s sum wraps past 255, as `+` does); to add up something else, `map` it to numbers first. A float sum adds its items in whatever order is fastest, several at once, so it can differ in the last bits from adding them left to right; a loop with `+` keeps the order as written.
 
 `xs[a...b]` is a new list of the items from `a` up to `b` (`xs[1...]`, `xs[...-1]`: either left out is the end), with Python's rules: negative counts from the end, and bounds past either end stop there. `users[0].name` reads on from an item.
 

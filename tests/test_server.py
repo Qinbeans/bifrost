@@ -726,6 +726,7 @@ def test_list_methods_in_the_editor(tmp_path: Path) -> None:
     completions = {c.label: c.detail for c in document.completions((row, column))}
     assert completions["map"] == "map = (f: (x: i64) => U) => U[]"
     assert completions["sort"] == "sort = () => null"
+    assert completions["sum"] == "sum = () => i64"
     assert document.hover((row, column + 1)) == (
         "```bifrost\nlet filter = (f: (x: i64) => bool) => i64[]\n// a new list of copies of the items f keeps\n```"
     )

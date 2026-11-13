@@ -13,6 +13,9 @@ The cell passes, in order:
   invisible (see ``OptimizeCells``).
 - ``LowerCells`` rewrites what is left back into the same calls, and checks no
   ``bifrost`` operation is left for codegen.
+
+And, on each function, ``ReassociateSums`` lets a float ``xs.sum()`` add its
+items in any order, so its loop vectorizes.
 """
 
 import dataclasses
@@ -20,9 +23,10 @@ import re
 
 import mlir_python as ir
 from mlir_python import passes
-from mlir_python.dialects import func
+from mlir_python.dialects import arith, func
 
 from bifrost.dialect import CELL_OPS, KINDS, CellOp, Lock, Release, Retain, Unlock
+from bifrost.list_methods import SUMMED
 
 _ACTIONS = {op.ACTION: op for op in CELL_OPS}
 _RUNTIME_CALL = re.compile(rf"bifrost_({'|'.join(KINDS)})_({'|'.join(_ACTIONS)})")
@@ -207,5 +211,35 @@ class LowerCells(passes.PythonPass):
             raise RuntimeError(msg)
 
 
-PIPELINE: tuple[passes.PythonPass, ...] = (RaiseCells(), OptimizeCells(), LowerCells())
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ReassociateSums(passes.PythonPass):
+    """Marks the additions of a generated float ``sum`` as reassociable (``fastmath<reassoc>``).
+
+    Adding left to right, each addition waits for the one before, so LLVM keeps
+    the loop scalar; free to reorder them, it adds several items at once, in
+    vector lanes, and the lanes at the end. The total can then differ from a
+    left-to-right one in the last bits. A ``sum`` function (named ``SUMMED``
+    and a count, by ``list_methods``) adds only its items to its total, so each
+    of its additions is marked; other functions keep their order.
+    """
+
+    ANCHOR = func.FuncOp
+
+    def run(self, op: ir.Operation) -> None:
+        """Mark the float additions of ``op``, if it is a sum function."""
+        assert isinstance(op, func.FuncOp)
+        if not op.sym_name.startswith(f"{SUMMED}_"):
+            return
+        added: list[arith.AddFOp] = []
+        op.walk(lambda inner: added.append(inner) if isinstance(inner, arith.AddFOp) else None)
+        for addition in added:
+            addition.fastmath |= arith.FastMathFlags.REASSOC
+
+
+PIPELINE: tuple[passes.PipelineElement, ...] = (
+    RaiseCells(),
+    OptimizeCells(),
+    LowerCells(),
+    ir.Nested(func.FuncOp, [ReassociateSums()]),
+)
 """What every project's program runs on the program it links."""

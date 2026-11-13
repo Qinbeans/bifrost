@@ -397,10 +397,20 @@ class Drops:
         lines = ["def {name}(value):", f"    return Value({arguments})"]
         return self.function(lines, names, {"value": kind, "return": kind})
 
-    def function(self, lines: list[str], names: dict[str, object], annotations: dict[str, object]) -> Any:  # noqa: ANN401
-        """Compile generated source (``mlir_python.lang`` reads a function's source) into the program."""
+    def function(
+        self,
+        lines: list[str],
+        names: dict[str, object],
+        annotations: dict[str, object],
+        *,
+        prefix: str = "bifrost_owned",
+    ) -> Any:  # noqa: ANN401
+        """Compile generated source (``mlir_python.lang`` reads a function's source) into the program.
+
+        Its name is ``prefix`` and a count: ``bifrost_owned_3``, or ``bifrost_sum_4`` for a pass to find.
+        """
         self._count += 1
-        name = f"bifrost_owned_{self._count}"
+        name = f"{prefix}_{self._count}"
         source = "\n".join(lines).format(name=name) + "\n"
         filename = f"<bifrost owned {name}>"
         linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)

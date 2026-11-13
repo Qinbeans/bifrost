@@ -47,7 +47,19 @@ let bump = [] (c: mem.Weak[Team], by: i64) => null {
     g -> c
 }
 
-let main = [io.printf, double, add, total, make, maths.add, bump, list.sorted, list.map, Team.grow] () => null {
+let main = [
+    io.printf,
+    double,
+    add,
+    total,
+    make,
+    maths.add,
+    bump,
+    list.sorted,
+    list.map,
+    list.sum,
+    Team.grow
+] () => null {
     io.printf("%d\n", 3 |> double)
     io.printf("%d\n", 3 |> add(4))
     io.printf("%d\n", 3 |> double |> add(1) |> double)
@@ -62,6 +74,7 @@ let main = [io.printf, double, add, total, make, maths.add, bump, list.sorted, l
     io.printf("%d %d\n", sorted[0], xs[0])
     io.printf("%d\n", #[9, 8] |> .sorted() |> total)
     io.printf("%d\n", xs |> .map([] (x: i64) => i64 x * 10) |> total)
+    io.printf("%d %d\n", xs |> .sum(), xs |> .map([] (x: i64) => i64 x * 10) |> .sum())
     io.printf("%d\n", xs |> len())
     let team = Team(size: 2)
     team |> .grow(3)
@@ -131,6 +144,7 @@ def test_pipes(tmp_path: Path) -> None:
         "1 3",  # a new list, sorted; xs as it was
         "17",
         "60",
+        "6 60",  # xs.sum(), and the sum of a new list, freed
         "3",
         "5",  # team.grow(3)
         "3",  # bump(g, 2)

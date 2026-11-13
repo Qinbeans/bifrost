@@ -8,6 +8,7 @@ no list made. ``#[...xs, x]`` makes a new list, or, when it replaces ``xs``,
 grows it in place.
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -437,6 +438,59 @@ def test_list_methods(tmp_path: Path) -> None:
     assert allocations - frees == 1
 
 
+SUMS = r"""
+let io = import("std:stdio")
+
+let Team = struct { let scores: i64[] }
+
+let mean = [list.sum] (xs: f64[]) => f64 xs.sum() / f64(len(xs))
+
+let main = [io.printf, list.sum, list.map, mean] () => null {
+    let xs = #[5, 3, 9, 1, 7]
+    let empty: i64[] = #[]
+    let halves: f32[] = #[0.5, 1.5, 2.25]
+    let bytes: u8[] = #[200, 100]
+    io.printf("%d %d %.2f %.2f %d\n", xs.sum(), empty.sum(), halves.sum(), mean(#[1.0, 2.0, 4.5]), bytes.sum())
+
+    let none: f32[] = #[]
+    let many: f32[] = #[]
+    forall i in #[0...1000] {
+        let many = #[...many, f32(0.25)]
+    }
+    io.printf("%.1f %.2f\n", none.sum(), many.sum())
+
+    let team = Team(scores: #[10, 20, 30])
+    let grid = #[#[1, 2], #[3, 4, 5]]
+    let rows = 0
+    forall row in grid {
+        let rows = rows + row.sum()
+    }
+    io.printf("%d %d %d\n", team.scores.sum(), rows, xs.map([] (x: i64) => i64 x * x).sum())
+}
+"""
+
+
+def test_list_sum(tmp_path: Path) -> None:
+    # sum adds up a list of numbers, in its item type (a u8 sum wraps past 255); 0 when empty. A
+    # float sum vectorizes, adding in any order (exact here: every partial sum is representable).
+    lines, allocations, frees = _counted(tmp_path, SUMS)
+    assert lines == ["25 0 4.25 2.50 44", "0.0 250.00", "60 15 165"]
+    assert allocations - frees == 1  # stdout keeps its buffer
+
+
+def test_a_float_sum_vectorizes(tmp_path: Path) -> None:
+    # Free to add in any order (see bifrost.passes.ReassociateSums), LLVM adds several f32 items at
+    # once; an integer sum vectorizes as it is.
+    source = (
+        "let total = [list.sum] (xs: f32[]) => f32 xs.sum()\n"
+        "let count = [list.sum] (xs: i32[]) => i32 xs.sum()\n"
+        "let main = [total, count] () => null {\n    let t = total(#[1.0])\n    let c = count(#[1])\n}\n"
+    )
+    llvm = str(_compile(tmp_path, source).program.llvm_ir(opt_level=OptLevel.O2))
+    assert re.search(r"fadd reassoc <\d+ x float>", llvm)
+    assert re.search(r"add <\d+ x i32>", llvm)
+
+
 HEAD = (
     'let io = import("std:stdio")\nlet mem = import("std:mem")\nlet fmt = import("std:fmt")\n'
     "let Team = struct { let members: i64[] }\nlet User = struct { let name: mem.Unique[str] }\n"
@@ -555,6 +609,27 @@ HEAD = (
             "sorted orders numbers and strings",
         ),
         (
+            "let f = [list.sum] () => null {\n    let bs = #[true]\n    let s = bs.sum()\n}",
+            "sum adds up numbers (ints and floats), not bool",
+        ),
+        (
+            'let f = [list.sum] () => null {\n    let names = #["a", "b"]\n    let s = names.sum()\n}',
+            "sum adds up numbers (ints and floats), not str",
+        ),
+        (
+            "let f = [list.sum] (users: User[]) => null {\n    let s = users.sum()\n}",
+            "sum adds up numbers (ints and floats), not User; give the numbers to add up with map first: "
+            "xs.map(f).sum()",
+        ),
+        (
+            "let f = [list.sum] () => null {\n    let xs = #[1]\n    let s = xs.sum(1)\n}",
+            "sum takes no arguments: xs.sum()",
+        ),
+        (
+            "let f = [list.sum] () => null {\n    let xs = #[1]\n    let s: f64 = xs.sum()\n}",
+            "expected f64, got i64",
+        ),
+        (
             "let f = [list.map] () => null {\n    let xs = #[1]\n    let ys = xs.map([] (x: f64) => f64 x)\n}",
             "map's function takes one item, an i64",
         ),
@@ -568,7 +643,8 @@ HEAD = (
         ),
         (
             "let f = [] () => null {\n    let xs = #[1]\n    let b = xs.size()\n}",
-            "i64[] has no method size; a list's are contains, filter, index_of, map, reverse, reversed, sort, sorted",
+            "i64[] has no method size; a list's are contains, filter, index_of, map, reverse, reversed, sort, sorted, "
+            "sum",
         ),
     ],
 )

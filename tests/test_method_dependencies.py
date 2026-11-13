@@ -117,6 +117,12 @@ let label = [models.User.label] (user: models.User) => i64 user.label()""",
     let at = xs.index_of(1)
     let back = xs |> .reversed()
 }""",
+        """let total = [list.sum] (xs: f64[]) => f64 xs.sum()
+let main = [list.sum, list.map] () => null {
+    let xs = #[3, 1, 2]
+    let n = xs.sum()
+    let m = xs |> .map([] (x: i64) => i64 x * 2) |> .sum()
+}""",
         """let main = [list.sort, list.reverse] () => null {
     let xs = #[3, 1, 2]
     let g <- xs
@@ -264,6 +270,14 @@ def test_listed_edges(tmp_path: Path, source: str) -> None:
             "main calls 'list.reversed' without depending on it; add it to the dependency list: [list.reversed]",
         ),
         (
+            "let total = [] (xs: f32[]) => f32 xs.sum()",
+            "total calls 'list.sum' without depending on it; add it to the dependency list: [list.sum]",
+        ),
+        (
+            "let main = [list.map] () => null {\n    let n = #[2, 1] |> .map([] (x: i64) => i64 x) |> .sum()\n}",
+            "main calls 'list.sum' without depending on it; add it to the dependency list: [list.sum]",
+        ),
+        (
             "let has = [] (xs: i64[]) => bool xs.contains(1)",
             "has calls 'list.contains' without depending on it; add it to the dependency list: [list.contains]",
         ),
@@ -283,6 +297,7 @@ def test_listed_edges(tmp_path: Path, source: str) -> None:
         (TEAM + "let main = [Team.size] () => null {}", "'Team.size' is a dependency of main but never called"),
         (BOX + "let main = [Box.get] () => null {}", "'Box.get' is a dependency of main but never called"),
         ("let main = [list.sorted] () => null {}", "'list.sorted' is a dependency of main but never called"),
+        ("let main = [list.sum] () => null {}", "'list.sum' is a dependency of main but never called"),
         ("let main = [copy] () => null {}", "'copy' is a dependency of main but never called"),
         (
             "let main = [Result.is_ok] () => null {}",
@@ -436,7 +451,13 @@ def test_entries_in_the_editor(tmp_path: Path) -> None:
     ("typed", "offered"),
     [
         ("let f = [Team.", [("solo", "function"), ("size", "method"), ("twice", "method")]),
-        ("let f = [io.printf,\n    list.", [(name, "function") for name in ["contains", "filter", "index_of", "map"]]),
+        (
+            "let f = [io.printf,\n    list.",
+            [
+                (name, "function")
+                for name in ["contains", "filter", "index_of", "map", "reverse", "reversed", "sort", "sorted", "sum"]
+            ],
+        ),
         ("let f = [Result.", [("is_err", "function"), ("is_ok", "function")]),
     ],
 )
@@ -447,6 +468,20 @@ def test_completing_entries(tmp_path: Path, typed: str, offered: list[tuple[str,
     row = source.count("\n") - 1
     completions = _document(tmp_path, source).completions((row, len(source.splitlines()[row])))
     assert [(c.label, c.kind) for c in completions][: len(offered)] == offered
+
+
+def test_sum_in_the_editor(tmp_path: Path) -> None:
+    # `list.sum` is described where it is listed, and offered with what it does.
+    source = "let total = [list.sum] (xs: f64[]) => f64 xs.sum()\n"
+    document = _document(tmp_path, source)
+    assert [d.message for d in document.diagnostics() if d.severity == Severity.ERROR] == []
+    assert document.hover((0, source.index("list.sum") + 6)) == (
+        "```bifrost\nlet sum = () => T\n// a list's function: its items added up (numbers), 0 when it has none\n```"
+    )
+    typed = "let f = [list.s"
+    offered = {c.label: c for c in _document(tmp_path, typed + "\n").completions((0, len(typed)))}
+    assert offered["sum"].detail == "sum = () => T"
+    assert offered["sum"].documentation == "its items added up (numbers), 0 when it has none"
 
 
 def test_completing_copy_in_a_list(tmp_path: Path) -> None:
