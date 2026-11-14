@@ -582,6 +582,7 @@ def test_completions_carry_documentation() -> None:
         "shift": "Move `p` right by `by` pixels",
         "channel": sync.FUNCTIONS["channel"],  # the prelude's, called in a body
         "condvar": sync.FUNCTIONS["condvar"],
+        "spawn": sync.SPAWN,
     }
 
 

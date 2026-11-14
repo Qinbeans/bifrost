@@ -34,7 +34,22 @@ needed to call them, a function lists them (``[channel]``, ``[condvar]``),
 and a name of the file hides them. The type of the messages comes from where
 the channel goes: ``let jobs: sync.Channel[i32] = channel(4)``, or a returned
 one, from the function's result type.
+
+Threads: ``spawn(work(jobs))`` runs ``work(jobs)`` on a new OS thread, and
+gives a ``sync.Thread[R]`` (``R`` is what ``work`` returns). ``await t``
+gives its result: in code that is not async, the caller waits there until
+the thread is done (only if it is not done yet); in an async function, only
+that task pauses, and the event loop runs the others meanwhile. A thread is
+awaited, or let go on purpose with ``tasks.ignore(t)`` (its result, which
+must own nothing, is dropped); one that is neither is a compile error.
+``spawn`` is the prelude's, like ``channel`` (``[spawn]``). What the call is
+given moves into the thread: owned values (the thread frees them when the
+call returns), copies, and another owner of each ``mem.Atomic`` and channel.
+A ``mem.Shared`` (one thread's) and a ``mem.Weak`` (a lend, which cannot
+outlive its call) cannot be given to one.
 """
+
+from mlir_python.lang import Fn, Token, i64, ptr
 
 from bifrost.std.mem import Container
 
@@ -61,4 +76,50 @@ FUNCTIONS = {
     CONDVAR_FUNCTION: "a new sync.CondVar: a sync.Channel with one slot",
 }
 
-__all__ = ["CHANNEL", "CHANNEL_FUNCTION", "CONDVAR", "CONDVAR_FUNCTION", "CONTAINERS", "FUNCTIONS"]
+# The prelude's function that starts a thread: `let t = spawn(work(jobs))`.
+SPAWN_FUNCTION = "spawn"
+SPAWN = "runs a call of a function that is not async on a new OS thread; `await` the thread for its result"
+THREAD = "sync.Thread"
+
+
+# What a spawn compiles to: thread_runtime.c (and, for `await t` in async code, async_runtime.c).
+def thread_new(result: i64, arguments: i64) -> ptr: ...
+def thread_result(thread: ptr) -> ptr: ...
+def thread_arguments(thread: ptr) -> ptr: ...
+def thread_start(thread: ptr, entry: Fn[[ptr], None]) -> None: ...
+def thread_join(thread: ptr) -> None: ...
+def thread_free(thread: ptr) -> None: ...
+def thread_ignore(thread: ptr) -> None: ...
+def thread_state(thread: ptr) -> ptr: ...
+def async_watch(state: ptr) -> Token: ...
+
+
+THREAD_RUNTIME = {
+    function.__name__: function
+    for function in (
+        thread_new,
+        thread_result,
+        thread_arguments,
+        thread_start,
+        thread_join,
+        thread_free,
+        thread_ignore,
+        thread_state,
+        async_watch,
+    )
+}
+for _name, _function in THREAD_RUNTIME.items():
+    _function.__name__ = f"bifrost_{_name}"
+
+__all__ = [
+    "CHANNEL",
+    "CHANNEL_FUNCTION",
+    "CONDVAR",
+    "CONDVAR_FUNCTION",
+    "CONTAINERS",
+    "FUNCTIONS",
+    "SPAWN",
+    "SPAWN_FUNCTION",
+    "THREAD",
+    "THREAD_RUNTIME",
+]

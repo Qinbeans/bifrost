@@ -41,7 +41,9 @@ _COPY_SUMMARY = "a deep copy of x: a new owner of the lists, strings and functio
 _CHANNEL_MAKERS = {
     sync.CHANNEL_FUNCTION: "channel = (n: i64) => sync.Channel[T]",
     sync.CONDVAR_FUNCTION: "condvar = () => sync.CondVar[T]",
+    sync.SPAWN_FUNCTION: "spawn = (f(...): R) => sync.Thread[R]",
 }
+_PRELUDE_SUMMARIES = {**sync.FUNCTIONS, sync.SPAWN_FUNCTION: sync.SPAWN}
 _LIST = "list"
 _RESULT_METHODS = {
     "is_ok": ("() => bool", "whether it holds a value"),
@@ -964,7 +966,7 @@ class Document:
         owner_name = _name_of(owner) if owner is not None and owner.type == "assignment" else None
         return f"{_text(owner_name)}_{_text(name)}" if owner_name is not None else None
 
-    def _type_of_value(self, value: Node, where: Node) -> str | None:
+    def _type_of_value(self, value: Node, where: Node) -> str | None:  # noqa: PLR0911 - one case per kind
         """Return the type of an expression, for the simple cases: calls, construction, names."""
         if value.type == "local_function_definition":
             return self._signature(value)  # a lambda
@@ -976,10 +978,22 @@ class Document:
         if value.type == "function_call":
             call = _named(value)[0]
             function = call.child_by_field_name("function")
+            if function is not None and self._is_spawn(_text(function), where):
+                return self._type_of_spawn(call, where)
             return self._type_of_call([], _text(function)) if function is not None else None
         if value.type == "child_annotation":
             return self._type_of_chain_call(value, where)
         return None
+
+    def _is_spawn(self, name: str, where: Node) -> bool:
+        """Whether ``name`` is the prelude's ``spawn`` here: no name of this file, or local, hides it."""
+        return name == sync.SPAWN_FUNCTION and self.bindings().get(name) is None and self._local(name, where) is None
+
+    def _type_of_spawn(self, call: Node, where: Node) -> str:
+        """Return what ``spawn(f(x))`` gives: ``sync.Thread[R]``, ``R`` what ``f`` returns."""
+        arguments = [_unwrap(argument) for argument in _named(call) if argument.type == "expression"]
+        result = self._type_of_value(arguments[0], where) if len(arguments) == 1 else None
+        return f"{sync.THREAD}[{result or 'null'}]"
 
     def _type_of_chain_call(self, value: Node, where: Node) -> str | None:
         """Return what ``a.b.f(x)`` gives: a module's or object's function, or a method of a local."""
@@ -2029,7 +2043,7 @@ class Document:
         if name == _COPY and plain and self.bindings().get(_COPY) is None and self._local(_COPY, node) is None:
             return _code(f"{_COPY} = (x: T) => T\n// {_COPY_SUMMARY}")
         if name in _CHANNEL_MAKERS and plain and self.bindings().get(name) is None and self._local(name, node) is None:
-            return _code(f"{_CHANNEL_MAKERS[name]}\n// {sync.FUNCTIONS[name]}")
+            return _code(f"{_CHANNEL_MAKERS[name]}\n// {_PRELUDE_SUMMARIES[name]}")
         if _ancestor(node, "dependency_list") is None and _ancestor(node, "local_dependency_list") is None:
             return None
         if name in _LANGUAGE_OWNERS and plain and self.bindings().get(name) is None:
@@ -2246,10 +2260,10 @@ class Document:
         return found + self._channel_makers()
 
     def _channel_makers(self) -> list[Completion]:
-        """Offer the prelude's ``channel`` and ``condvar``, unless a name of this file hides them."""
+        """Offer the prelude's ``channel``, ``condvar`` and ``spawn``, unless a name of this file hides them."""
         bound = self.bindings()
         return [
-            Completion(name, "function", signature, documentation=sync.FUNCTIONS[name])
+            Completion(name, "function", signature, documentation=_PRELUDE_SUMMARIES[name])
             for name, signature in _CHANNEL_MAKERS.items()
             if name not in bound
         ]

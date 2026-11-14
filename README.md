@@ -312,7 +312,47 @@ let main = [channel, condvar, io.printf] () => null {
 
 The sender returns at once while a slot is free, and waits only when every slot holds an unread message; the receiver takes the oldest message at once if there is one, and waits only when there are none. `channel(0)` (or `channel()`) has no slots: the sender waits until a receiver takes its message. A `sync.CondVar` is a channel with one slot, made by `condvar()`, for one thread to tell another that something happened. Any number of threads send and receive on one channel, and each message goes to exactly one receiver.
 
-A message moves into the channel, so an owned value sent is not used again, and the receiver owns what it receives; numbers, booleans, strings and records of those are copied. A `mem.Atomic` can be sent (the channel holds another owner of it until it is received), but not a `mem.Weak`, a lend that cannot outlive its call, or a `mem.Shared`, which is one thread's. A channel has several owners, counted atomically like a `mem.Atomic`'s, and the last one frees it with the messages still queued; it is passed to C's `void *` (a thread's argument) as is. `channel` and `condvar` are the language's own, like `copy`: they need no import, and a function lists them (`[channel]`). Sending and receiving wait, so they are errors in an `async` function (they would stall the event loop) and while a guard is held (the thread at the other end may need it).
+A message moves into the channel, so an owned value sent is not used again, and the receiver owns what it receives; numbers, booleans, strings and records of those are copied. A `mem.Atomic` can be sent (the channel holds another owner of it until it is received), but not a `mem.Weak`, a lend that cannot outlive its call, or a `mem.Shared`, which is one thread's. A channel has several owners, counted atomically like a `mem.Atomic`'s, and the last one frees it with the messages still queued; it is passed to a thread (see Threads) or to C's `void *` as is. `channel` and `condvar` are the language's own, like `copy`: they need no import, and a function lists them (`[channel]`). Sending and receiving wait, so they are errors in an `async` function (they would stall the event loop) and while a guard is held (the thread at the other end may need it).
+
+### Threads
+
+`spawn(f(x))` runs `f(x)` on a new OS thread, and `await` gives its result:
+
+```bifrost
+let io = import("std:stdio")
+let sync = import("std:sync")
+
+let produce = (jobs: sync.Channel[i64], count: i64) => null {
+    let i = 0
+    while i < count {
+        i -> jobs
+        let i = i + 1
+    }
+}
+
+let total = (jobs: sync.Channel[i64], count: i64) => i64 {
+    let sum = 0
+    let i = 0
+    while i < count {
+        let job <- jobs
+        let sum = sum + job
+        let i = i + 1
+    }
+    return sum
+}
+
+let main = [spawn, produce, total, channel, io.printf] () => null {
+    let jobs: sync.Channel[i64] = channel(4)
+    let sender = spawn(produce(jobs, 100))     // both run now, on threads of their own
+    let summer = spawn(total(jobs, 100))
+    await sender                               // main waits here until the sender is done
+    io.printf("%ld\n", await summer)           // 4950
+}
+```
+
+`spawn` gives a `sync.Thread`, and the function keeps running alongside the caller. In a function that is not `async`, `await t` waits there, and only if the thread is not done yet. In an `async` function only that task pauses: the event loop runs the others meanwhile, so an HTTP handler can hand slow work to a thread without stalling the server. A thread is awaited, or let go on purpose with `tasks.ignore(t)` (its result is dropped, so it must own nothing). A thread that is neither, on some path, is a compile error, as is passing one on, returning it, or keeping it.
+
+What the call is given moves into the thread. An owned value is not used again by the caller, and the thread frees it when the call returns. Numbers, booleans, strings and records of those are copied, and a `mem.Atomic` or a channel gets another owner. A `mem.Weak` (a lend, which could be gone before the thread is) and a `mem.Shared` (one thread's) cannot be given to a thread. The function is one of Bifrost's, and not `async` (an async call is awaited, or run alongside with `tasks.ignore`). `spawn` is the language's own, like `channel`: it needs no import, and a function lists it (`[spawn]`).
 
 ### Formatting and owned strings
 
@@ -653,7 +693,7 @@ let slow = [http.query_int, http.sleep, http.json] async (ctx: http.Context) => 
 }
 ```
 
-The compiler knows which calls pause, so it checks the keywords rather than trusting them: a call that pauses without `await`, an `await` on a call that does not pause, and an `await` outside an `async` function are errors. `main` may be `async` when the project says so, with `type: async` in `config.yaml`'s `package` (the default is `sync`); the program runs it on the event loop and ends when it is done:
+The compiler knows which calls pause, so it checks the keywords rather than trusting them: a call that pauses without `await`, an `await` on a call that does not pause, and an `await` outside an `async` function are errors (except on a thread: see Threads). `main` may be `async` when the project says so, with `type: async` in `config.yaml`'s `package` (the default is `sync`); the program runs it on the event loop and ends when it is done:
 
 ```bifrost
 let time = import("std:time")

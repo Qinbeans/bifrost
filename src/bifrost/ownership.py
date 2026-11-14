@@ -32,6 +32,12 @@ Sending a value to a ``sync.Channel`` (``message -> jobs``) moves it into the
 channel, and receiving one (``let job <- jobs``) makes the receiver its owner.
 A ``mem.Atomic`` sent stays an owner (the channel holds another).
 
+A thread (``let t = spawn(work(xs))``) is an owner too, which ``await t`` or
+``tasks.ignore(t)`` uses up; one that is neither on some path is reported
+where it would be freed. What ``work`` is given moves into the thread (``xs``
+is not used again), and ``let n = await t`` makes ``n`` the owner of the
+result.
+
 A ``mem.Shared`` or ``mem.Atomic`` local (a cell) is an owner too, released
 where its scope ends, but ``let other = counter`` copies it: both are owners,
 and the value lives until the last is released. ``return counter`` still
@@ -93,6 +99,9 @@ class Oracle:
     # For a receive (`let job <- jobs`): what the message is, "owned" (a list, an owned string...),
     # "cell" (a mem.Atomic: another owner of it), or "" (a plain value, copied).
     received: Callable[[Node], str] = lambda _: ""
+    thread: Callable[[Node], bool] = lambda _: False  # does this expression name a thread (`let t = spawn(...)`)?
+    # For `spawn(f(x))`: the arguments of the call it runs (they move into the thread); `None` for other calls.
+    spawned: Callable[[Node], list[Node] | None] = lambda _: None
 
 
 @dataclass
@@ -583,8 +592,11 @@ class _Checker:
 
     # -- expressions ------------------------------------------------------------
 
-    def fresh(self, node: Node) -> bool:
+    def fresh(self, node: Node) -> bool:  # noqa: PLR0911 - one case per kind of expression
         """Whether an expression makes a new list, closure, or record or object holding one."""
+        awaited = _unwrap(node)
+        if awaited.type == "await_expression" and self.oracle.thread(awaited.child_by_field_name("value")):
+            return self.oracle.owned_value(awaited)  # a thread's result: its own
         core = _awaited(node)
         if self.oracle.function_value(core):
             return True
@@ -709,7 +721,9 @@ class _Checker:
             self.captures(node, state)  # its body is a function of its own, checked when it is lowered
             return
         arguments = _call_arguments(node)
-        if node.type == "try_expression":
+        if node.type == "await_expression" and self.oracle.thread(node.child_by_field_name("value")):
+            self.thread(node.child_by_field_name("value"), state, node)
+        elif node.type == "try_expression":
             self.try_(node, state)
         elif arguments is not None:
             self.call(node, arguments, state, owned=owned)
@@ -769,10 +783,14 @@ class _Checker:
                 for argument in _named(_named(part)[0]):
                     self.expression(argument, state)
 
-    def call(self, node: Node, arguments: list[Node], state: _State, *, owned: bool) -> None:
+    def call(self, node: Node, arguments: list[Node], state: _State, *, owned: bool) -> None:  # noqa: C901 - per argument
         """Check a call: its owned result must have an owner, and its moved arguments move."""
         self.cell_result(node, owned=owned)
         if self.built(node, arguments, state):
+            return
+        spawned = self.oracle.spawned(node)
+        if spawned is not None:
+            self.spawn(spawned, state)
             return
         moved = self.oracle.moved_arguments(node)
         callee = _text(node).split("(")[0]
@@ -783,7 +801,9 @@ class _Checker:
                 self.lending(inner, _root(inner), state, what)
         for index, argument in enumerate(arguments):
             inner = _unwrap(argument)
-            if index in moved and inner.type == "identifier" and _text(inner) in state.alive:
+            if self.oracle.thread(inner):
+                self.thread(inner, state, argument)  # `tasks.ignore(t)`
+            elif index in moved and inner.type == "identifier" and _text(inner) in state.alive:
                 self.move(inner, state, argument)
             elif index in moved and self.oracle.owned_value(inner) and not self.oracle.owned_call(inner):
                 raise OwnershipError(inner, self.borrowed(inner, state))  # given away, but not ours to give
@@ -795,6 +815,31 @@ class _Checker:
             self.name(_named(node)[0], state)
             if self.oracle.changes(node):
                 self.changed(node, state)
+
+    def spawn(self, arguments: list[Node], state: _State) -> None:
+        """``spawn(work(xs, c))``: what ``work`` is given moves into the thread; a cell or channel, another owner."""
+        for argument in arguments:
+            inner = _unwrap(argument)
+            if inner.type == "identifier" and _text(inner) in self.cells:
+                self.name(inner, state)
+            elif inner.type == "identifier" and _text(inner) in state.alive:
+                self.move(inner, state, argument)
+            elif self.fresh(inner):
+                self.keep(inner, state)
+            elif self.oracle.owned_value(inner):
+                raise OwnershipError(inner, self.borrowed(inner, state))  # given away, but not ours to give
+            else:
+                self.expression(argument, state)
+
+    def thread(self, value: Node | None, state: _State, where: Node) -> None:
+        """``await t`` or ``tasks.ignore(t)``: the thread ``t`` is used up (``spawn(...)`` itself: checked)."""
+        if value is None:
+            return
+        inner = _unwrap(value)
+        if inner.type == "identifier" and _text(inner) in state.alive:
+            self.move(inner, state, where)
+        else:
+            self.expression(inner, state, owned=True)
 
     def cell_result(self, node: Node, *, owned: bool) -> None:
         """Reject a call returning a ``mem.Shared`` or ``mem.Atomic`` that nothing owns."""

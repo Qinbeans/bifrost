@@ -454,6 +454,9 @@ class _FunctionScope:
         self.cell_parameters: set[str] = set()  # the cells that are parameters (borrowed, never released)
         self.channels: dict[str, object] = {}  # `sync.Channel` parameters and owners -> the type of their messages
         self.channel_result: object = None  # for a function returning a sync.Channel, the type of its messages
+        self.threads: dict[str, ScalarType | None] = {}  # `let t = spawn(f(x))` -> what f returns (None: nothing)
+        self.thread_uses: set[int] = set()  # ids of the names of threads used as they may be: `await t`, ...
+        self.thread_lets: dict[str, Node] = {}  # thread -> its `let`, where a thread never awaited is reported
         self.shared_locals: set[str] = set()  # `let x: mem.Unique[T] = ...` (owned values, lent to calls)
         self.held: dict[str, tuple[Any, object]] = {}  # name -> (its mem container, the type it holds)
         self.types: dict[str, ScalarType | None] = {}  # local -> its type, when the compiler can tell
@@ -2032,6 +2035,8 @@ class SourceUnit:
 
     def _ownership_oracle(self) -> ownership.Oracle:
         def signature(node: Node) -> tuple[bool, set[int]]:
+            if self._spawned(node) is not None:
+                return True, set()  # a thread, awaited (or ignored) by whoever holds it
             callee = self._callee(node)
             if callee in (fmt.FORMAT, json.ENCODE, json.DECODE, form.DECODE):
                 return True, set()
@@ -2066,6 +2071,8 @@ class SourceUnit:
             exhaustive=self._exhaustive,
             channel=self._names_channel,
             received=self._received_kind,
+            thread=self._is_thread,
+            spawned=self._spawned_arguments,
         )
 
     def _names_channel(self, node: Node | None) -> bool:
@@ -2147,6 +2154,7 @@ class SourceUnit:
                     kind = scalar_type(self._type(found[1] if found is not None else declared))
                 else:
                     kind = self._static_type(_children(node)[-1])
+                    self._bind_thread(name, _children(node)[-1])
         except BifrostError:
             return  # reported where it is lowered
         if kind is not None or name not in self._scope.types:
@@ -2229,8 +2237,8 @@ class SourceUnit:
         taken = self._scope.names | self.globals.keys() | self._functions
         if parts == [_COPY] and _COPY not in taken:
             return _COPY
-        if len(parts) == 1 and parts[0] in sync.FUNCTIONS and parts[0] not in taken:
-            return parts[0]  # `[channel]`, `[condvar]`
+        if len(parts) == 1 and parts[0] in {*sync.FUNCTIONS, sync.SPAWN_FUNCTION} and parts[0] not in taken:
+            return parts[0]  # `[channel]`, `[condvar]`, `[spawn]`
         if len(parts) != 2 or (parts[0] in taken and self._names_member(entry, parts)):  # noqa: PLR2004
             return None  # not `list.sorted` (a type and a function), or this file names it (a struct list)
         owner, name = parts
@@ -2475,6 +2483,13 @@ class SourceUnit:
     def _free(self, name: str, node: Node) -> ast.stmt:
         """``free(name)``: the end of an owned string's life (for a cell, the end of one owner's)."""
         assert self._scope is not None
+        if name in self._scope.threads:
+            msg = (
+                f"the thread {name} is never awaited here. Did you forget `await {name}`? "
+                f"If not waiting is deliberate, let it go with `tasks.ignore({name})`"
+            )
+            where = node if node.type in {"return_statement", "try_expression"} else self._scope.thread_lets[name]
+            raise self.error(where, msg)
         if name in self._scope.channels:
             return self._free_channel(name, node)
         if name in self._scope.cells:
@@ -3620,6 +3635,12 @@ class SourceUnit:
         assert self._scope is not None
         name = self._identifier(node)
         qualified = self._qualify(name)
+        if name in self._scope.threads and node.id not in self._scope.thread_uses:
+            msg = (
+                f"{name} is a sync.Thread: wait for its result with `await {name}`, or let it go with "
+                f"`tasks.ignore({name})`; a thread is not passed, returned or kept"
+            )
+            raise self.error(node, msg)
         if name not in self._scope.names:
             self._no_generic_value(self._generic_named(qualified.split(".")), node)
         if qualified in self._functions and name not in self._scope.names:
@@ -4508,9 +4529,11 @@ class SourceUnit:
             return owns(expected)
         return self._makes_new(node)
 
-    def _makes_new(self, node: Node) -> bool:
+    def _makes_new(self, node: Node) -> bool:  # noqa: PLR0911 - one case per kind of expression
         """Whether an expression makes a new value that owns memory, whatever it is put in (see ``_fresh``)."""
         whole = core = _unwrap(node)  # an `await f()` has the type of what it waits for
+        if core.type == "await_expression" and self._is_thread(core.child_by_field_name("value")):
+            return owns(self._static_type(whole))  # a thread's result: its own
         if core.type == "await_expression":
             awaited = core.child_by_field_name("value")
             core = _unwrap(awaited) if awaited is not None else core
@@ -4540,8 +4563,10 @@ class SourceUnit:
             return False
         return self._function_signature(node) is not None
 
-    def _special_call(self, node: Node, name: str, path: list[str] | None) -> ast.expr | None:
-        """Lower ``copy(x)``, ``i32(x)``, ``ok(x)``/``err(e)`` and calls of generics; ``None`` for other calls."""
+    def _special_call(  # noqa: PLR0911 - one case per function of the language's own
+        self, node: Node, name: str, path: list[str] | None
+    ) -> ast.expr | None:
+        """Lower ``copy(x)``, ``i32(x)``, ``ok(x)``/``err(e)``, ``spawn(f(x))`` and calls of generics; else ``None``."""
         if path is None and self._is_copy(name):
             self._depend(_COPY, node.child_by_field_name("function"))
             return self._copy(node)
@@ -4550,6 +4575,9 @@ class SourceUnit:
         if path is None and self._is_channel_maker(name):
             self._depend(name, node.child_by_field_name("function"))
             return self._new_channel(node, name)
+        if path is None and self._is_spawn(name):
+            self._depend(name, node.child_by_field_name("function"))
+            return self._spawn(node)
         if path is None and self._is_conversion(name):
             return self._convert(node, name)
         generic = self._generic_callee(name, path)
@@ -5003,6 +5031,8 @@ class SourceUnit:
         """``await f(x)``: the call must pause, and the function must be ``async``."""
         assert self._scope is not None
         value = _unwrap(node.child_by_field_name("value"))
+        if self._is_thread(value):
+            return self._await_thread(value, node)
         call = _children(value)[-1] if value.type == "child_annotation" else value
         if call.type != "function_call":
             if pipes.is_piped(node):  # `await x |> f` is `(await x) |> f`
@@ -5497,6 +5527,343 @@ class SourceUnit:
         )
         return symbol, target
 
+    # -- threads ---------------------------------------------------------------------
+
+    def _is_spawn(self, name: str) -> bool:
+        """Whether ``name(...)`` is the prelude's ``spawn``: nothing else of that name is in scope."""
+        assert self._scope is not None
+        return name == sync.SPAWN_FUNCTION and name not in (self._scope.names | self.globals.keys() | self._functions)
+
+    def _spawned(self, node: Node | None) -> Node | None:
+        """For ``spawn(f(x))`` (the prelude's), its call (a ``user_function_call``); ``None`` for anything else."""
+        if node is None or self._scope is None:
+            return None
+        node = _unwrap(node)
+        inner = _children(node)[0] if node.type == "function_call" else None
+        function = (
+            inner.child_by_field_name("function") if inner is not None and inner.type == "user_function_call" else None
+        )
+        return inner if function is not None and self._is_spawn(_text(function)) else None
+
+    def _is_thread(self, node: Node | None) -> bool:
+        """Whether ``node`` is a thread: ``spawn(f(x))``, or a local holding one."""
+        if node is None or self._scope is None:
+            return False
+        inner = _unwrap(node)
+        if inner.type == "identifier":
+            return _text(inner) in self._scope.threads
+        return self._spawned(inner) is not None
+
+    def _thread_result(self, node: Node) -> ScalarType | None:
+        """Return what awaiting the thread ``node`` gives: what its function returns (``None``: nothing)."""
+        assert self._scope is not None
+        inner = _unwrap(node)
+        if inner.type == "identifier":
+            return self._scope.threads[_text(inner)]
+        spawned = self._spawned(inner)
+        assert spawned is not None
+        _, callee, _ = self._spawn_target(spawned)
+        return self._call_signature(callee)[0]
+
+    def _bind_thread(self, name: str, value: Node) -> None:
+        """Note a local holding a thread: ``let t = spawn(f(x))``, or ``let u = t`` (``t`` moves to ``u``)."""
+        assert self._scope is not None
+        inner = _unwrap(value)
+        if not self._is_thread(inner):
+            self._scope.threads.pop(name, None)
+            return
+        if inner.type == "identifier":
+            self._scope.thread_uses.add(inner.id)
+        self._scope.threads[name] = self._thread_result(inner)
+        let = value.parent
+        assert let is not None
+        self._scope.thread_lets[name] = let
+
+    def _spawned_arguments(self, node: Node) -> list[Node] | None:
+        """For ``spawn(f(x))``, the arguments of the call it runs, which move into the thread; else ``None``."""
+        spawned = self._spawned(node)
+        if spawned is None:
+            return None
+        try:
+            value, _, _ = self._spawn_target(spawned)
+        except BifrostError:
+            return None  # reported where it is lowered
+        return self._spawn_arguments(_unwrap(value))
+
+    @staticmethod
+    def _spawn_arguments(call: Node) -> list[Node]:
+        """Return the arguments of the call ``f(x)`` (or ``module.f(x)``) a spawn runs."""
+        function_call = _children(call)[-1] if call.type == "child_annotation" else call
+        return [argument for argument in _children(_children(function_call)[0]) if argument.type == "expression"]
+
+    def _spawn_target(self, call: Node) -> tuple[Node, object, str]:
+        """Check what ``spawn`` is given; return the call it runs, what that calls, and its name as written."""
+        assert self._scope is not None
+        arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
+        if len(arguments) != 1 or arguments[0].type != "expression":
+            raise self.error(call, "spawn takes one call to run on a new thread: spawn(work(jobs))")
+        value = arguments[0]
+        inner = _unwrap(value)
+        what = _text(inner).split("(")[0]
+        named = inner.type == "function_call" or (
+            inner.type == "child_annotation"
+            and _children(inner)[-1].type == "function_call"
+            and all(part.type == "simple_identifier" for part in _children(inner)[:-1])
+            and _text(_children(inner)[0]) not in self._scope.names  # `module.f(x)`, not a method of a local
+        )
+        callee = self._callee(inner) if named else None
+        here = isinstance(callee, str) and callee in self._function_nodes
+        if not here and not (isinstance(callee, Function) and callee.kind != "extern"):
+            msg = (
+                f"spawn runs a call of a Bifrost function on a new thread, like spawn(work(jobs)); {what} is not one"
+                " (to run a method, a lambda or a C function, call it in a function of this file, and spawn that)"
+            )
+            raise self.error(inner, msg)
+        if self._pauses(callee):
+            msg = (
+                f"{what} is async, and spawn runs a function that is not async on a thread of its own; "
+                f"await {what}(...), or run it alongside with tasks.ignore({what}(...))"
+            )
+            raise self.error(inner, msg)
+        return value, callee, what
+
+    def _spawn(self, call: Node) -> ast.expr:
+        """``spawn(work(jobs))``: run ``work(jobs)`` on a new OS thread; the thread (a pointer) is its value.
+
+        The arguments go in the thread's block (thread_runtime.c), as one record, after the
+        result; a function generated for this spawn (its entry) reads them on the new
+        thread, calls ``work``, stores the result, and frees what the thread owned: the
+        owned values moved in, and its owners of each mem.Atomic and channel.
+        """
+        assert self._scope is not None
+        value, callee, what = self._spawn_target(call)
+        whole = self._call_expression(call)
+        around = whole.parent
+        while around is not None and around.type in {"expression", "parenthesized_expression"}:
+            around = around.parent
+        if _is_statement(whole) and around is not None and around.type == "block_expression":
+            msg = (
+                f"spawn(...) gives the thread running {what}(...); wait for it, `await spawn(...)`, or keep it to "
+                "wait for later, `let t = spawn(...)`, or let it go, `tasks.ignore(spawn(...))`"
+            )
+            raise self.error(call, msg)
+        result, parameters, pointees = self._call_signature(callee)
+        moved = self._moved_parameters(callee)
+        arguments = self._spawn_arguments(_unwrap(value))
+        given = self._spawn_given(arguments, pointees, what)
+        for argument in arguments:
+            if owns(self._static_type(argument)):
+                self._keep(_unwrap(argument))  # it moves into the thread: not freed after the statement
+        lowered = self._owned_expression(value)
+        if not isinstance(lowered, ast.Call) or len(lowered.args) != len(arguments) or lowered.keywords:
+            raise self.error(value, f"spawn passes {what} its arguments by position: spawn({what}(a, b))")
+        self.project.threads = True
+        self._scope.temporaries += 1
+        prefix = f"__bifrost_thread_{self._scope.temporaries}"
+
+        def name(identifier: str, context: ast.expr_context | None = None) -> ast.Name:
+            return self._at(ast.Name(identifier, context or ast.Load()), call)
+
+        def runtime(function: str, *passed: ast.expr) -> ast.Call:
+            extern = self.project.runtime_extern(sync.THREAD_RUNTIME[function])
+            return self._at(ast.Call(self._at(self._global(extern, "thread"), call), list(passed), []), call)
+
+        fields = tuple((f"argument_{index}", kind) for index, kind in enumerate(parameters))
+        record = self._record_type(fields) if fields else None
+        sizes = [
+            ast.Constant(scalar_type(result).size if result is not None else 0),
+            ast.Constant(scalar_type(record).size if record is not None else 0),
+        ]
+        made = runtime("thread_new", *sizes)
+        statements: list[ast.stmt] = [self._at(ast.Assign([name(prefix, ast.Store())], made), call)]
+        for argument in given:  # the thread's own owner of each cell and channel
+            statements.append(self._cell_statement("retain", argument, call))
+        if record is not None:
+            slot = self._at(
+                ast.Call(self._global(Ptr[record], "type"), [runtime("thread_arguments", name(prefix))], []), call
+            )
+            values = [ast.keyword(field, argument) for (field, _), argument in zip(fields, lowered.args, strict=True)]
+            built = self._at(ast.Call(self._global(record, "record"), [], values), call)
+            statements.append(self._at(ast.Assign([ast.Subscript(slot, ast.Constant(0), ast.Store())], built), call))
+        entry = self._thread_entry(call, lowered.func, (result, parameters, pointees), (record, moved))
+        statements.append(self._at(ast.Expr(runtime("thread_start", name(prefix), name(entry))), call))
+        self._scope.before.extend(statements)
+        return name(prefix)
+
+    def _moved_parameters(self, callee: object) -> set[int]:
+        """Return the parameters of ``callee`` that take what they are given (a ``mem.Unique[str]``): it frees them."""
+        if isinstance(callee, str):
+            return self._owned_signatures.get(callee, (False, set()))[1]
+        assert isinstance(callee, Function)
+        return self.project.owned_signatures.get(callee.name, (False, set()))[1]
+
+    def _spawn_given(self, arguments: list[Node], pointees: list[object | None], what: str) -> list[str]:
+        """Check what a spawn's call is given; return the cells and channels, of which the thread holds an owner."""
+        assert self._scope is not None
+        given: list[str] = []
+        for index, argument in enumerate(arguments):
+            pointee = pointees[index] if index < len(pointees) else None
+            inner = _unwrap(argument)
+            if pointee is not None and not isinstance(pointee, _Cell):
+                msg = (
+                    f"{what} borrows {_text(inner)} (a mem.Weak), which a thread could still use after it is gone; "
+                    "give the thread a mem.Atomic, a channel, or a value of its own"
+                )
+                raise self.error(inner, msg)
+            if not isinstance(pointee, _Cell):
+                continue
+            if pointee.container is mem.SHARED:
+                msg = (
+                    f"{what} takes a mem.Shared, which is one thread's: its owners are not counted atomically; "
+                    "make it a mem.Atomic to share it with a thread"
+                )
+                raise self.error(inner, msg)
+            name = _text(inner) if inner.type == "identifier" else None
+            if name is None or name not in self._scope.cells:
+                raise self.error(inner, f"spawn gives {what} an owner of {_text(inner)}; name it first: let c = ...")
+            given.append(name)
+        return given
+
+    def _thread_entry(
+        self,
+        call: Node,
+        function: ast.expr,
+        signature: tuple[ScalarType | None, list[object], list[object | None]],
+        arguments: tuple[type | None, set[int]],
+    ) -> str:
+        """Define what a spawned thread runs: read the arguments, call the function, store the result, free.
+
+        Return its name. It runs on the new thread, so it frees what the thread was given:
+        each owned value the function only borrowed (``moved``: those it took, and frees
+        itself), and its owner of each cell and channel.
+        """
+        assert self._scope is not None
+        result, parameters, pointees = signature
+        record, moved = arguments
+        row, column = call.start_point
+        symbol = f"{self._scope.symbol}_spawn_{row + 1}_{column}"
+
+        def name(identifier: str, context: ast.expr_context | None = None) -> ast.Name:
+            return self._at(ast.Name(identifier, context or ast.Load()), call)
+
+        def runtime(function_name: str, *passed: ast.expr) -> ast.Call:
+            extern = self.project.runtime_extern(sync.THREAD_RUNTIME[function_name])
+            return self._at(ast.Call(self._at(self._global(extern, "thread"), call), list(passed), []), call)
+
+        body: list[ast.stmt] = []
+        names = [f"__bifrost_argument_{index}" for index in range(len(parameters))]
+        if record is not None:
+            where = runtime("thread_arguments", name("__bifrost_thread"))
+            slot = ast.Call(self._global(Ptr[record], "type"), [where], [])
+            read = ast.Subscript(slot, ast.Constant(0), ast.Load())
+            body.append(self._at(ast.Assign([name("__bifrost_given", ast.Store())], read), call))
+            for index, argument in enumerate(names):
+                read = ast.Attribute(name("__bifrost_given"), f"argument_{index}", ast.Load())
+                body.append(self._at(ast.Assign([name(argument, ast.Store())], read), call))
+        made = ast.Call(_copy_tree(function), [name(argument) for argument in names], [])
+        if result is None:
+            body.append(self._at(ast.Expr(made), call))
+        else:
+            slot = ast.Call(self._global(Ptr[result], "type"), [runtime("thread_result", name("__bifrost_thread"))], [])
+            body.append(self._at(ast.Assign([ast.Subscript(slot, ast.Constant(0), ast.Store())], made), call))
+        outer = self._scope
+        self._scope = _FunctionScope(symbol, set(names), symbol)  # for the frees, which keep temporaries
+        try:
+            for index, (argument, kind) in enumerate(zip(names, parameters, strict=True)):
+                pointee = pointees[index] if index < len(pointees) else None
+                if isinstance(pointee, _Cell) and pointee.container is sync.CHANNEL:
+                    self._scope.channels[argument] = pointee.held
+                    self._scope.cells[argument] = sync.CHANNEL
+                    self._scope.held[argument] = (sync.CHANNEL, pointee.held)
+                    body.append(self._free_channel(argument, call))
+                elif isinstance(pointee, _Cell):
+                    body.append(self._release_cell(name(argument), pointee.container, pointee.held, call))
+                elif index not in moved and owns(scalar_type(kind)):
+                    body.append(self._drop(name(argument), scalar_type(kind), call))
+        finally:
+            self._scope = outer
+        definition = self._at(
+            ast.FunctionDef(
+                name=symbol,
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[self._at(ast.arg("__bifrost_thread"), call)],
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    defaults=[],
+                ),
+                body=[self._at(statement, call) for statement in body],
+                decorator_list=[],
+                type_params=[],
+            ),
+            call,
+        )
+        self.globals[symbol] = self.project.program.function(
+            self._compile(definition, {"__bifrost_thread": ptr, "return": type(None)})
+        )
+        return symbol
+
+    def _await_thread(self, value: Node, node: Node) -> ast.expr:
+        """``await t``: the thread's result, once it is done.
+
+        In code that is not async the caller waits there; in an async function only this
+        task pauses (the event loop watches the thread, and runs the other tasks meanwhile).
+        """
+        assert self._scope is not None
+        inner = _unwrap(value)
+        if inner.type == "identifier":
+            self._scope.thread_uses.add(inner.id)
+        result = self._thread_result(inner)
+        thread = self._expression(value)
+        self._scope.temporaries += 1
+        prefix = f"__bifrost_awaited_{self._scope.temporaries}"
+
+        def name(identifier: str, context: ast.expr_context | None = None) -> ast.Name:
+            return self._at(ast.Name(identifier, context or ast.Load()), node)
+
+        def runtime(function: str, *passed: ast.expr) -> ast.Call:
+            extern = self.project.runtime_extern(sync.THREAD_RUNTIME[function])
+            return self._at(ast.Call(self._at(self._global(extern, "thread"), node), list(passed), []), node)
+
+        statements: list[ast.stmt] = [self._at(ast.Assign([name(prefix, ast.Store())], thread), node)]
+        if self._scope.is_async:
+            watched = runtime("async_watch", runtime("thread_state", name(prefix)))
+            statements.append(self._at(ast.Expr(self._at(ast.Await(watched), node)), node))
+        statements.append(self._at(ast.Expr(runtime("thread_join", name(prefix))), node))
+        if result is not None:
+            slot = ast.Call(self._global(Ptr[result], "type"), [runtime("thread_result", name(prefix))], [])
+            read = self._at(ast.Subscript(self._at(slot, node), ast.Constant(0), ast.Load()), node)
+            statements.append(self._at(ast.Assign([name(f"{prefix}_result", ast.Store())], read), node))
+        statements.append(self._at(ast.Expr(runtime("thread_free", name(prefix))), node))
+        self._scope.before.extend(statements)
+        if result is None:
+            if not _is_statement(node):
+                raise self.error(node, "this thread's function returns nothing, so `await` gives nothing here")
+            return self._at(ast.Constant(0), node)  # a statement: its value is never read
+        if owns(result) and _unwrap(node).id not in self._owning:
+            return self._temporary(name(f"{prefix}_result"), result, node)  # only lent: freed after the statement
+        return name(f"{prefix}_result")
+
+    def _ignored_thread(self, call: Node) -> ast.expr | None:
+        """``tasks.ignore(t)``: let a thread run on, nothing waiting for it; ``None`` if it is given no thread."""
+        assert self._scope is not None
+        arguments = [argument for argument in _children(call) if argument.type == "expression"]
+        if len(arguments) != 1 or not self._is_thread(arguments[0]):
+            return None
+        inner = _unwrap(arguments[0])
+        if inner.type == "identifier":
+            self._scope.thread_uses.add(inner.id)
+        result = self._thread_result(inner)
+        if owns(result):
+            msg = (
+                f"this thread's function returns {_shown(result)}, which tasks.ignore would leak; "
+                "wait for it with `await` (or return something that owns nothing)"
+            )
+            raise self.error(inner, msg)
+        extern = self.project.runtime_extern(sync.THREAD_RUNTIME["thread_ignore"])
+        function = self._at(self._global(extern, "thread"), call)
+        return self._at(ast.Call(function, [self._expression(arguments[0])], []), call)
+
     def _ignored_call(self, call: Node) -> tuple[Node, list[object]]:
         """Check the argument of ``tasks.ignore``; return the call and its parameter types."""
         arguments = [argument for argument in _children(call) if argument.type in {"expression", "named_argument"}]
@@ -5535,6 +5902,9 @@ class SourceUnit:
     def _ignore(self, call: Node) -> ast.expr:
         """``tasks.ignore(log("done"))``: start a call and let go of its token, not waiting for it."""
         assert self._scope is not None
+        thread = self._ignored_thread(call)
+        if thread is not None:
+            return thread
         value, parameters = self._ignored_call(call)
         symbol, target = self._task_function(value, "ignore", None, parameters)
         self._scope.temporaries += 1
@@ -5554,6 +5924,8 @@ class SourceUnit:
     def _await_type(self, node: Node) -> ScalarType | None:
         """Return the type of ``await x``: a gather's record, or what the awaited call returns."""
         value = _unwrap(node.child_by_field_name("value"))
+        if self._is_thread(value):
+            return self._thread_result(value)
         if self._callee(value) is not tasks.GATHER:
             return self._static_type(value)
         call = _children(_children(value)[-1])[0]
@@ -5687,6 +6059,8 @@ class SourceUnit:
             return scalar_type(_PRIMITIVES[name])
         if self._scope is not None and self._is_result_constructor(name):
             return self._expected_values.get(node.id)  # the Result written where it goes
+        if self._scope is not None and self._is_spawn(name):
+            return scalar_type(ptr)  # a sync.Thread: what `await` gives is `_await_type`'s
         if self._scope is not None and self._is_copy(name):
             copied = [argument for argument in _children(_children(node)[0]) if argument.type == "expression"]
             return self._static_type(copied[0]) if len(copied) == 1 else None

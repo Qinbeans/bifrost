@@ -14,6 +14,12 @@
  * bifrost_async_next_timer(), and bifrost_async_run_ready() fires those due. With
  * no event loop, blocking code sleeps until the next timer.
  *
+ * And it watches threads (`await t` on a sync.Thread, in async code): a thread ends on
+ * its own OS thread, which may not touch anything here, so it only sets its state, and
+ * the loop checks the states it watches each time it runs ready coroutines, completing
+ * the tokens of the threads that ended. While it watches one, the loop waits at most
+ * a millisecond at a time.
+ *
  * Everything runs on the thread that runs the event loop, so nothing is locked.
  * Bifrost compiles this file with the program's linker and links it in when the
  * program uses async.
@@ -49,8 +55,16 @@ typedef struct Timer {
     struct Timer *next; /* timers are kept sorted by deadline */
 } Timer;
 
+/* A token completed when a thread's state (thread_runtime.c) is no longer RUNNING (0). */
+typedef struct Watch {
+    int64_t *state;
+    struct Object *token;
+    struct Watch *next;
+} Watch;
+
 static Waiter *ready_head, *ready_tail;
 static Timer *timers;
+static Watch *watched;
 static void (*poller)(void *);
 static void *poller_context;
 
@@ -168,16 +182,51 @@ void *bifrost_time_sleep(int64_t milliseconds)
 /* Milliseconds since some fixed point: for measuring time. */
 int64_t bifrost_time_now(void) { return now_ms(); }
 
+/* -- threads ----------------------------------------------------------------------- */
+
+/* `await t` on a thread, in async code: a token that completes once `*state` is not 0. */
+void *bifrost_async_watch(int64_t *state)
+{
+    Object *token = mlirAsyncRuntimeCreateToken();
+    Watch *watch = allocate(sizeof(Watch));
+    watch->state = state;
+    watch->token = token;
+    watch->next = watched;
+    watched = watch;
+    return token;
+}
+
+/* Complete the tokens of the watched threads that ended. */
+static void check_threads(void)
+{
+    Watch **at = &watched;
+    while (*at != NULL) {
+        Watch *watch = *at;
+        if (__atomic_load_n(watch->state, __ATOMIC_ACQUIRE) == 0) {
+            at = &watch->next;
+            continue;
+        }
+        *at = watch->next;
+        mlirAsyncRuntimeEmplaceToken(watch->token);
+        free(watch);
+    }
+}
+
 /* -- for event loops ---------------------------------------------------------------- */
 
 /* Milliseconds until the next timer is due (0 if one is), or -1 if there is none:
-   an event loop waits at most this long for events. */
+   an event loop waits at most this long for events. While threads are watched, at
+   most 1: their ends are noticed by checking. */
 int64_t bifrost_async_next_timer(void)
 {
-    if (timers == NULL)
-        return -1;
-    int64_t left = timers->deadline - now_ms();
-    return left > 0 ? left : 0;
+    int64_t left = -1;
+    if (timers != NULL) {
+        left = timers->deadline - now_ms();
+        left = left > 0 ? left : 0;
+    }
+    if (watched != NULL && (left < 0 || left > 1))
+        left = 1;
+    return left;
 }
 
 /* Run the coroutines that are ready (and those whose timers are due), including
@@ -185,6 +234,7 @@ int64_t bifrost_async_next_timer(void)
 void bifrost_async_run_ready(void)
 {
     fire_timers();
+    check_threads();
     while (ready_head != NULL) {
         Waiter *waiter = ready_head;
         ready_head = waiter->next;

@@ -152,6 +152,7 @@ class Project:
         self.files = Files(self.program, self.drops, self.owned_signatures)
         # The placeholders std:math's calls lower to, until LowerMath makes them math operations.
         self.math = Placeholders(self.program)
+        self.threads = False  # whether the program spawns a thread: then it links std/thread_runtime.c
         # A list's own functions (xs.map(f), g.sort()), generated per element type.
         self.list_methods = ListMethods(self.drops)
         # C symbol -> a function of a runtime Bifrost links in, declared when first called.
@@ -353,6 +354,8 @@ class Project:
         runtimes = [self._c_runtime("decode_runtime")] if self.decoders.used else []
         if self.files.used:
             runtimes.append(self._c_runtime("fs_runtime"))
+        if self.threads:
+            runtimes.append(self._c_runtime("thread_runtime"))
         async_runtime = self._async_runtime() if self.pausing or self._returns_tokens() else None
         output = self.config.path / self.config.package.name
         level = self.config.flags.optimization
