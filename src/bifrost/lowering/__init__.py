@@ -5619,16 +5619,13 @@ class SourceUnit:
                 " (to run a method, a lambda or a C function, call it in a function of this file, and spawn that)"
             )
             raise self.error(inner, msg)
-        if self._pauses(callee):
-            msg = (
-                f"{what} is async, and spawn runs a function that is not async on a thread of its own; "
-                f"await {what}(...), or run it alongside with tasks.ignore({what}(...))"
-            )
-            raise self.error(inner, msg)
         return value, callee, what
 
     def _spawn(self, call: Node) -> ast.expr:
         """``spawn(work(jobs))``: run ``work(jobs)`` on a new OS thread; the thread (a pointer) is its value.
+
+        An async function runs to the end on the thread's own event loop (a plain function
+        calling one runs it so, as ``main`` runs an async ``main``).
 
         The arguments go in the thread's block (thread_runtime.c), as one record, after the
         result; a function generated for this spawn (its entry) reads them on the new
@@ -5651,12 +5648,7 @@ class SourceUnit:
         moved = self._moved_parameters(callee)
         arguments = self._spawn_arguments(_unwrap(value))
         given = self._spawn_given(arguments, pointees, what)
-        for argument in arguments:
-            if owns(self._static_type(argument)):
-                self._keep(_unwrap(argument))  # it moves into the thread: not freed after the statement
-        lowered = self._owned_expression(value)
-        if not isinstance(lowered, ast.Call) or len(lowered.args) != len(arguments) or lowered.keywords:
-            raise self.error(value, f"spawn passes {what} its arguments by position: spawn({what}(a, b))")
+        lowered = self._spawned_call(value, callee, arguments, what)
         self.project.threads = True
         self._scope.temporaries += 1
         prefix = f"__bifrost_thread_{self._scope.temporaries}"
@@ -5689,6 +5681,28 @@ class SourceUnit:
         statements.append(self._at(ast.Expr(runtime("thread_start", name(prefix), name(entry))), call))
         self._scope.before.extend(statements)
         return name(prefix)
+
+    def _spawned_call(self, value: Node, callee: object, arguments: list[Node], what: str) -> ast.Call:
+        """Lower the call a spawn runs, in the caller: its function, and the arguments that move into the thread.
+
+        An async function's call is not awaited here: the thread runs it to the end, on an
+        event loop of its own.
+        """
+        assert self._scope is not None
+        for argument in arguments:
+            if owns(self._static_type(argument)):
+                self._keep(_unwrap(argument))  # it moves into the thread: not freed after the statement
+        pauses = self._pauses(callee)
+        if pauses:
+            inner = _unwrap(value)
+            function_call = _children(inner)[-1] if inner.type == "child_annotation" else inner
+            self._scope.awaited.add(_children(function_call)[0].id)
+        lowered = self._owned_expression(value)
+        if pauses and isinstance(lowered, ast.Await):
+            lowered = lowered.value
+        if not isinstance(lowered, ast.Call) or len(lowered.args) != len(arguments) or lowered.keywords:
+            raise self.error(value, f"spawn passes {what} its arguments by position: spawn({what}(a, b))")
+        return lowered
 
     def _moved_parameters(self, callee: object) -> set[int]:
         """Return the parameters of ``callee`` that take what they are given (a ``mem.Unique[str]``): it frees them."""

@@ -20,7 +20,10 @@
  * the tokens of the threads that ended. While it watches one, the loop waits at most
  * a millisecond at a time.
  *
- * Everything runs on the thread that runs the event loop, so nothing is locked.
+ * Everything runs on the thread that runs the event loop, so nothing is locked. Each OS
+ * thread has a loop of its own (the state below is thread-local): a thread spawned to run
+ * an async function (`spawn(fetch(x))`) runs it to the end on its loop, and its tasks,
+ * timers and tokens never leave it.
  * Bifrost compiles this file with the program's linker and links it in when the
  * program uses async.
  */
@@ -62,11 +65,11 @@ typedef struct Watch {
     struct Watch *next;
 } Watch;
 
-static Waiter *ready_head, *ready_tail;
-static Timer *timers;
-static Watch *watched;
-static void (*poller)(void *);
-static void *poller_context;
+static _Thread_local Waiter *ready_head, *ready_tail;
+static _Thread_local Timer *timers;
+static _Thread_local Watch *watched;
+static _Thread_local void (*poller)(void *);
+static _Thread_local void *poller_context;
 
 static void *allocate(size_t size)
 {

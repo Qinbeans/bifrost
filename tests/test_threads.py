@@ -299,6 +299,69 @@ let main = [spawn, slow, tick, tasks.ignore, io.printf] async () => null {
     assert _run(program).stdout == "tick\ntick\ntick\ngot 42\n"
 
 
+LATER = """
+let later = [time.sleep] async (n: i64) => i64 {
+    await time.sleep(150)
+    return n * 2
+}
+"""
+
+
+def test_an_async_function_runs_on_its_threads_own_event_loop(tmp_path: Path) -> None:
+    # main is not async: each thread runs `later` to the end on a loop of its own, at the same time.
+    program = _build(
+        tmp_path,
+        LATER
+        + """
+let main = [spawn, later, time.now, io.printf] () => null {
+    let start = time.now()
+    let a = spawn(later(1))
+    let b = spawn(later(2))
+    let c = spawn(later(3))
+    let sum = await a + await b + await c
+    io.printf("%ld %d\\n", sum, time.now() - start < 400)
+}
+""",
+    )
+    assert _run(program).stdout == "12 1\n"  # three sleeps of 150 ms, together: not 450 ms
+
+
+def test_an_async_main_spawns_an_async_function(tmp_path: Path) -> None:
+    program = _build(
+        tmp_path,
+        LATER
+        + """
+let tick = [time.sleep, io.puts] async () => null {
+    let i = 0
+    while i < 3 {
+        await time.sleep(20)
+        io.puts("tick")
+        let i = i + 1
+    }
+}
+
+let main = [spawn, later, tick, io.printf] async () => null {
+    let t = spawn(later(21))
+    await tick()
+    io.printf("got %ld\\n", await t)
+}
+""",
+        "async",
+    )
+    assert _run(program).stdout == "tick\ntick\ntick\ngot 42\n"
+
+
+@pytest.mark.skipif(shutil.which("valgrind") is None, reason="needs valgrind")
+def test_event_loops_on_threads_leave_nothing_behind(tmp_path: Path) -> None:
+    _valgrind(
+        _build(
+            tmp_path,
+            LATER + "let main = [spawn, later, io.printf] () => null {\n"
+            '    io.printf("%ld\\n", await spawn(later(1)))\n}\n',
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("body", "message"),
     [
@@ -345,11 +408,6 @@ let main = [spawn, slow, tick, tasks.ignore, io.printf] async () => null {
             "let main = [spawn, bump] () => null {\n    let c: mem.Atomic[i64] = 1\n    let g <- c\n"
             "    await spawn(bump(c))\n    g -> c\n}\n",
             "c is locked by g (line 48); use g until `g -> c`",
-        ),
-        (
-            "let fetch = [] async (n: i64) => i64 {\n    return n\n}\n"
-            "let main = [spawn, fetch] () => null {\n    await spawn(fetch(1))\n}\n",
-            "fetch is async, and spawn runs a function that is not async on a thread of its own",
         ),
         (
             "let names = (n: i64) => i64[] {\n    return #[n]\n}\n"

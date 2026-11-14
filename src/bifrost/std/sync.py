@@ -35,7 +35,8 @@ and a name of the file hides them. The type of the messages comes from where
 the channel goes: ``let jobs: sync.Channel[i32] = channel(4)``, or a returned
 one, from the function's result type.
 
-Threads: ``spawn(work(jobs))`` runs ``work(jobs)`` on a new OS thread, and
+Threads: ``spawn(work(jobs))`` runs ``work(jobs)`` on a new OS thread (an
+async ``work`` on an event loop of that thread's own, to the end), and
 gives a ``sync.Thread[R]`` (``R`` is what ``work`` returns). ``await t``
 gives its result: in code that is not async, the caller waits there until
 the thread is done (only if it is not done yet); in an async function, only
@@ -78,7 +79,7 @@ FUNCTIONS = {
 
 # The prelude's function that starts a thread: `let t = spawn(work(jobs))`.
 SPAWN_FUNCTION = "spawn"
-SPAWN = "runs a call of a function that is not async on a new OS thread; `await` the thread for its result"
+SPAWN = "runs a call on a new OS thread (an async one on its own event loop); `await` the thread for its result"
 THREAD = "sync.Thread"
 
 
