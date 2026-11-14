@@ -6,6 +6,8 @@ installed. In async code, ``await t`` pauses only the task waiting: another task
 ticks while the thread works.
 """
 
+import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,7 +18,50 @@ from bifrost.configs import Config
 from bifrost.lowering import BifrostError, lower_file
 from bifrost.project import Project
 from bifrost.server.analysis import Document
-from tests.test_sync import RUNS, _counting, _leftover, _valgrind
+
+RUNS = 50  # each threaded program runs this many times
+
+# Counts allocations; reports how many are still live when the program exits.
+COUNTER_C = r"""
+#include <stdio.h>
+#include <stddef.h>
+extern void *__libc_malloc(size_t);
+extern void __libc_free(void *);
+static long live;
+void *malloc(size_t size) { __atomic_add_fetch(&live, 1, __ATOMIC_SEQ_CST); return __libc_malloc(size); }
+void free(void *pointer) { if (pointer) __atomic_sub_fetch(&live, 1, __ATOMIC_SEQ_CST); __libc_free(pointer); }
+__attribute__((destructor)) static void report(void) { fprintf(stderr, "live allocations: %ld\n", live); }
+"""
+
+
+def _leftover(stderr: str) -> int:
+    """Return how many allocations the counter saw still live at exit.
+
+    At most one is stdio's own: the buffer glibc may (or, depending on the C library and how
+    the program ends, may not) have allocated for stdout and still hold. Anything more is
+    something the program leaked.
+    """
+    match = re.search(r"live allocations: (-?\d+)", stderr)
+    assert match is not None, stderr
+    return int(match.group(1))
+
+
+def _counting(tmp_path: Path) -> dict[str, str]:
+    """Return an environment that preloads the allocation counter, built with the C compiler at hand."""
+    compiler = shutil.which("clang") or shutil.which("cc")
+    if compiler is None:
+        pytest.skip("no C compiler to build the allocation counter")
+    (tmp_path / "count.c").write_text(COUNTER_C)
+    library = tmp_path / "libcount.so"
+    subprocess.run([compiler, "-shared", "-fPIC", "-o", library, tmp_path / "count.c"], check=True)  # noqa: S603
+    return {**os.environ, "LD_PRELOAD": str(library)}
+
+
+def _valgrind(executable: Path) -> None:
+    command = ["valgrind", "-q", "--leak-check=full", "--errors-for-leak-kinds=all", "--error-exitcode=9", executable]
+    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=300)  # noqa: S603
+    assert result.returncode == 0, result.stderr
+
 
 HEADER = """\
 let io = import("std:stdio")
