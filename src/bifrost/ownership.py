@@ -28,6 +28,10 @@ its block), what it reads from is not moved or replaced.
 ``let xs = #[...xs, x]`` gives ``xs`` a new value; the old one is freed
 first, or, when the new list starts with all of the old one, grown in place.
 
+Sending a value to a ``sync.Channel`` (``message -> jobs``) moves it into the
+channel, and receiving one (``let job <- jobs``) makes the receiver its owner.
+A ``mem.Atomic`` sent stays an owner (the channel holds another).
+
 A ``mem.Shared`` or ``mem.Atomic`` local (a cell) is an owner too, released
 where its scope ends, but ``let other = counter`` copies it: both are owners,
 and the value lives until the last is released. ``return counter`` still
@@ -85,6 +89,10 @@ class Oracle:
     pattern: Callable[[Node], tuple[str, Node | None] | None] = results.pattern
     # Whether a match's arms (their conditions) cover every value it may match, with no `_`.
     exhaustive: Callable[[list[Node]], bool] = results.exhaustive
+    channel: Callable[[Node], bool] = lambda _: False  # does this expression name a sync.Channel?
+    # For a receive (`let job <- jobs`): what the message is, "owned" (a list, an owned string...),
+    # "cell" (a mem.Atomic: another owner of it), or "" (a plain value, copied).
+    received: Callable[[Node], str] = lambda _: ""
 
 
 @dataclass
@@ -279,11 +287,53 @@ class _Checker:
                 return self.statement(_unwrap(item), state)
             case "field_assignment":
                 self.field_assignment(item, state)
+            case "lock" if self.oracle.channel(item.child_by_field_name("source")):
+                self.receive(item, state)
+            case "release" if self.oracle.channel(item.child_by_field_name("source")):
+                self.send(item.child_by_field_name("guard"), item.child_by_field_name("source"), state)
+            case "send":
+                self.send(item.child_by_field_name("value"), item.child_by_field_name("channel"), state)
             case "lock" | "release" | "guard_assignment":
                 for child in _named(item):
                     self.expression(child, state)
                 self.guard(item)
         return state
+
+    def receive(self, item: Node, state: _State) -> None:
+        """``let job <- jobs``: ``job`` owns the message received (a plain value is a copy)."""
+        self.expression(item.child_by_field_name("source"), state)
+        identifier = item.child_by_field_name("guard")
+        name = _text(identifier)
+        self.oracle.bind(name, item)
+        if name in state.alive:
+            where = _line(state.alive[name][0])
+            raise OwnershipError(
+                identifier, f"{name} already owns a value (line {where}); give the new one another name"
+            )
+        state.views.pop(name, None)
+        state.moved.pop(name, None)
+        kind = self.oracle.received(item)
+        if kind:
+            block = item.parent
+            assert block is not None
+            state.alive[name] = (item, block)
+        if kind == "cell":
+            self.cells.add(name)
+
+    def send(self, value: Node | None, channel: Node | None, state: _State) -> None:
+        """``message -> jobs``: the message moves into the channel; a cell sent stays an owner (it is counted)."""
+        if value is None or channel is None:
+            return
+        inner = _unwrap(value)
+        if inner.type == "identifier" and _text(inner) in self.cells:
+            self.name(inner, state)
+        elif inner.type == "identifier" and _text(inner) in state.alive:
+            self.move(inner, state, value)
+        elif self.oracle.owned_value(inner):
+            self.keep(inner, state)
+        else:
+            self.expression(inner, state)
+        self.expression(channel, state)
 
     def local_assignment(self, item: Node, state: _State) -> None:
         parts = _named(item)

@@ -27,7 +27,7 @@ from bifrost.naming import extern_name, is_constant_case, is_pascal_case, is_sna
 from bifrost.owned import is_list
 from bifrost.packages import PackageError
 from bifrost.project import Project
-from bifrost.std import fmt, form, fs, json, mem, tasks
+from bifrost.std import fmt, form, fs, json, mem, sync, tasks
 from bifrost.std import math as std_math
 from bifrost.syntax import syntax_errors
 
@@ -37,6 +37,11 @@ _MAX_DEPTH = 16  # how many type parameters a type is followed through (`T` is `
 # What a dependency list names of the language's own (see ``bifrost.lowering``): `copy`, `list.sorted`, `Result.is_ok`.
 _COPY = "copy"
 _COPY_SUMMARY = "a deep copy of x: a new owner of the lists, strings and function values it holds"
+# The prelude's channel makers (see `bifrost.std.sync`): their signatures, as hovers and completions show them.
+_CHANNEL_MAKERS = {
+    sync.CHANNEL_FUNCTION: "channel = (n: i64) => sync.Channel[T]",
+    sync.CONDVAR_FUNCTION: "condvar = () => sync.CondVar[T]",
+}
 _LIST = "list"
 _RESULT_METHODS = {
     "is_ok": ("() => bool", "whether it holds a value"),
@@ -843,7 +848,7 @@ class Document:
             for lock in _descendants(function, "lock", own=True)
         )
 
-    def _type_of_binding(self, local: Node) -> str | None:
+    def _type_of_binding(self, local: Node) -> str | None:  # noqa: PLR0911 - one answer per kind of binding
         if local.type == "match_arm":
             return self._arm_type(local)
         parts = _named(local)
@@ -855,6 +860,9 @@ class Document:
             declared = local.child_by_field_name("type")
             if declared is not None:
                 return " ".join(_text(declared).split())
+            message = self._message_of(locked) if locked else None
+            if message is not None:
+                return message  # `let job <- jobs` receives a message
             return self._guard_type(locked) if locked else None
         if local.type == "local_assignment" and len(parts) > 1:
             return self._type_of_let(local, _unwrap(parts[-1]))
@@ -879,6 +887,13 @@ class Document:
         called = self._called(inner) if inner is not None and inner.type == "user_function_call" else None
         callee = self._callee(*called, where) if called is not None else None
         return isinstance(callee, tuple) and bool(_type_parameters(callee[1]))
+
+    def _message_of(self, channel: str) -> str | None:
+        """Return a channel type's messages' type (``i32`` for ``sync.Channel[i32]``), else ``None``."""
+        found = re.fullmatch(r"(\w+)\.(?:Channel|CondVar)\[(.*)\]", channel)
+        if found is not None and self._module_of(found.group(1)) == f"{std.PREFIX}sync":
+            return found.group(2).strip()
+        return None
 
     def _guard_type(self, locked: str) -> str:
         """Name the guard a lock gives: ``mem.Weak[Context]`` -> ``mem.WeakGuard[Context]``.
@@ -1923,8 +1938,9 @@ class Document:
             builtin = _BUILTIN_FUNCTIONS[dotted[0]].get(dotted[1])
             shown = _code(f"{builtin!r} = {builtin.signature}\n// {builtin.summary}") if builtin else None
             return shown or _constant_hover(*dotted)  # or a number it holds: math.pi
-        if dotted is not None and dotted[0] == f"{std.PREFIX}mem":
-            container = mem.CONTAINERS.get(dotted[1])
+        if dotted is not None and dotted[0] in {f"{std.PREFIX}mem", f"{std.PREFIX}sync"}:
+            containers = mem.CONTAINERS if dotted[0] == f"{std.PREFIX}mem" else sync.CONTAINERS
+            container = containers.get(dotted[1])
             return _code(f"{container!r}[T]\n// {container.summary}") if container else None
         if dotted is not None:
             declaration = self._declaration(*dotted)
@@ -2012,6 +2028,8 @@ class Document:
         plain = self._member_access(node) is None and self._field_path(node) is None  # not `x.copy`
         if name == _COPY and plain and self.bindings().get(_COPY) is None and self._local(_COPY, node) is None:
             return _code(f"{_COPY} = (x: T) => T\n// {_COPY_SUMMARY}")
+        if name in _CHANNEL_MAKERS and plain and self.bindings().get(name) is None and self._local(name, node) is None:
+            return _code(f"{_CHANNEL_MAKERS[name]}\n// {sync.FUNCTIONS[name]}")
         if _ancestor(node, "dependency_list") is None and _ancestor(node, "local_dependency_list") is None:
             return None
         if name in _LANGUAGE_OWNERS and plain and self.bindings().get(name) is None:
@@ -2194,6 +2212,8 @@ class Document:
                 names.append(Completion(candidate, "variable"))
         if listing:
             names += self._language_entries()
+        else:
+            names += self._channel_makers()  # called in a body: `let jobs: sync.Channel[i32] = channel(4)`
         return (
             names
             + [Completion(keyword, "keyword") for keyword in KEYWORDS]
@@ -2223,7 +2243,16 @@ class Document:
             else [Completion(_COPY, "function", f"{_COPY} = (x: T) => T", documentation=_COPY_SUMMARY)]
         )
         found += [Completion(name, "module", what) for name, what in _LANGUAGE_OWNERS.items() if name not in bound]
-        return found
+        return found + self._channel_makers()
+
+    def _channel_makers(self) -> list[Completion]:
+        """Offer the prelude's ``channel`` and ``condvar``, unless a name of this file hides them."""
+        bound = self.bindings()
+        return [
+            Completion(name, "function", signature, documentation=sync.FUNCTIONS[name])
+            for name, signature in _CHANNEL_MAKERS.items()
+            if name not in bound
+        ]
 
     def _dependency_members(self, owner: str) -> list[Completion] | None:
         """Offer what a dependency list names after ``owner.``, or ``None`` to offer as elsewhere.
@@ -2626,10 +2655,11 @@ class Document:
             ]
             constants = _BUILTIN_CONSTANTS.get(module, {}).values()
             return functions + [Completion(c.name, "constant", f"{c!r} = {c.value!r}: {c.summary}") for c in constants]
-        if module == f"{std.PREFIX}mem":
+        if module in {f"{std.PREFIX}mem", f"{std.PREFIX}sync"}:
+            containers = mem.CONTAINERS if module == f"{std.PREFIX}mem" else sync.CONTAINERS
             return [
                 Completion(container.name, "struct", f"{container!r}[T]: {container.summary}")
-                for container in mem.CONTAINERS.values()
+                for container in containers.values()
             ]
         found = self._extern(module)
         if found is None:
@@ -2985,6 +3015,7 @@ _BUILTIN_SUMMARIES: dict[str, tuple[str, Iterable[str]]] = {
     "form": ("values as forms (a=1&b=x)", form.FUNCTIONS),
     "fs": ("reading and writing whole files", fs.FUNCTIONS),
     "math": ("square roots, rounding, trigonometry, pi and e", [*std_math.FUNCTIONS, *std_math.CONSTANTS]),
+    "sync": ("channels between threads", sync.CONTAINERS),
 }
 
 

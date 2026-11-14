@@ -100,7 +100,7 @@ from bifrost.owned import (
     signature_of,
 )
 from bifrost.project import Project
-from bifrost.std import fmt, form, json, json_runtime, list_runtime, mem, mem_runtime, tasks
+from bifrost.std import fmt, form, json, json_runtime, list_runtime, mem, mem_runtime, sync, sync_runtime, tasks
 from bifrost.std import math as std_math
 from bifrost.syntax import syntax_errors
 
@@ -126,6 +126,9 @@ _DEPENDENCY_LISTS = {"dependency_list", "local_dependency_list"}
 # The language's own functions a dependency list names: `copy`, and a list's (`list.sorted`).
 _COPY = "copy"
 _LIST = "list"
+
+# The containers whose values are counted on the heap, with several owners: cells and channels.
+_COUNTED = (*mem.CELLS, sync.CHANNEL)
 
 # The numeric types a value converts to by calling them: `i32(x / 2)`, `f32(n)` (see `_convert`).
 _CONVERSIONS = {name for name in _PRIMITIVES if name not in {"bool", "str", "null"}}
@@ -304,6 +307,15 @@ def _type_label(kind: object) -> str:
     return getattr(kind, "__name__", None) or (found.name if found is not None else repr(kind))
 
 
+def _message_label(kind: object) -> str:
+    """Name the type of a channel's messages: ``i32``, ``#{x: i64}``, or ``mem.Atomic[Counter]`` for a pointer."""
+    found = scalar_type(kind)
+    assert found is not None
+    if found.kind == "ptr" and found.element is not None and not is_list(found):
+        return f"mem.Atomic[{_shown(found.element)}]"
+    return _shown(found)
+
+
 def _returns(node: Node, exhaustive: Callable[[list[Node]], bool] = results.exhaustive) -> bool:
     """Whether a statement (or block) returns on every path, so that nothing runs after it.
 
@@ -440,6 +452,8 @@ class _FunctionScope:
         self.pointers: set[str] = set()  # `mem.Weak` parameters and cells (pointers)
         self.cells: dict[str, Any] = {}  # `mem.Shared`/`mem.Atomic` parameters and owners -> their container
         self.cell_parameters: set[str] = set()  # the cells that are parameters (borrowed, never released)
+        self.channels: dict[str, object] = {}  # `sync.Channel` parameters and owners -> the type of their messages
+        self.channel_result: object = None  # for a function returning a sync.Channel, the type of its messages
         self.shared_locals: set[str] = set()  # `let x: mem.Unique[T] = ...` (owned values, lent to calls)
         self.held: dict[str, tuple[Any, object]] = {}  # name -> (its mem container, the type it holds)
         self.types: dict[str, ScalarType | None] = {}  # local -> its type, when the compiler can tell
@@ -500,6 +514,7 @@ class SourceUnit:
         # Values (by id) whose type is written where they go: `let xs: i64[] = empty()`, a returned value.
         self._expected_values: dict[int, ScalarType] = {}
         self._instance_names: dict[str, str] = {}  # generated filename of a generic's instance -> `first[i64]`
+        self._channel_targets: dict[int, object] = {}  # `channel(n)` calls (by id) -> the type of their messages
 
     # -- errors -----------------------------------------------------------------
 
@@ -984,7 +999,7 @@ class SourceUnit:
             return OWNED_STRING
         if container is mem.UNIQUE:
             raise self._unsupported(type_node, "an object owning another (a mem.Unique field)")
-        if container in mem.CELLS:
+        if container in _COUNTED:
             raise self._unsupported(type_node, f"an object holding a {container!r} (a {container!r} field)")
         return self._type(type_node)
 
@@ -1099,6 +1114,9 @@ class SourceUnit:
             raise self.error(node, f"{base!r} takes one type: {base!r}[Context]")
         if base is mem.UNIQUE:
             return self._type(arguments[0])  # the owner holds the value itself (a str: its pointer)
+        if base in (sync.CHANNEL, sync.CONDVAR):
+            self._message_type(arguments[0])  # checks what it may carry
+            return ptr  # the channel's block (see sync_runtime), passed as is to C's void *
         # pyrefly: ignore [invalid-annotation]
         return Ptr[self._type(arguments[0])]
 
@@ -1133,6 +1151,8 @@ class SourceUnit:
         except BifrostError:
             return None
         arguments = node.children_by_field_name("argument")
+        if base is sync.CONDVAR:
+            base = sync.CHANNEL  # a CondVar is a Channel with one slot: the same type
         return (base, arguments[0]) if isinstance(base, mem.Container) and len(arguments) == 1 else None
 
     def _is(self, container: mem.Container, type_node: Node | None) -> bool:
@@ -1147,7 +1167,7 @@ class SourceUnit:
         return_node = parts[parts.index(next(part for part in parts if part.type == "parameter_list")) + 1]
         cell = self._cell(return_node)
         found = self._container(return_node)
-        result = (cell, self._type(found[1])) if cell is not None and found is not None else None
+        result = self._held_of(found) if cell is not None and found is not None else None
         self._cell_results[name] = self.project.cell_results[symbol] = result
 
     def _find_pausing(self, functions: list[_PendingFunction]) -> None:
@@ -1170,9 +1190,39 @@ class SourceUnit:
         return False
 
     def _cell(self, type_node: Node | None) -> mem.Container | None:
-        """For a ``mem.Shared[T]`` or ``mem.Atomic[T]`` type node, its container; ``None`` for other types."""
+        """For a ``mem.Shared[T]``, ``mem.Atomic[T]`` or ``sync.Channel[T]`` type node, its container; else ``None``."""
         found = self._container(type_node)
-        return found[0] if found is not None and found[0] in mem.CELLS else None
+        return found[0] if found is not None and found[0] in _COUNTED else None
+
+    def _held_of(self, found: tuple[mem.Container, Node]) -> tuple[mem.Container, object]:
+        """``mem.Atomic[T]`` -> its container and ``T``; a ``sync.Channel[T]``'s ``T`` is the type of its messages."""
+        container, argument = found
+        return container, self._message_type(argument) if container is sync.CHANNEL else self._type(argument)
+
+    def _message_type(self, node: Node) -> object:
+        """Return the type of a channel's messages, written ``node``: ``i32``, ``mem.Unique[str]``, ``mem.Atomic[T]``.
+
+        A ``mem.Atomic`` message is the cell (``Ptr[T]``): the channel holds another owner of it.
+        """
+        found = self._container(node)
+        if found is None:
+            kind = self._stored_type(node)
+            if kind is type(None):
+                raise self.error(node, "a sync.Channel carries values; null is not one")
+            return kind
+        container, held = found
+        if container is mem.WEAK:
+            msg = "a sync.Channel cannot carry a mem.Weak: it is a lend, which cannot outlive the call that lends it"
+            raise self.error(node, msg)
+        if container is mem.SHARED:
+            msg = "a sync.Channel cannot carry a mem.Shared, which is for one thread; send a mem.Atomic instead"
+            raise self.error(node, msg)
+        if container is mem.ATOMIC:
+            # pyrefly: ignore [invalid-annotation]
+            return Ptr[self._type(held)]
+        if container is mem.UNIQUE and self._type(held) == cstr:
+            return OWNED_STRING
+        raise self._unsupported(node, f"a sync.Channel of {container!r} values")
 
     def _cell_result(self, value: Node) -> tuple[mem.Container, object] | None:
         """For a call returning a ``mem.Shared`` or ``mem.Atomic``, its container and held type."""
@@ -1209,8 +1259,8 @@ class SourceUnit:
             found = self._container(type_node)
             if found is not None and found[0] is mem.WEAK:
                 pointees.append(self._type(found[1]))
-            elif found is not None and found[0] in mem.CELLS:
-                pointees.append(_Cell(found[0], self._type(found[1])))
+            elif found is not None and found[0] in _COUNTED:
+                pointees.append(_Cell(*self._held_of(found)))
             else:
                 pointees.append(None)
         return pointees
@@ -1684,7 +1734,7 @@ class SourceUnit:
 
     # -- functions ----------------------------------------------------------------
 
-    def _function(
+    def _function(  # noqa: PLR0915 - one step per part of a definition, in order
         self,
         name: str,
         node: Node,
@@ -1720,8 +1770,9 @@ class SourceUnit:
             for parameter in _children(parameter_list)
             if self._owned_type(_children(parameter)[1])
         }
-        cells = {name: container for name, (container, _) in held.items() if container in mem.CELLS}
+        cells = {name: container for name, (container, _) in held.items() if container in _COUNTED}
         cell_parameters = set(cells) & set(annotations)
+        channels = {name: kind for name, (container, kind) in held.items() if container is sync.CHANNEL}
 
         self._scope = scope = _FunctionScope(name, set(annotations) - {"return"}, symbol or name, dict(closure or []))
         scope.result = annotations["return"]
@@ -1735,7 +1786,10 @@ class SourceUnit:
         scope.types = scope.captures | {
             parameter: scalar_type(kind) for parameter, kind in annotations.items() if parameter != "return"
         }
-        scope.held, scope.cells, scope.cell_parameters = held, cells, cell_parameters
+        scope.held, scope.cells, scope.cell_parameters, scope.channels = held, cells, cell_parameters, channels
+        returned = self._container(return_node)
+        if returned is not None and returned[0] is sync.CHANNEL:
+            scope.channel_result = self._message_type(returned[1])
         scope.pointers = {name for name, (container, _) in held.items() if container is mem.WEAK} | set(cells)
         scope.shared_locals = {name for name, (container, _) in held.items() if container is mem.UNIQUE}
         if dependency_list is not None:
@@ -1744,6 +1798,7 @@ class SourceUnit:
         scope.locks = {
             self._identifier(lock.child_by_field_name("guard")): _text(_unwrap(lock.child_by_field_name("source")))
             for lock in self._descendants(body, "lock")
+            if not self._receives(lock, held)
         }
         self._scope.names |= (
             {self._identifier(_children(let)[0]) for let in self._descendants(body, "local_assignment")}
@@ -1865,11 +1920,13 @@ class SourceUnit:
                 msg = "passing ownership (a mem.Unique parameter); borrow it with mem.Weak"
                 raise self._unsupported(type_node, msg)
             if found is not None:
-                held[self._identifier(identifier)] = (found[0], self._type(found[1]))
+                held[self._identifier(identifier)] = self._held_of(found)
         self._held_locals(body, held)
         return held
 
-    def _held_locals(self, body: Node, held: dict[str, tuple[mem.Container, object]]) -> None:
+    def _held_locals(  # noqa: C901 - one case per kind of local
+        self, body: Node, held: dict[str, tuple[mem.Container, object]]
+    ) -> None:
         """Add the locals of ``body`` that hold a ``mem`` container to ``held``."""
         for let in self._descendants(body, "local_assignment"):
             found = self._container(let.child_by_field_name("type"))
@@ -1877,15 +1934,43 @@ class SourceUnit:
                 msg = "a local cannot be a mem.Weak, which is only lent to a call; own the value with mem.Unique"
                 raise self.error(let.child_by_field_name("type"), msg)
             if found is not None and not self._owned_type(let.child_by_field_name("type")):
-                held[self._identifier(_children(let)[0])] = (found[0], self._type(found[1]))
+                held[self._identifier(_children(let)[0])] = self._held_of(found)
             elif let.child_by_field_name("type") is None and (cell := self._inferred_cell(let, held)) is not None:
                 held[self._identifier(_children(let)[0])] = cell
+        for lock in self._descendants(body, "lock"):  # `let c <- counters`: a mem.Atomic received owns the cell
+            if self._receives(lock, held):
+                source = _text(_unwrap(lock.child_by_field_name("source")))
+                cell = self._atomic_message(held[source][1])
+                if cell is not None:
+                    held[self._identifier(lock.child_by_field_name("guard"))] = (mem.ATOMIC, cell)
+        for let in self._descendants(body, "local_assignment"):  # `let other = received`: another owner
+            name = self._identifier(_children(let)[0])
+            if name not in held and let.child_by_field_name("type") is None:
+                cell = self._inferred_cell(let, held)
+                if cell is not None:
+                    held[name] = cell
+
+    @staticmethod
+    def _receives(lock: Node, held: Mapping[str, tuple[Any, object]]) -> bool:
+        """Whether ``let name <- source`` receives from a channel (rather than locking a value)."""
+        source = _unwrap(lock.child_by_field_name("source"))
+        found = held.get(_text(source)) if source.type == "identifier" else None
+        return found is not None and found[0] is sync.CHANNEL
+
+    @staticmethod
+    def _atomic_message(kind: object) -> object | None:
+        """For a channel's ``mem.Atomic[T]`` messages (``Ptr[T]``), ``T``, as a cell holds it; else ``None``."""
+        found = scalar_type(kind) if kind is not None else None
+        if found is None or found.kind != "ptr" or found.element is None or is_list(found):
+            return None
+        element = found.element
+        return element.python if isinstance(element, StructType) else element
 
     def _inferred_cell(self, let: Node, held: dict[str, tuple[mem.Container, object]]) -> tuple[Any, object] | None:
         """``let other = counter`` and ``let counter = make_counter()`` own a cell too: return its kind."""
         value = _unwrap(_children(let)[-1])
         source = held.get(_text(value)) if value.type == "identifier" else None
-        return source if source is not None and source[0] in mem.CELLS else self._cell_result(value)
+        return source if source is not None and source[0] in _COUNTED else self._cell_result(value)
 
     def _owned_type(self, type_node: Node | None) -> bool:
         """Whether a type node is ``mem.Unique[str]``: an owned string, freed by its owner."""
@@ -1979,7 +2064,21 @@ class SourceUnit:
             bind=self._bind_local,
             pattern=self._arm_pattern,
             exhaustive=self._exhaustive,
+            channel=self._names_channel,
+            received=self._received_kind,
         )
+
+    def _names_channel(self, node: Node | None) -> bool:
+        """Whether ``node`` names a ``sync.Channel`` of the function being lowered."""
+        inner = _unwrap(node) if node is not None else None
+        return inner is not None and inner.type == "identifier" and _text(inner) in self._scope.channels
+
+    def _received_kind(self, lock: Node) -> str:
+        """Return what ``let job <- jobs`` receives, for ``ownership``: ``"cell"``, ``"owned"``, or ``""`` (a copy)."""
+        kind = self._scope.channels[_text(_unwrap(lock.child_by_field_name("source")))]
+        if self._atomic_message(kind) is not None:
+            return "cell"
+        return "owned" if owns(scalar_type(kind)) else ""
 
     @staticmethod
     def _copy_hint(node: Node, kind: ScalarType | None) -> str:
@@ -2027,6 +2126,10 @@ class SourceUnit:
         try:
             if node.type == "match_arm":
                 self._scope.types[name] = self._pattern_type(node)
+                return
+            if node.type == "lock":  # a channel's message
+                source = _text(_unwrap(node.child_by_field_name("source")))
+                self._scope.types[name] = scalar_type(self._scope.channels[source])
                 return
             if node.type == "forall":
                 iterated = _children(node)[1]
@@ -2126,6 +2229,8 @@ class SourceUnit:
         taken = self._scope.names | self.globals.keys() | self._functions
         if parts == [_COPY] and _COPY not in taken:
             return _COPY
+        if len(parts) == 1 and parts[0] in sync.FUNCTIONS and parts[0] not in taken:
+            return parts[0]  # `[channel]`, `[condvar]`
         if len(parts) != 2 or (parts[0] in taken and self._names_member(entry, parts)):  # noqa: PLR2004
             return None  # not `list.sorted` (a type and a function), or this file names it (a struct list)
         owner, name = parts
@@ -2370,18 +2475,11 @@ class SourceUnit:
     def _free(self, name: str, node: Node) -> ast.stmt:
         """``free(name)``: the end of an owned string's life (for a cell, the end of one owner's)."""
         assert self._scope is not None
+        if name in self._scope.channels:
+            return self._free_channel(name, node)
         if name in self._scope.cells:
-            held = scalar_type(self._scope.held[name][1])
-            if not owns(held):
-                return self._cell_statement("release", name, node)
-            # The last owner frees what the value holds, then the cell.
-            assert held is not None
-            pointer = self._at(ast.Name(name, ast.Load()), node)
-            left = self._cell_call("unref", self._scope.cells[name], [pointer], node)
-            value = self._at(ast.Subscript(copy.copy(pointer), ast.Constant(0), ast.Load()), node)
-            last = self._at(ast.Compare(left, [ast.Eq()], [ast.Constant(0)]), node)
-            destroy = self._cell_call("destroy", self._scope.cells[name], [copy.copy(pointer)], node)
-            return self._at(ast.If(last, [self._drop(value, held, node), self._at(ast.Expr(destroy), node)], []), node)
+            container, held = self._scope.held[name]
+            return self._release_cell(self._at(ast.Name(name, ast.Load()), node), container, held, node)
         kind = self._scope.types.get(name)
         if owns(kind):
             assert kind is not None
@@ -2390,11 +2488,78 @@ class SourceUnit:
         call = ast.Call(self._at(ast.Name("__bifrost_free", ast.Load()), node), [ast.Name(name, ast.Load())], [])
         return self._at(ast.Expr(self._at(call, node)), node)
 
-    def _block_item(self, item: Node) -> list[ast.stmt]:
+    def _release_cell(self, pointer: ast.Name, container: mem.Container, held: object, node: Node) -> ast.stmt:
+        """Drop one owner of the cell ``pointer``; the last frees what the value holds, then the cell."""
+        kind = scalar_type(held)
+        if not owns(kind):
+            return self._at(ast.Expr(self._cell_call("release", container, [pointer], node)), node)
+        assert kind is not None
+        left = self._cell_call("unref", container, [pointer], node)
+        value = self._at(ast.Subscript(copy.copy(pointer), ast.Constant(0), ast.Load()), node)
+        last = self._at(ast.Compare(left, [ast.Eq()], [ast.Constant(0)]), node)
+        destroy = self._cell_call("destroy", container, [copy.copy(pointer)], node)
+        return self._at(ast.If(last, [self._drop(value, kind, node), self._at(ast.Expr(destroy), node)], []), node)
+
+    def _free_channel(self, name: str, node: Node) -> ast.stmt:
+        """Drop one owner of the channel ``name``; the last frees the messages still queued, then the channel."""
+        assert self._scope is not None
+        kind = self._scope.channels[name]
+        cell = self._atomic_message(kind)
+        if cell is None and not owns(scalar_type(kind)):
+            return self._cell_statement("release", name, node)
+
+        def channel() -> ast.Name:
+            return self._at(ast.Name(name, ast.Load()), node)
+
+        self._scope.temporaries += 1
+        message = f"__bifrost_queued_{self._scope.temporaries}"
+        slot = self._at(
+            ast.Call(self._global(Ptr[kind], "type"), [self._channel_call("next", channel(), node)], []), node
+        )
+        take = self._at(
+            ast.Assign(
+                [self._at(ast.Name(message, ast.Store()), node)],
+                self._at(ast.Subscript(slot, ast.Constant(0), ast.Load()), node),
+            ),
+            node,
+        )
+        held = self._at(ast.Name(message, ast.Load()), node)
+        drop = (
+            self._release_cell(held, mem.ATOMIC, cell, node)
+            if cell is not None
+            else self._drop(held, scalar_type(kind), node)
+        )
+        queued = self._at(
+            ast.Compare(self._channel_call("queued", channel(), node), [ast.Gt()], [ast.Constant(0)]), node
+        )
+        drain = self._at(ast.While(queued, [take, drop], []), node)
+        last = self._at(
+            ast.Compare(self._cell_call("unref", sync.CHANNEL, [channel()], node), [ast.Eq()], [ast.Constant(0)]),
+            node,
+        )
+        destroy = self._at(ast.Expr(self._channel_call("destroy", channel(), node)), node)
+        return self._at(ast.If(last, [drain, destroy], []), node)
+
+    def _channel_call(self, action: str, channel: ast.expr, node: Node) -> ast.Call:
+        """Call the channel runtime on ``channel``: ``bifrost_channel_send_begin(jobs)``, ..."""
+        function = self._at(self._global(getattr(sync_runtime, f"bifrost_channel_{action}"), "sync"), node)
+        return self._at(ast.Call(function, [channel], []), node)
+
+    def _block_item(self, item: Node) -> list[ast.stmt]:  # noqa: C901, PLR0912 - one case per kind of statement
         """Lower one statement of a block (its lends are added around it by ``_block``)."""
         assert self._scope is not None
         statements: list[ast.stmt] = []
         match item.type:
+            case "lock" if self._names_channel(item.child_by_field_name("source")):
+                statements.extend(self._receive(item))
+            case "release" if self._names_channel(item.child_by_field_name("source")):
+                statements.extend(
+                    self._send(item.child_by_field_name("guard"), item.child_by_field_name("source"), item)
+                )
+            case "send":
+                statements.extend(
+                    self._send(item.child_by_field_name("value"), item.child_by_field_name("channel"), item)
+                )
             case "lock":
                 guard = self._identifier(item.child_by_field_name("guard"))
                 source = _text(_unwrap(item.child_by_field_name("source")))
@@ -2422,6 +2587,102 @@ class SourceUnit:
             case _:
                 statements.extend(self._statement(item))
         return statements
+
+    def _check_channel_use(self, item: Node, action: str) -> None:
+        """Reject a send or receive in an async function: the waiting would block the event loop."""
+        assert self._scope is not None
+        if self._scope.is_async:
+            waits = "the sender may wait" if action == "sends to" else "the receiver may wait"
+            msg = (
+                f"{self._scope.function} is async, and it {action} a sync.Channel: {waits}, which blocks the event "
+                "loop (every task on this thread). Send and receive in a function that is not async, on a thread"
+            )
+            raise self.error(item, msg)
+
+    def _receive(self, item: Node) -> list[ast.stmt]:
+        """``let job <- jobs``: the receiver waits until a message is queued, then takes the oldest."""
+        assert self._scope is not None
+        self._check_channel_use(item, "receives from")
+        source = _unwrap(item.child_by_field_name("source"))
+        channel = _text(source)
+        kind = self._scope.channels[channel]
+        name = self._identifier(item.child_by_field_name("guard"))
+        annotation = item.child_by_field_name("type")
+        if annotation is not None and scalar_type(self._message_type(annotation)) != scalar_type(kind):
+            msg = f"{channel} carries {_message_label(kind)} messages, not {' '.join(_text(annotation).split())}"
+            raise self.error(annotation, msg)
+        self._scope.types[name] = scalar_type(kind)
+        self._scope.temporaries += 1
+        slot = f"__bifrost_slot_{self._scope.temporaries}"
+        begin = self._channel_call("receive_begin", self._at(ast.Name(channel, ast.Load()), source), item)
+        typed = self._at(ast.Call(self._at(self._global(Ptr[kind], "type"), item), [begin], []), item)
+        read = self._at(ast.Subscript(self._at(ast.Name(slot, ast.Load()), item), ast.Constant(0), ast.Load()), item)
+        end = self._channel_call("receive_end", self._at(ast.Name(channel, ast.Load()), source), item)
+        return [
+            self._at(ast.Assign([self._at(ast.Name(slot, ast.Store()), item)], typed), item),
+            self._at(ast.Assign([self._at(ast.Name(name, ast.Store()), item)], read), item),
+            self._at(ast.Expr(end), item),
+        ]
+
+    def _send(self, value: Node, channel_node: Node, item: Node) -> list[ast.stmt]:
+        """Lower ``message -> jobs``: the sender waits only if every slot holds an unread message.
+
+        Unbuffered (no slots), the sender waits until a receiver takes it. The message moves into
+        the channel; a mem.Atomic sent is counted as another owner.
+        """
+        assert self._scope is not None
+        self._check_channel_use(item, "sends to")
+        channel = _text(_unwrap(channel_node))
+        kind = self._scope.channels[channel]
+        inner = _unwrap(value)
+        statements: list[ast.stmt] = []
+        cell = self._atomic_message(kind)
+        if cell is not None:
+            name = _text(inner) if inner.type == "identifier" else None
+            found = self._scope.held.get(name) if name is not None and name in self._scope.cells else None
+            if found is None or found[0] is not mem.ATOMIC or scalar_type(found[1]) != scalar_type(cell):
+                what = f"{name} is not one" if name is not None else "send one by name"
+                raise self.error(inner, f"{channel} carries {_message_label(kind)} messages; {what}")
+            assert name is not None
+            statements.append(self._cell_statement("retain", name, item))  # the channel holds another owner
+            lowered: ast.expr = self._at(ast.Name(name, ast.Load()), inner)
+        else:
+            self._expect(value, kind)
+            self._check_message(value, kind, channel)
+            fresh = owns(scalar_type(kind)) and self._fresh(value)
+            lowered = self._owned_expression(value) if fresh else self._expression(value)
+        self._scope.temporaries += 1
+        message, slot = f"__bifrost_message_{self._scope.temporaries}", f"__bifrost_slot_{self._scope.temporaries}"
+        statements.insert(0, self._at(ast.Assign([self._at(ast.Name(message, ast.Store()), item)], lowered), item))
+
+        def channel_name() -> ast.Name:
+            return self._at(ast.Name(channel, ast.Load()), channel_node)
+
+        begin = self._channel_call("send_begin", channel_name(), item)
+        typed = self._at(ast.Call(self._at(self._global(Ptr[kind], "type"), item), [begin], []), item)
+        target = self._at(ast.Subscript(self._at(ast.Name(slot, ast.Load()), item), ast.Constant(0), ast.Store()), item)
+        return [
+            *statements,
+            self._at(ast.Assign([self._at(ast.Name(slot, ast.Store()), item)], typed), item),
+            self._at(ast.Assign([target], self._at(ast.Name(message, ast.Load()), item)), item),
+            self._at(ast.Expr(self._channel_call("send_end", channel_name(), item)), item),
+        ]
+
+    def _check_message(self, value: Node, kind: object, channel: str) -> None:
+        """Reject a message of another type than the channel's (a number written as one takes the channel's)."""
+        wanted = scalar_type(kind)
+        assert wanted is not None
+        self._check_record(value, kind, f"{channel} carries")
+        known = self._static_type(value)
+        if known is None or known == wanted or _converts(wanted) or self._loose_number(value) is not None:
+            return
+        if known == cstr and wanted == OWNED_STRING:
+            msg = (
+                f"{channel} carries mem.Unique[str] messages (owned strings, freed by the receiver), and this is a "
+                'str, which nothing may free; send an owned copy: fmt.format("%s", ...)'
+            )
+            raise self.error(value, msg)
+        raise self.error(value, f"{channel} carries {_message_label(kind)} messages, but this is {_shown(known)}")
 
     def _local_assignment(self, item: Node) -> list[ast.stmt]:
         """``let x = v``, or ``let x: T = v`` (a ``mem.Unique`` local is a plain value, lent to calls).
@@ -2581,9 +2842,12 @@ class SourceUnit:
         assert self._scope is not None
         name = target.id
         container, held = self._scope.held[name]
-        self._scope.types[name] = scalar_type(held)
+        self._scope.types[name] = scalar_type(ptr if container is sync.CHANNEL else held)
         inner = _unwrap(value)
         source = _text(inner) if inner.type == "identifier" else None
+        if container is sync.CHANNEL and self._channel_maker(inner) is not None:
+            self._channel_targets[inner.id] = held
+            return self._at(ast.Assign([target], self._expression(value)), item)
         found = self._cell_result(inner)
         if source in self._scope.cells or found is not None:
             other, other_held = self._scope.held[source] if source in self._scope.cells else found
@@ -2595,6 +2859,12 @@ class SourceUnit:
             if source is not None:
                 self._scope.after.append(self._cell_statement("retain", name, item))
             return self._at(ast.Assign([target], self._expression(value)), item)
+        if container is sync.CHANNEL:
+            msg = (
+                f"{name} is a sync.Channel: make one with channel(n) or condvar(), or another owner of one "
+                "(`let other = jobs`)"
+            )
+            raise self.error(inner, msg)
         # A new cell: allocate it, then move the value in.
         pointer = self._global(Ptr[held], "type")
         size = self._at(ast.Constant(scalar_type(held).size), item)
@@ -2611,6 +2881,9 @@ class SourceUnit:
 
     def _cell_call(self, action: str, container: mem.Container, arguments: list[ast.expr], node: Node) -> ast.Call:
         """Call the runtime for a cell: ``bifrost_shared_retain(c)``, ``bifrost_atomic_lock(c)``, ..."""
+        if container is sync.CHANNEL:
+            function = self._at(self._global(getattr(sync_runtime, f"bifrost_channel_{action}"), "sync"), node)
+            return self._at(ast.Call(function, arguments, []), node)
         kind = "shared" if container is mem.SHARED else "atomic"
         function = self._at(self._global(getattr(mem_runtime, f"bifrost_{kind}_{action}"), "mem"), node)
         return self._at(ast.Call(function, arguments, []), node)
@@ -4274,6 +4547,9 @@ class SourceUnit:
             return self._copy(node)
         if path is None and self._is_result_constructor(name):
             return self._result_constructor(node, name)
+        if path is None and self._is_channel_maker(name):
+            self._depend(name, node.child_by_field_name("function"))
+            return self._new_channel(node, name)
         if path is None and self._is_conversion(name):
             return self._convert(node, name)
         generic = self._generic_callee(name, path)
@@ -4285,6 +4561,56 @@ class SourceUnit:
         """Whether ``name(...)`` is the prelude's ``copy``: nothing else named ``copy`` is in scope."""
         assert self._scope is not None
         return name == _COPY and not ({name} & (self._scope.names | self.globals.keys() | self._functions))
+
+    def _is_channel_maker(self, name: str) -> bool:
+        """Whether ``name(...)`` is the prelude's ``channel`` or ``condvar``: nothing else of that name is in scope."""
+        assert self._scope is not None
+        taken = self._scope.names | self.globals.keys() | self._functions
+        return name in sync.FUNCTIONS and name not in taken
+
+    def _channel_maker(self, node: Node) -> str | None:
+        """For ``channel(n)`` or ``condvar()`` (the prelude's), its name; ``None`` for anything else."""
+        node = _unwrap(node)
+        inner = _children(node)[0] if node.type == "function_call" else None
+        function = (
+            inner.child_by_field_name("function") if inner is not None and inner.type == "user_function_call" else None
+        )
+        return _text(function) if function is not None and self._is_channel_maker(_text(function)) else None
+
+    def _new_channel(self, node: Node, name: str) -> ast.expr:
+        """``channel(n)``: a new channel of n slots (0, the default: unbuffered); ``condvar()``: one slot.
+
+        The messages' type is the one written where it goes (``let jobs: sync.Channel[i32] = channel(4)``).
+        """
+        kind = self._channel_targets.get(self._call_expression(node).id)
+        if kind is None:
+            msg = (
+                f"{name}() makes a sync.Channel; write the type of its messages where it goes: "
+                f"`let jobs: sync.Channel[i32] = {name}(...)`"
+            )
+            raise self.error(node, msg)
+        arguments = [argument for argument in _children(node) if argument.type in {"expression", "named_argument"}]
+        if any(argument.type == "named_argument" for argument in arguments):
+            raise self.error(node, f"{name} takes its number of slots by position: {name}(4)")
+        if name == sync.CONDVAR_FUNCTION and arguments:
+            raise self.error(node, "condvar() takes nothing: a sync.CondVar has one slot (channel(n) has n)")
+        if len(arguments) > 1:
+            raise self.error(arguments[1], "channel takes one number, its slots: channel(4) (or channel() for none)")
+        if (
+            arguments
+            and self._static_type(arguments[0]) not in {None, i64}
+            and self._loose_number(arguments[0]) is None
+        ):
+            found = self._static_type(arguments[0])
+            raise self.error(arguments[0], f"channel takes its slots as an i64, not {_type_label(found)}: i64(n)")
+        capacity = self._expression(arguments[0]) if arguments else self._at(ast.Constant(0), node)
+        if name == sync.CONDVAR_FUNCTION:
+            capacity = self._at(ast.Constant(1), node)
+        size = self._at(ast.Constant(scalar_type(kind).size), node)
+        where = f"{_display(self.path, self.root)}:{node.start_point[0] + 1}"
+        negative = f"{where}: channel(n) takes 0 or more slots, and n is negative\n"
+        call = self._at(self._global(sync_runtime.bifrost_channel_new, "sync"), node)
+        return self._at(ast.Call(call, [capacity, size, self._at(ast.Constant(negative), node)], []), node)
 
     def _is_result_constructor(self, name: str) -> bool:
         """Whether ``name(...)`` is the prelude's ``ok`` or ``err``: nothing else of that name is in scope."""
@@ -4722,6 +5048,8 @@ class SourceUnit:
     def _returned(self, value: Node) -> None:
         """Note what a function returns: the shape of its ``Record``, or checked against its written record type."""
         assert self._scope is not None
+        if self._scope.channel_result is not None and self._channel_maker(value) is not None:
+            self._channel_targets[_unwrap(value).id] = self._scope.channel_result  # `return channel(4)`
         if self._scope.results is not None:
             self._scope.results.append((value, self._static_type(value)))
             return
@@ -5426,6 +5754,8 @@ class SourceUnit:
         assert self._scope is not None
         # A guard reaches what it locks (known from its lock before lowering, for the checks that run first).
         name = self._scope.guards.get(name) or self._scope.locks.get(name, name)
+        if name in self._scope.channels:
+            return scalar_type(ptr)  # a channel's block (see sync_runtime)
         if name in self._scope.held:
             return scalar_type(self._scope.held[name][1])
         if name not in self._scope.names and self._qualify(name) in self._function_nodes:
@@ -5818,14 +6148,18 @@ class SourceUnit:
         assert self._scope is not None
         inner = _unwrap(argument)
         name = _text(inner) if inner.type == "identifier" else None
+        channel = cell.container is sync.CHANNEL
+        label = _message_label if channel else _type_label
         if name is None or name not in self._scope.cells:
             what = f"{name} is not one" if name is not None else "pass one by name"
-            raise self.error(inner, f"this parameter takes a {cell.container!r}[{_type_label(cell.held)}]; {what}")
+            raise self.error(inner, f"this parameter takes a {cell.container!r}[{label(cell.held)}]; {what}")
         container, held = self._scope.held[name]
         if container is not cell.container:
             raise self.error(inner, f"{name} is a {container!r}, but this parameter takes a {cell.container!r}")
         if held != cell.held:
-            raise self.error(inner, f"{name} holds a {_type_label(held)}, not a {_type_label(cell.held)}")
+            if channel:
+                raise self.error(inner, f"{name} carries {label(held)} messages, not {label(cell.held)}")
+            raise self.error(inner, f"{name} holds a {label(held)}, not a {label(cell.held)}")
         return self._at(ast.Name(name, ast.Load()), inner)
 
     def _lend(self, argument: Node, pointee: object, call: Node, *, opaque: bool = False) -> ast.expr:
@@ -5840,6 +6174,11 @@ class SourceUnit:
         if inner.type != "identifier":
             return self._lend_part(inner, pointee, call)
         name = self._scope.guards.get(_text(inner), _text(inner))
+        if name in self._scope.channels and not opaque:
+            msg = (
+                f"{name} is a sync.Channel; pass it to a sync.Channel parameter, or to C's void * (a thread's argument)"
+            )
+            raise self.error(inner, msg)
         if name in self._scope.cells and name == _text(inner) and not opaque:
             return self._lend_cell(name, inner, call)
         if name in self._scope.pointers:
@@ -6488,6 +6827,7 @@ _STD_MODULES: dict[str, Mapping[str, object]] = {
     f"{std.PREFIX}tasks": tasks.FUNCTIONS,
     f"{std.PREFIX}form": form.FUNCTIONS,
     f"{std.PREFIX}math": std_math.FUNCTIONS | std_math.VALUES,
+    f"{std.PREFIX}sync": sync.CONTAINERS,
 }
 
 # The index of a slice: `xs[a...b]`, `xs[a...]`, `xs[...b]`.

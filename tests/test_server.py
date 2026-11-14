@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from bifrost.server.analysis import Document, Severity, SymbolKind
+from bifrost.std import sync
 
 # A folder of the raylib example project, so its config.yaml (raylib externs) applies.
 EXAMPLES = Path(__file__).parents[1] / "examples" / "raylib" / "src"
@@ -576,7 +577,12 @@ def test_completions_carry_documentation() -> None:
     document = Document.open(EXAMPLES / "scratch.bif", DOCUMENTED + "let use = [] () => null {\n    \n}\n")
     line = len(DOCUMENTED.splitlines()) + 1
     documented = {c.label: c.documentation for c in document.completions((line, 4)) if c.documentation}
-    assert documented == {"Point": "A point on the screen,\nin pixels", "shift": "Move `p` right by `by` pixels"}
+    assert documented == {
+        "Point": "A point on the screen,\nin pixels",
+        "shift": "Move `p` right by `by` pixels",
+        "channel": sync.FUNCTIONS["channel"],  # the prelude's, called in a body
+        "condvar": sync.FUNCTIONS["condvar"],
+    }
 
 
 def test_lists_show_their_types(tmp_path: Path) -> None:

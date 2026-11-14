@@ -42,10 +42,11 @@ class Container:
     summary: str
     supported: bool
     guards: str | None = None  # for a guard type, the container it locks ("Weak" for WeakGuard)
+    module: str = "mem"  # the standard module it belongs to: std:mem, or std:sync for sync.Channel
 
     def __repr__(self) -> str:
         """Show it as Bifrost code names it: ``mem.Unique``."""
-        return f"mem.{self.name}"
+        return f"{self.module}.{self.name}"
 
 
 UNIQUE = Container("Unique", "the one owner of a value; lent to calls, reached through a guard", supported=True)

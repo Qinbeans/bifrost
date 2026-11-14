@@ -290,6 +290,30 @@ count -> counter
 
 Objects cannot hold one yet.
 
+### Channels
+
+`import("std:sync")` passes values between threads, as Go's channels do. `channel(n)` makes a `sync.Channel` with `n` slots; `value -> jobs` sends and `let job <- jobs` receives:
+
+```bifrost
+let io = import("std:stdio")
+let sync = import("std:sync")
+
+let main = [channel, condvar, io.printf] () => null {
+    let jobs: sync.Channel[i32] = channel(4)   // four slots
+    7 -> jobs                                  // the sender waits only if all four hold unread messages
+    8 -> jobs
+    let job <- jobs                            // the receiver waits only if none is queued; it takes 7
+    let ready: sync.CondVar[bool] = condvar()  // one slot
+    true -> ready
+    let go <- ready
+    io.printf("%d %d\n", job, go)             // 7 1
+}
+```
+
+The sender returns at once while a slot is free, and waits only when every slot holds an unread message; the receiver takes the oldest message at once if there is one, and waits only when there are none. `channel(0)` (or `channel()`) has no slots: the sender waits until a receiver takes its message. A `sync.CondVar` is a channel with one slot, made by `condvar()`, for one thread to tell another that something happened. Any number of threads send and receive on one channel, and each message goes to exactly one receiver.
+
+A message moves into the channel, so an owned value sent is not used again, and the receiver owns what it receives; numbers, booleans, strings and records of those are copied. A `mem.Atomic` can be sent (the channel holds another owner of it until it is received), but not a `mem.Weak`, a lend that cannot outlive its call, or a `mem.Shared`, which is one thread's. A channel has several owners, counted atomically like a `mem.Atomic`'s, and the last one frees it with the messages still queued; it is passed to C's `void *` (a thread's argument) as is. `channel` and `condvar` are the language's own, like `copy`: they need no import, and a function lists them (`[channel]`). Sending and receiving wait, so they are errors in an `async` function (they would stall the event loop) and while a guard is held (the thread at the other end may need it).
+
 ### Formatting and owned strings
 
 `std:fmt` formats like `printf` into a string allocated to fit, and hands back its ownership:
@@ -677,7 +701,7 @@ There are `sqrt`, `floor`, `ceil`, `round` (halves away from zero), `trunc`, `ab
 
 `import("raylib")` brings in a module declared in `config.yaml`, the project's or a package's (raylib's is [`extras/raylib`](./extras/raylib)). Its functions take Bifrost names: `InitWindow` is `rl.init_window`, and structs keep PascalCase (`rl.Color`). The C symbols are unchanged.
 
-`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, `import("std:fs")` [files](#files), and `import("std:math")` [math](#math).
+`import("std:stdio")` brings in a standard module bundled with the compiler (`printf`, `puts`, `fopen`, ...), with no configuration needed. `import("std:mem")` brings in the memory containers above, `import("std:fmt")` formatting, `import("std:fs")` [files](#files), `import("std:math")` [math](#math), and `import("std:sync")` [channels](#channels).
 
 ### Modules
 

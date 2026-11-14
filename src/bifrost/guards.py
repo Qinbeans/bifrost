@@ -14,6 +14,11 @@ it is lent to) is only reached through a guard, or lent to a call. A
 ``mem.Shared`` or ``mem.Atomic`` may also be given another owner
 (``let other = counter``) or returned.
 
+On a ``sync.Channel`` the arrows send and receive instead: ``let job <- jobs``
+receives a message (an ordinary local, not a guard), and ``7 -> jobs`` sends
+one. Neither may happen while a guard is held: the sender or the receiver may
+wait, for a peer that may need that very lock (a deadlock).
+
 All of this is checked here, before lowering. A guard compiles to the pointer
 (or value) it locks; only a ``mem.Shared`` or ``mem.Atomic`` lock also runs
 code (see ``bifrost.std.mem_runtime``).
@@ -26,7 +31,8 @@ from tree_sitter import Node
 
 from bifrost import pipes, results
 
-_CELLS = {"mem.Shared", "mem.Atomic"}  # containers that may have several owners
+_CHANNEL = "sync.Channel"
+_CELLS = {"mem.Shared", "mem.Atomic", _CHANNEL}  # containers that may have several owners
 
 
 class GuardError(Exception):
@@ -139,6 +145,8 @@ class _Checker:
                 return self.lock(item, state)
             case "release":
                 return self.release(item, state)
+            case "send":
+                self.send(item, state)
             case "field_assignment":
                 self.field_assignment(item, state)
             case "guard_assignment":
@@ -173,6 +181,8 @@ class _Checker:
     def lock(self, node: Node, state: _State) -> _State:
         guard = _text(node.child_by_field_name("guard"))
         source_node = _unwrap(node.child_by_field_name("source"))
+        if self.is_channel(source_node):
+            return self.receive(node, guard, source_node, state)
         if source_node.type != "identifier":
             raise GuardError(source_node, "lock a name: `let guard <- ctx`")
         source = _text(source_node)
@@ -190,9 +200,71 @@ class _Checker:
         state.released.pop(guard, None)
         return state
 
+    def is_channel(self, node: Node) -> bool:
+        """Whether ``node`` names a ``sync.Channel``, which ``<-`` receives from and ``->`` sends to."""
+        return node.type == "identifier" and self.held.get(_text(node)) == _CHANNEL
+
+    @staticmethod
+    def no_guard_held(node: Node, state: _State, action: str) -> None:
+        """Reject a send or receive while a guard is held: the peer it may wait for may need that lock."""
+        if not state.held:
+            return
+        lock = next(iter(state.held.values()))
+        msg = (
+            f"{action} while {lock.guard} holds {lock.source} (locked on line {_line(lock.node)}): "
+            f"{'the sender' if action.startswith('sends') else 'the receiver'} may wait for a peer that needs "
+            f"{lock.source} (a deadlock). Release it first ({_release_hint(lock)}), and lock again after"
+        )
+        raise GuardError(node, msg)
+
+    def receive(self, node: Node, name: str, channel: Node, state: _State) -> _State:
+        """``let job <- jobs``: receive a message into a new local (not a guard)."""
+        self.no_guard_held(node, state, f"receives from {_text(channel)}")
+        self.name(channel, state, field_access=False, lent=True)
+        if name in state.held:
+            raise GuardError(node, f"{name} is a guard; give the message another name")
+        state.released.pop(name, None)
+        return state
+
+    def send(self, node: Node, state: _State) -> None:
+        """``7 -> jobs``: send a value to a channel; ``->`` to anything else is neither a send nor a release."""
+        value, channel = node.child_by_field_name("value"), _unwrap(node.child_by_field_name("channel"))
+        if not self.is_channel(channel):
+            what = _text(channel)
+            kind = self.held.get(what) if channel.type == "identifier" else None
+            if kind is not None:
+                msg = (
+                    f"{what} is a {kind}, not a sync.Channel: `->` sends a value to a channel, or releases a "
+                    f"guard (`guard -> {what}`)"
+                )
+            else:
+                sent = " ".join(_text(value).split())
+                msg = (
+                    f"{what} is not a sync.Channel (`->` sends a value to one), and {sent} is not a guard "
+                    f"(`guard -> {what}` releases one)"
+                )
+            raise GuardError(channel, msg)
+        self.no_guard_held(node, state, f"sends to {_text(channel)}")
+        self.sent(value, state)
+        self.name(channel, state, field_access=False, lent=True)
+
+    def sent(self, value: Node, state: _State) -> None:
+        """Check a value sent: a cell (a mem.Atomic) is sent whole, as another owner."""
+        inner = _unwrap(value)
+        if inner.type == "identifier" and self.held.get(_text(inner)) in _CELLS - {_CHANNEL}:
+            self.name(inner, state, field_access=False, lent=True)
+        else:
+            self.uses(value, state)
+
     def release(self, node: Node, state: _State) -> _State:
         guard = _text(node.child_by_field_name("guard"))
-        source = _text(_unwrap(node.child_by_field_name("source")))
+        source_node = _unwrap(node.child_by_field_name("source"))
+        source = _text(source_node)
+        if self.is_channel(source_node):  # `job -> jobs`: a send of the value a name holds
+            self.no_guard_held(node, state, f"sends to {source}")
+            self.sent(node.child_by_field_name("guard"), state)
+            self.name(source_node, state, field_access=False, lent=True)
+            return state
         lock = state.held.get(guard)
         if lock is None:
             if guard in state.released:
@@ -445,6 +517,16 @@ class _Checker:
             )
             raise GuardError(node, msg)
         self.not_held(node, name, state)
+        if (
+            name in self.held
+            and self.held[name] == _CHANNEL
+            and (field_access or not (lent or self.is_whole_value(node)))
+        ):
+            msg = (
+                f"{name} is a sync.Channel: send to it (`value -> {name}`), receive from it (`let m <- {name}`), "
+                f"pass it to a call, or make another owner (`let other = {name}`)"
+            )
+            raise GuardError(node, msg)
         if name in self.held and field_access:
             msg = f"{name} is a {self.held[name]}; lock it (`let guard <- {name}`) to reach its fields"
             raise GuardError(node, msg)
