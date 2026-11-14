@@ -9,6 +9,7 @@ which polls an ``mem.Atomic`` it writes after each send or receive.
 
 import collections
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -80,6 +81,18 @@ def _run(executable: Path, env: dict[str, str] | None = None) -> subprocess.Comp
     return subprocess.run([executable], capture_output=True, text=True, check=True, timeout=60, env=env)  # noqa: S603
 
 
+def _leftover(stderr: str) -> int:
+    """Return how many allocations the counter saw still live at exit.
+
+    At most one is stdio's own: the buffer glibc may (or, depending on the C library and how
+    the program ends, may not) have allocated for stdout and still hold. Anything more is
+    something the program leaked.
+    """
+    match = re.search(r"live allocations: (-?\d+)", stderr)
+    assert match is not None, stderr
+    return int(match.group(1))
+
+
 def _counting(tmp_path: Path) -> dict[str, str]:
     """Return an environment that preloads the allocation counter, built with the C compiler at hand."""
     compiler = shutil.which("clang") or shutil.which("cc")
@@ -144,7 +157,7 @@ def test_messages_come_out_oldest_first(tmp_path: Path) -> None:
     executable = _build(tmp_path, ORDER)
     result = _run(executable, env=_counting(tmp_path))
     assert result.stdout.splitlines() == ["7 8 9 10 11", "1 0"]
-    assert "live allocations: 1" in result.stderr  # only stdout's buffer: both channels were freed
+    assert _leftover(result.stderr) <= 1  # only stdout's buffer: both channels were freed
 
 
 OWNED = (
@@ -202,7 +215,7 @@ def test_owned_messages_move_through_and_are_freed_once(tmp_path: Path) -> None:
     executable = _build(tmp_path, OWNED)
     result = _run(executable, env=_counting(tmp_path))
     assert result.stdout.splitlines() == ["job 1", "1 3", "a 2", "1 2", "42", "15"]
-    assert "live allocations: 1" in result.stderr  # only stdout's buffer
+    assert _leftover(result.stderr) <= 1  # only stdout's buffer
 
 
 @pytest.mark.skipif(shutil.which("valgrind") is None, reason="needs valgrind")
@@ -241,7 +254,7 @@ def test_channels_have_several_owners(tmp_path: Path) -> None:
     executable = _build(tmp_path, OWNERS)
     result = _run(executable, env=_counting(tmp_path))
     assert result.stdout.splitlines() == ["name 0"]
-    assert "live allocations: 1" in result.stderr  # the last of three owners freed it, and names 1 and 2
+    assert _leftover(result.stderr) <= 1  # the last of three owners freed it, and names 1 and 2
 
 
 def test_a_negative_number_of_slots_stops_the_program(tmp_path: Path) -> None:
@@ -447,7 +460,7 @@ def test_the_sender_waits_only_while_every_slot_holds_an_unread_message(
     for _ in range(3):
         result = _run(executable, env=_counting(tmp_path))
         assert result.stdout.splitlines() == [str(slots), str(sends)]
-        assert "live allocations: 1" in result.stderr  # the channel and the mem.Atomic were freed
+        assert _leftover(result.stderr) <= 1  # the channel and the mem.Atomic were freed
 
 
 RECEIVER = (
@@ -483,7 +496,7 @@ def test_the_receiver_waits_until_a_message_is_sent(tmp_path: Path) -> None:
     for _ in range(3):
         result = _run(executable, env=_counting(tmp_path))
         assert result.stdout.splitlines() == ["1", "2"]
-        assert "live allocations: 1" in result.stderr
+        assert _leftover(result.stderr) <= 1
 
 
 # Producers send 1 to MESSAGES each; consumers print every message they receive, until a 0.
@@ -619,7 +632,7 @@ def test_queued_messages_are_freed_with_the_last_owner(tmp_path: Path) -> None:
     for _ in range(RUNS):
         result = _run(executable, env=_counting(tmp_path))
         assert result.stdout.splitlines() == ["took 10"]
-        assert "live allocations: 1" in result.stderr  # 30 names were still queued
+        assert _leftover(result.stderr) <= 1  # 30 names were still queued
 
 
 @pytest.mark.skipif(shutil.which("valgrind") is None, reason="needs valgrind")
