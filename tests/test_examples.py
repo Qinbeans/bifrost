@@ -21,6 +21,7 @@ EXAMPLES = Path(__file__).parents[1] / "examples"
         EXAMPLES / "async",
         EXAMPLES / "breakout",
         EXAMPLES / "json",
+        EXAMPLES / "threads",
     ],
 )
 def test_example_compiles(project: Path) -> None:

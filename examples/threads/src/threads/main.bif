@@ -1,0 +1,33 @@
+let stdio = import("std:stdio")
+let tasks = import("std:tasks")
+let sync = import("std:sync")
+let time = import("std:time")
+
+let sum_it = [stdio.printf, time.sleep] async (a: i32, b: i32) => i32 {
+    if a > b {
+        stdio.printf("%d is greater than %d", a, b)
+        return -1
+    }
+    let sum = 0
+    forall i in #[a...b] {
+        stdio.printf("%d\n", sum)
+        let sum = i + sum
+        await time.sleep(10)
+    }
+    return sum
+}
+
+let timer = [stdio.printf, time.sleep] async (sleep: i64, iterations: i64) => null {
+    forall i in #[1...iterations + 1] {
+        stdio.printf("Step %ld: slept for %ld ms\n", i, sleep * i * 10)
+        await time.sleep(sleep * 10)
+    }
+}
+
+let main = [stdio.printf, spawn, sum_it, timer] () => null {
+    let job = spawn(sum_it(1, 20))
+    let job2 = spawn(timer(8, 4))
+    let result = await job
+    stdio.printf("%d\n", result)
+    await job2
+}
